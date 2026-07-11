@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:grim-dawn-encounter-lab:schema:encounter:0.1.0",
+  "title": "EncounterDefinition",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "game_version", "channel", "difficulty", "enemies"],
+  "properties": {
+    "schema_version": { "const": "0.1.0" },
+    "game_version": { "type": "string", "minLength": 1 },
+    "channel": { "enum": ["stable", "public_test", "mod"] },
+    "difficulty": { "enum": ["normal", "elite", "ultimate"] },
+    "player_count": { "type": "integer", "minimum": 1 },
+    "shattered_realm": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["shard", "mutators"],
+      "properties": {
+        "shard": { "type": "integer", "minimum": 1 },
+        "mutators": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+        "scaling_record": { "type": "string" }
+      }
+    },
+    "enemies": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/enemy" }
+    },
+    "assumptions": { "type": "array", "items": { "type": "string" } }
+  },
+  "$defs": {
+    "enemy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["record_id", "level", "phase", "skills"],
+      "properties": {
+        "record_id": { "type": "string", "minLength": 1 },
+        "name_tag": { "type": "string" },
+        "level": { "type": "integer", "minimum": 1 },
+        "phase": { "type": "string" },
+        "classification": { "enum": ["hero", "boss", "nemesis", "celestial", "other"] },
+        "offensive_ability": { "type": "number", "minimum": 0 },
+        "random_equipment_state": { "enum": ["none", "resolved", "unresolved"] },
+        "skills": { "type": "array", "items": { "$ref": "#/$defs/skill" } }
+      }
+    },
+    "skill": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["record_id", "damage_packets", "behavior", "confidence"],
+      "properties": {
+        "record_id": { "type": "string", "minLength": 1 },
+        "skill_level": { "type": ["integer", "null"], "minimum": 1 },
+        "damage_packets": { "type": "array", "items": { "$ref": "#/$defs/damagePacket" } },
+        "debuffs": { "type": "array", "items": { "$ref": "#/$defs/debuff" } },
+        "behavior": { "$ref": "#/$defs/behavior" },
+        "hit_model": { "enum": ["single", "multi_hit", "projectile", "ground", "aura", "unknown"] },
+        "maximum_simultaneous_hits": { "type": ["integer", "null"], "minimum": 1 },
+        "confidence": { "enum": ["high", "medium", "low", "unknown"] }
+      }
+    },
+    "damagePacket": {
+      "type": "object",
+      "required": ["damage_type", "minimum", "maximum"],
+      "properties": {
+        "damage_type": { "type": "string" },
+        "minimum": { "type": "number", "minimum": 0 },
+        "maximum": { "type": "number", "minimum": 0 },
+        "duration_seconds": { "type": "number", "minimum": 0 },
+        "weapon_damage_percent": { "type": "number", "minimum": 0 }
+      }
+    },
+    "debuff": {
+      "type": "object",
+      "required": ["kind", "value", "duration_seconds"],
+      "properties": {
+        "kind": { "type": "string" },
+        "value": { "type": "number" },
+        "duration_seconds": { "type": "number", "minimum": 0 },
+        "stacking_group": { "type": "string" }
+      }
+    },
+    "behavior": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "initial_timeout_seconds": { "type": ["number", "null"], "minimum": 0 },
+        "delay_seconds": { "type": ["number", "null"], "minimum": 0 },
+        "chance": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+        "range_band": { "enum": ["short", "medium", "long", "any", "unknown"] },
+        "next_skill_record_id": { "type": ["string", "null"] },
+        "trigger": { "type": "string" }
+      }
+    }
+  }
+}

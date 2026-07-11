@@ -1,0 +1,20 @@
+# Local game data and generated datasets
+data/raw/
+data/generated/
+
+# Local saves and captures
+*.gdc
+*.gst
+*.gsh
+captures/
+
+# Local configuration
+.env
+*.local.json
+
+# Common build/cache output
+dist/
+build/
+.cache/
+__pycache__/
+*.pyc

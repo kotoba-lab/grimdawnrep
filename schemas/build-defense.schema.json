@@ -1,0 +1,104 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:grim-dawn-encounter-lab:schema:build-defense:0.1.0",
+  "title": "BuildDefenseSnapshot",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "game_version", "level", "health", "defensive_ability", "resistances", "armor"],
+  "properties": {
+    "schema_version": { "const": "0.1.0" },
+    "game_version": { "type": "string", "minLength": 1 },
+    "level": { "type": "integer", "minimum": 1 },
+    "health": { "type": "number", "exclusiveMinimum": 0 },
+    "defensive_ability": { "type": "number", "minimum": 0 },
+    "resistances": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/resistance" }
+    },
+    "armor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["absorption", "slots"],
+      "properties": {
+        "absorption": { "type": "number", "minimum": 0, "maximum": 1 },
+        "slots": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["head", "shoulders", "torso", "arms", "legs", "feet"],
+          "properties": {
+            "head": { "type": "number", "minimum": 0 },
+            "shoulders": { "type": "number", "minimum": 0 },
+            "torso": { "type": "number", "minimum": 0 },
+            "arms": { "type": "number", "minimum": 0 },
+            "legs": { "type": "number", "minimum": 0 },
+            "feet": { "type": "number", "minimum": 0 }
+          }
+        }
+      }
+    },
+    "shield": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["block_chance", "block_amount", "recovery_seconds"],
+      "properties": {
+        "block_chance": { "type": "number", "minimum": 0, "maximum": 1 },
+        "block_amount": { "type": "number", "minimum": 0 },
+        "recovery_seconds": { "type": "number", "minimum": 0 }
+      }
+    },
+    "avoidance": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "dodge": { "type": "number", "minimum": 0, "maximum": 1 },
+        "deflect": { "type": "number", "minimum": 0, "maximum": 1 }
+      }
+    },
+    "absorption": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "percent": { "type": "number", "minimum": 0, "maximum": 1 },
+        "flat": { "type": "number", "minimum": 0 }
+      }
+    },
+    "cc_resistances": {
+      "type": "object",
+      "additionalProperties": { "type": "number", "minimum": 0 }
+    },
+    "active_effects": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/effect" }
+    },
+    "provenance": { "$ref": "#/$defs/provenance" }
+  },
+  "$defs": {
+    "resistance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["current", "maximum"],
+      "properties": {
+        "current": { "type": "number" },
+        "maximum": { "type": "number" },
+        "uncapped": { "type": "number" }
+      }
+    },
+    "effect": {
+      "type": "object",
+      "required": ["id", "state"],
+      "properties": {
+        "id": { "type": "string" },
+        "state": { "enum": ["active", "inactive", "conditional"] },
+        "remaining_seconds": { "type": "number", "minimum": 0 }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "properties": {
+        "source": { "enum": ["manual", "player_gdc", "grimtools_url", "fixture"] },
+        "source_hash": { "type": "string" },
+        "created_at": { "type": "string", "format": "date-time" }
+      }
+    }
+  }
+}

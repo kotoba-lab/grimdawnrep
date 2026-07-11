@@ -1,0 +1,55 @@
+{
+  "as_of": "2026-07-11",
+  "claims": [
+    {
+      "id": "enemy-ai-partially-data-driven",
+      "statement": "Enemy skill selection is partially reconstructable from database fields including initial timeout, delay, chance, range, and chained skills.",
+      "status": "confirmed",
+      "applies_to": ["data-model"],
+      "evidence": ["official-modding-guide", "grimtools-monsterdb-announcement"],
+      "confidence": "high"
+    },
+    {
+      "id": "monsterdb-not-final-damage",
+      "statement": "Displayed Monster Database skill values are not by themselves the final incoming damage because percentage bonuses and some equipment are not accounted for in the displayed skill panel.",
+      "status": "confirmed",
+      "applies_to": ["grimtools-monsterdb"],
+      "evidence": ["grimtools-monsterdb-announcement"],
+      "confidence": "high"
+    },
+    {
+      "id": "armor-location-tail-risk",
+      "statement": "Physical damage mitigation varies by randomly selected armor location, so a single aggregate armor rating can hide lethal tail risk.",
+      "status": "confirmed",
+      "applies_to": ["official-current-guide"],
+      "evidence": ["official-combat-guide"],
+      "confidence": "high"
+    },
+    {
+      "id": "sr-and-celestial-not-equivalent",
+      "statement": "A fixed single-superboss tank test is not equivalent to Shattered Realm survival because SR adds depth scaling, randomized mutators, and potentially multiple Nemesis enemies.",
+      "status": "confirmed",
+      "applies_to": ["1.2.1.6"],
+      "evidence": ["official-sr-guide", "patch-1.2.1.6"],
+      "confidence": "high"
+    },
+    {
+      "id": "sunder-amplifies-followup-debuffs",
+      "statement": "Sunder can amplify subsequent Sunder and other debuff magnitudes in the tested 1.2.1.6-era public-test behavior.",
+      "status": "provisional",
+      "applies_to": ["reported-around-1.2.1.6-public-test"],
+      "evidence": ["community-sunder-test-2025"],
+      "confidence": "medium",
+      "retest_required": true,
+      "notes": "Community fixed-damage tests support the observation, but intent and current stable/public-test behavior are not established."
+    },
+    {
+      "id": "local-arz-import-feasible",
+      "statement": "A local, read-only ARZ ingestion pipeline is technically feasible without depending on GrimTools page scraping.",
+      "status": "confirmed",
+      "applies_to": ["architecture"],
+      "evidence": ["official-modding-guide", "arz-go-library"],
+      "confidence": "high"
+    }
+  ]
+}

@@ -1,0 +1,85 @@
+{
+  "as_of": "2026-07-11",
+  "sources": [
+    {
+      "id": "official-combat-guide",
+      "title": "Guide - Gameplay - Combat",
+      "url": "https://www.grimdawn.com/guide/gameplay/combat/",
+      "publisher": "Crate Entertainment",
+      "kind": "official_guide",
+      "evidence_grade": "A",
+      "version_scope": "unspecified-current-page",
+      "covers": ["defense_order", "armor_locations", "armor_absorption", "oa_da"]
+    },
+    {
+      "id": "official-sr-guide",
+      "title": "Guide - Game Settings - Shattered Realm",
+      "url": "https://www.grimdawn.com/guide/game-settings/shattered-realm/",
+      "publisher": "Crate Entertainment",
+      "kind": "official_guide",
+      "evidence_grade": "A",
+      "version_scope": "unspecified-current-page",
+      "covers": ["shattered_realm", "mutators"]
+    },
+    {
+      "id": "official-modding-guide",
+      "title": "Grim Dawn Modding Guide v1.2",
+      "url": "https://www.grimdawn.com/downloads/Grim%20Dawn%20Modding%20Guide.pdf",
+      "publisher": "Crate Entertainment",
+      "kind": "official_guide",
+      "evidence_grade": "A",
+      "version_scope": "guide-version-1.2-2016",
+      "covers": ["dbr", "monster_bio", "skill_configuration", "ai_timing"]
+    },
+    {
+      "id": "patch-1.2.1.6",
+      "title": "Grim Dawn Version v1.2.1.6 + Hotfix",
+      "url": "https://forums.crateentertainment.com/t/grim-dawn-version-v1-2-1-6-hotfix/146187",
+      "publisher": "Crate Entertainment",
+      "kind": "patch_notes",
+      "evidence_grade": "B",
+      "version_scope": "1.2.1.6",
+      "covers": ["stable_version", "shattered_realm", "monster_physical_damage"]
+    },
+    {
+      "id": "grimtools-monsterdb-announcement",
+      "title": "[GrimTools] Monster Database",
+      "url": "https://forums.crateentertainment.com/t/grimtools-monster-database/42861",
+      "publisher": "Dammitt / Crate Entertainment Forum",
+      "kind": "tool_author_description",
+      "evidence_grade": "C",
+      "version_scope": "feature-description",
+      "covers": ["monster_database", "limitations", "skill_behavior"]
+    },
+    {
+      "id": "community-sunder-test-2025",
+      "title": "Can Sunder buff/enhance Sunder and other debuffs?",
+      "url": "https://forums.crateentertainment.com/t/can-sunder-buff-enhance-sunder-and-other-debuffs/144682",
+      "publisher": "Crate Entertainment Forum community",
+      "kind": "community_experiment",
+      "evidence_grade": "C",
+      "version_scope": "reported-around-1.2.1.6-public-test",
+      "covers": ["sunder", "debuff_amplification", "multi_hit"]
+    },
+    {
+      "id": "arz-go-library",
+      "title": "codeberg.org/alex-ilchukov/arz/v2",
+      "url": "https://pkg.go.dev/codeberg.org/alex-ilchukov/arz/v2",
+      "publisher": "Alex Ilchukov",
+      "kind": "open_source_library",
+      "evidence_grade": "A",
+      "version_scope": "library-2.0.2",
+      "covers": ["arz_parser", "mit_license"]
+    },
+    {
+      "id": "save-decryption-tools",
+      "title": "[Tool] Save File Decryption Tools",
+      "url": "https://forums.crateentertainment.com/t/tool-save-file-decryption-tools/110765",
+      "publisher": "Crate Entertainment Forum community",
+      "kind": "open_source_tool_announcement",
+      "evidence_grade": "C",
+      "version_scope": "1.1.9.1-era",
+      "covers": ["player_gdc", "save_parser_limits"]
+    }
+  ]
+}
