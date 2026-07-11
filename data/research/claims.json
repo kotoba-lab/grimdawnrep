@@ -50,6 +50,23 @@
       "applies_to": ["architecture"],
       "evidence": ["official-modding-guide", "arz-go-library"],
       "confidence": "high"
+    },
+    {
+      "id": "compiled-engine-semantics-not-in-arz",
+      "statement": "ARZ and DBR values do not fully define combat semantics because template behavior is implemented by compiled engine code unavailable through normal modding data.",
+      "status": "confirmed",
+      "applies_to": ["architecture", "combat-model"],
+      "evidence": ["official-modding-guide", "forum-compiled-template-boundary"],
+      "confidence": "medium"
+    },
+    {
+      "id": "runtime-combat-not-fully-enumerable",
+      "statement": "All possible combat outcomes cannot be practically enumerated from static data because runtime position, random state, concurrent enemies, timing, and player actions create a combinatorial state space.",
+      "status": "confirmed",
+      "applies_to": ["architecture", "encounter-simulation"],
+      "evidence": ["official-sr-guide", "forum-compiled-template-boundary", "forum-combat-log-limits"],
+      "confidence": "high",
+      "notes": "This is an architectural inference from the documented data/runtime boundary and encounter variables."
     }
   ]
 }

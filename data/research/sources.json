@@ -80,6 +80,26 @@
       "evidence_grade": "C",
       "version_scope": "1.1.9.1-era",
       "covers": ["player_gdc", "save_parser_limits"]
+    },
+    {
+      "id": "forum-compiled-template-boundary",
+      "title": "Is hardcoding possible in Grim Dawn?",
+      "url": "https://forums.crateentertainment.com/t/is-hardcoding-possible-in-grim-dawn/105546",
+      "publisher": "Crate Entertainment Forum modding community",
+      "kind": "community_technical_explanation",
+      "evidence_grade": "C",
+      "version_scope": "engine-architecture-observation",
+      "covers": ["compiled_engine", "template_behavior", "modding_limits"]
+    },
+    {
+      "id": "forum-combat-log-limits",
+      "title": "Any mod to see what killed me?",
+      "url": "https://forums.crateentertainment.com/t/any-mod-to-see-what-killed-me/114339",
+      "publisher": "Crate Entertainment Forum community",
+      "kind": "community_tooling_observation",
+      "evidence_grade": "C",
+      "version_scope": "2022-observation",
+      "covers": ["combat_log", "death_attribution", "runtime_instrumentation"]
     }
   ]
 }

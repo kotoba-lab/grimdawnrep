@@ -22,7 +22,7 @@ Grim Dawn のビルドを「キャラクターシート上の強さ」だけで�
 4. 「ワンパン」は一つの分類ではありません。真の単発、同フレーム近傍の多段、耐性低下やSunder後の追撃、床ダメージとの重なりを分けて扱います。
 5. データは GrimTools の画面スクレイピングへ依存せず、ユーザーが所有するゲームの ARZ をローカル解析して生成する方針が有力です。
 
-詳しくは [初期調査](docs/research/initial-findings.md)、[データ戦略](docs/architecture/data-strategy.md)、[実証実験バックログ](docs/research/experiment-backlog.md) を参照してください。
+詳しくは [初期調査](docs/research/initial-findings.md)、[戦闘データ完全収集の境界](docs/research/coverage-boundary.md)、[データ戦略](docs/architecture/data-strategy.md)、[実証実験バックログ](docs/research/experiment-backlog.md) を参照してください。
 
 ## リポジトリ構成
 
