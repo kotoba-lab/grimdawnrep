@@ -117,6 +117,14 @@ ARZレコードを可能な限り損失なく表現します。原フィール�
 - SR scaling / Mutatorの変更
 - 既存claimの再検証が必要になった範囲
 
-## 現時点の制約
+## 現時点の実データ状況と制約
 
-2026-07-11の実行環境では Steam の標準ライブラリ、一般的な別ドライブ配置、GOGレジストリから Grim Dawn 本体を特定できませんでした。メイン端末には本体が存在するというユーザー情報があるため、実データ検証時にインストールパスを明示するか、その端末上で抽出器を実行します。ARZパーサの実データ検証と敵レコードのフィールドマッピングは未実施です。
+2026-07-13に、この端末のSteam標準配置 `C:\Program Files (x86)\Steam\steamapps\common\Grim Dawn` で次の入力を確認しました。
+
+- Base Game: `database/database.arz`
+- Ashes of Malmouth: `gdx1/database/GDX1.arz`
+- Forgotten Gods: `gdx2/database/GDX2.arz`
+- 英語・日本語を含むlocalization ARC
+- Steam Cloud配下の既存 `player.gdc`
+
+これによりローカル抽出とセーブ取込を同じ端末で検証できます。ただし、ARZパーサによるレコード抽出、敵レコードのフィールドマッピング、`player.gdc` の版互換性検証はまだ実施していません。また、Steamマニフェストやファイルの存在だけからstable / public_testを断定せず、dataset作成時にチャンネルを明示指定するか、検証可能な版情報とともに記録します。
