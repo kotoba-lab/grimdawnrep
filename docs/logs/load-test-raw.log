@@ -1,0 +1,10 @@
+2026-07-13 M0 doctor validation
+fixture unittest: 5 tests passed
+compileall: passed
+fixture CLI: exit 0, 5 files, 0 warnings
+real-data CLI: exit 0
+detection: steam_default
+required files: 5
+warnings: 0
+channel: unknown
+input fingerprint comparison: unchanged (size, UTC mtime, SHA-256)
