@@ -78,7 +78,7 @@ game install / player.gdc / Grim Tools URL
 - インストールパスの明示指定とSteam標準配置の検出
 - ARZ/ARC/セーブを変更しない読み取り専用ガード
 - dataset manifestの初版
-- Base、GDX1、GDX2、日本語localizationの存在・ハッシュ確認
+- Base、GDX1、GDX2、GDX3、日本語localizationの存在・ハッシュ確認
 - 小さな手製fixtureとCI向けゲーム非依存テスト
 
 検証対象:
@@ -299,7 +299,7 @@ M0 -> M1 -> M2 -> M3 -> M6 -> M7
 範囲:
 
 - Steam標準配置または明示パスからGrim Dawnを検出
-- Base、GDX1、GDX2、英語・日本語ARCの存在確認
+- Base、GDX1、GDX2、GDX3、英語・日本語ARCの存在確認
 - ファイルサイズ、更新日時、SHA-256をJSONへ出力
 - stable / public_testはユーザー指定または検証可能な根拠がない限り断定しない
 - 入力ファイルを変更しないことをテスト

@@ -12,7 +12,7 @@ Updated: 2026-07-13
 
 | Definition of done | Status | Evidence / remaining boundary |
 | --- | --- | --- |
-| 1. Regenerate from a clean owned install | Verified | `doctor` and `dataset-extract`; real Base/GDX1/GDX2/EN/JA inputs; input hashes unchanged. |
+| 1. Regenerate from a clean owned install | Verified | `doctor` and `dataset-extract`; real Base/GDX1/GDX2/GDX3/EN/JA inputs; input hashes unchanged. |
 | 2. Ordered expansion integration | Verified | Deterministic Base → GDX1 → GDX2 overlay, future ordered layers supported by the library contract. |
 | 3. Real `player.gdc` and shared URL into one Build model | Verified | Both adapters emit schema 0.1.0. A user-authorized same-save official upload comparison matched 6/6 scalar fields, 12/12 local equipment slots, and 96/96 skills with zero mismatches. Opaque-ID pairs remain explicitly scoped rather than misrepresented as a global map. |
 | 4. Representative enemies, phases, sequences | Verified for the MVP set | 13 real phase records across eight localized enemy names produce 67 scenarios: 61 single hits, four shotgun envelopes, and two DBR-derived DA-debuff/follow-up windows. Hypothetical AI ordering and projectile contacts remain explicit unknowns. |

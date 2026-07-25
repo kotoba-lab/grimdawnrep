@@ -1,0 +1,7 @@
+{
+  "game_version": "fixture",
+  "channel": "stable",
+  "difficulty": "ultimate",
+  "enemy_level": 100,
+  "content": "campaign_single_enemy"
+}

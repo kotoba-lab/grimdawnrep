@@ -50,5 +50,5 @@ python -m grim_dawn_lab dataset-extract `
 ## 既知制約
 
 - 難易度pakの配列順は `difficulty major × player count minor` として解決している。最終OA/DAにはengine由来のlevel/attribute寄与が残るため、現在のattributesは式成分と補正値のtraceとして扱い、実測または表示値照合前に最終値と断定しない。
-- 二つの未解決component skill参照は導入済みBase/GDX1/GDX2に実体がない。将来拡張層検出の対象である。
+- 二つの未解決component skill参照は導入済みBase/GDX1/GDX2/GDX3に実体がない。将来拡張層検出の対象である。
 - 全item索引はRaw閉包に含まれるが、用途別item viewはM4のBuild import前に拡張する。

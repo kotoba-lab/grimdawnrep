@@ -1,10 +1,10 @@
 {
-  "as_of": "2026-07-11",
+  "as_of": "2026-07-25",
   "claims": [
     {
       "id": "enemy-ai-partially-data-driven",
       "statement": "Enemy skill selection is partially reconstructable from database fields including initial timeout, delay, chance, range, and chained skills.",
-      "status": "confirmed",
+      "status": "stale",
       "applies_to": ["data-model"],
       "evidence": ["official-modding-guide", "grimtools-monsterdb-announcement"],
       "confidence": "high"
@@ -36,12 +36,28 @@
     {
       "id": "sunder-amplifies-followup-debuffs",
       "statement": "Sunder can amplify subsequent Sunder and other debuff magnitudes in the tested 1.2.1.6-era public-test behavior.",
-      "status": "provisional",
+      "status": "stale",
       "applies_to": ["reported-around-1.2.1.6-public-test"],
       "evidence": ["community-sunder-test-2025"],
       "confidence": "medium",
       "retest_required": true,
       "notes": "Community fixed-damage tests support the observation, but intent and current stable/public-test behavior are not established."
+    },
+    {
+      "id": "patch-1.3-enemy-defense-changes",
+      "statement": "Patch 1.3.0.0 reports reduced enemy armor and percent armor absorption, requiring dataset revalidation rather than a player-defense constant change.",
+      "status": "confirmed",
+      "applies_to": ["1.3.0.0"],
+      "evidence": ["patch-1.3.0"],
+      "confidence": "high"
+    },
+    {
+      "id": "patch-1.3-spirit-health",
+      "statement": "Patch 1.3.0.0 reports Spirit health contribution changed from 8 to 12; the current player model does not derive health from Spirit.",
+      "status": "confirmed",
+      "applies_to": ["1.3.0.0"],
+      "evidence": ["patch-1.3.0"],
+      "confidence": "high"
     },
     {
       "id": "local-arz-import-feasible",

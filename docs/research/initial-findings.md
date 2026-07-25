@@ -131,7 +131,7 @@ Sunderについて、2025年のコミュニティ実験では「後続のSunder�
 
 ## バージョン上の注意
 
-- 2026-07-11時点で公式 Patch Notes の最新安定版は `1.2.1.6 + Hotfix` です。
+- 2026-07-25時点で公式 Patch Notes の最新安定版は `1.3.0.0` です。Fangs of Asterkarnも同時配信済みです。
 - 同時点で `1.3.0` の公開テストが進行中です。
 - 現行公式ガイドは Fangs of Asterkarn / Berserker / Onslaught の記述を含みます。安定版データと混ぜず、仕様ページにも `applies_to` を持たせます。
 
