@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import unittest
 
 from grim_dawn_lab.doctor import REQUIRED_INPUTS, create_manifest, resolve_install_path
@@ -26,12 +27,25 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual("explicit", manifest["install"]["detection"])
         self.assertEqual("not_established", manifest["channel_evidence"])
         self.assertEqual([], manifest["warnings"])
-        self.assertEqual(5, len(manifest["files"]))
-        self.assertTrue(all(manifest["content"].values()))
-        for item in manifest["files"]:
+        self.assertEqual(8, len(manifest["files"]))
+        self.assertTrue(manifest["content"]["gdx3"])
+        for item in manifest["files"][:len(REQUIRED_INPUTS)]:
             self.assertTrue(item["exists"])
             self.assertEqual(64, len(item["sha256"]))
-            self.assertGreater(item["size_bytes"], 0)
+        self.assertGreater(item["size_bytes"], 0)
+
+    def test_missing_optional_gdx3_is_recorded_without_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            install = Path(temporary)
+            for _, _, relative in REQUIRED_INPUTS:
+                target = install / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(b"fixture")
+            manifest = create_manifest(install)
+        self.assertEqual([], manifest["warnings"])
+        self.assertFalse(manifest["content"]["gdx3"])
+        gdx3 = next(item for item in manifest["files"] if item["key"] == "gdx3_database")
+        self.assertFalse(gdx3["exists"])
 
     def test_diagnostic_does_not_modify_inputs(self) -> None:
         paths = [FIXTURE / relative for _, _, relative in REQUIRED_INPUTS]

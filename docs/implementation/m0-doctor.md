@@ -7,7 +7,7 @@
 ## 対象範囲
 
 - 明示パス、またはWindows上のSteam標準配置からGrim Dawnを検出する。
-- Base、GDX1、GDX2、英語・日本語localizationの存在を確認する。
+- Base、GDX1、GDX2、GDX3、英語・日本語localizationの存在を確認する。Base以外の拡張層は optional として manifest に absent/present を記録する。
 - 各入力の相対パス、サイズ、UTC更新日時、SHA-256をJSONへ記録する。
 - channelは明示指定がない限り `unknown` とする。
 
@@ -26,7 +26,7 @@ python -m grim_dawn_lab doctor --install-path "C:\Program Files (x86)\Steam\stea
 
 - 合成fixtureでゲーム非依存テストが通る。
 - 診断前後で入力のサイズ、更新日時、SHA-256が一致する。
-- 所有ゲームで5入力のmanifestを生成できる。
+- 所有ゲームでBase/GDX1/GDX2/GDX3とlocalizationのmanifestを生成できる。GDX3未所持でも診断は成功し、`gdx3: absent` を記録する。
 
 ```powershell
 $env:PYTHONPATH = "src"

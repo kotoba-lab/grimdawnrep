@@ -19,6 +19,14 @@ REQUIRED_INPUTS = (
     ("localization_ja", "localization", Path("resources/Text_JA.arc")),
 )
 
+# DLC layers are optional: their absence is retained in the manifest instead of
+# being treated as an invalid base-game installation.
+OPTIONAL_INPUTS = (
+    ("gdx3_database", "gdx3", Path("gdx3/database/GDX3.arz")),
+    ("gdx3_localization_en", "gdx3_localization", Path("gdx3/resources/Text_EN.arc")),
+    ("gdx3_localization_ja", "gdx3_localization", Path("gdx3/resources/Text_JA.arc")),
+)
+
 
 def steam_install_candidates(environ: dict[str, str] | None = None) -> list[Path]:
     """Return deduplicated Steam default locations without touching the filesystem."""
@@ -100,8 +108,8 @@ def create_manifest(
                     "message": f"Install path does not exist: {install_path}",
                 }
             )
-        files = [inspect_file(install_path, *definition) for definition in REQUIRED_INPUTS]
-        for item in files:
+        files = [inspect_file(install_path, *definition) for definition in (*REQUIRED_INPUTS, *OPTIONAL_INPUTS)]
+        for item in files[:len(REQUIRED_INPUTS)]:
             if not item["exists"]:
                 warnings.append(
                     {
@@ -125,6 +133,7 @@ def create_manifest(
             "base": any(item["key"] == "base_database" and item["exists"] for item in files),
             "gdx1": any(item["key"] == "gdx1_database" and item["exists"] for item in files),
             "gdx2": any(item["key"] == "gdx2_database" and item["exists"] for item in files),
+            "gdx3": any(item["key"] == "gdx3_database" and item["exists"] for item in files),
             "localization_en": any(item["key"] == "localization_en" and item["exists"] for item in files),
             "localization_ja": any(item["key"] == "localization_ja" and item["exists"] for item in files),
         },

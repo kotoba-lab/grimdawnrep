@@ -22,7 +22,7 @@
     },
     "content": {
       "type": "object",
-      "required": ["base", "gdx1", "gdx2", "localization_en", "localization_ja"],
+      "required": ["base", "gdx1", "gdx2", "gdx3", "localization_en", "localization_ja"],
       "additionalProperties": { "type": "boolean" }
     },
     "files": {
