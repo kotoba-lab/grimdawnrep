@@ -29,10 +29,14 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual([], manifest["warnings"])
         self.assertEqual(8, len(manifest["files"]))
         self.assertTrue(manifest["content"]["gdx3"])
-        for item in manifest["files"][:len(REQUIRED_INPUTS)]:
+        for item in manifest["files"]:
+            if not item["exists"]:
+                self.assertEqual("optional", item["requirement"])
+                continue
             self.assertTrue(item["exists"])
+            self.assertIn(item["requirement"], {"required", "optional"})
             self.assertEqual(64, len(item["sha256"]))
-        self.assertGreater(item["size_bytes"], 0)
+            self.assertGreater(item["size_bytes"], 0)
 
     def test_missing_optional_gdx3_is_recorded_without_error(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -64,7 +68,7 @@ class DoctorTests(unittest.TestCase):
         manifest = create_manifest(ROOT / "missing-install")
         codes = [warning["code"] for warning in manifest["warnings"]]
         self.assertIn("install_path_missing", codes)
-        self.assertEqual(5, codes.count("required_file_missing"))
+        self.assertEqual(1, codes.count("required_file_missing"))
 
     def test_cli_prints_json(self) -> None:
         completed = subprocess.run(
@@ -76,7 +80,7 @@ class DoctorTests(unittest.TestCase):
             text=True,
         )
         manifest = json.loads(completed.stdout)
-        self.assertEqual("1.0.0", manifest["schema_version"])
+        self.assertEqual("1.1.0", manifest["schema_version"])
 
 
 if __name__ == "__main__":

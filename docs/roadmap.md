@@ -28,7 +28,7 @@
 最終ゴールは、次をすべて満たしたときに完了とします。
 
 1. クリーンな環境で、ユーザーが指定または自動検出したゲームインストールからデータセットを再生成できる。
-2. Base Game、GDX1、GDX2および将来拡張を、明示した優先順位で統合できる。
+2. Base Game、GDX1、GDX2、GDX3を、明示した優先順位で統合できる。
 3. 実在する `player.gdc` と Grim Tools共有URLの双方から、同一の内部Buildモデルを生成できる。
 4. 選定した代表敵群について、全フェーズと主要攻撃列を正規化し、対象ビルドへの被ダメージを計算できる。
 5. 少なくとも一つの単発、一つの多段、一つのデバフ後追撃、一つの複数要因遭遇を実測と照合できる。
@@ -121,7 +121,7 @@ game install / player.gdc / Grim Tools URL
 実装:
 
 - ARZレコードの損失を抑えたRaw表現
-- Base → GDX1 → GDX2 → 将来拡張の上書き規則
+- Base → GDX1 → GDX2 → GDX3の上書き規則
 - ARCから英語・日本語localization tagを解決
 - Monster → phase → skill → controller → chained skillの参照追跡
 - アイテム、接辞、セット、コンポーネント、増強剤の最低限の索引

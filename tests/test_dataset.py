@@ -127,9 +127,36 @@ class DatasetTests(unittest.TestCase):
     def test_archive_failure_reports_bounded_stderr_tail(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            with patch("grim_dawn_lab.dataset.subprocess.run") as run:
-                run.return_value.returncode = 7
-                with self.assertRaisesRegex(RuntimeError, "ArchiveTool failed \\(7\\)"):
+            def fake_run(*args, **kwargs):
+                kwargs["stderr"].write(b"PREFIX_SENTINEL" + b"A" * 10000 + b"TAIL_MARKER")
+                return type("Result", (), {"returncode": 7})()
+            with patch("grim_dawn_lab.dataset.subprocess.run", side_effect=fake_run):
+                with self.assertRaisesRegex(RuntimeError, "TAIL_MARKER") as raised:
+                    extract_arz(root / "ArchiveTool.exe", root / "input.arz", root / "out")
+            self.assertNotIn("PREFIX_SENTINEL", str(raised.exception))
+
+    def test_archive_minus_one_accepts_complete_tree_and_signal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            def fake_run(*args, **kwargs):
+                record = root / "out/records/fixture.dbr"
+                record.parent.mkdir(parents=True)
+                record.write_text("x,1,\n", encoding="utf-8")
+                kwargs["stdout"].write(b"Operation completed\n")
+                return type("Result", (), {"returncode": -1})()
+            with patch("grim_dawn_lab.dataset.subprocess.run", side_effect=fake_run):
+                extract_arz(root / "ArchiveTool.exe", root / "input.arz", root / "out")
+
+    def test_archive_minus_one_rejects_incomplete_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            def fake_run(*args, **kwargs):
+                record = root / "out/records/fixture.dbr"
+                record.parent.mkdir(parents=True)
+                record.write_text("x,1,\n", encoding="utf-8")
+                return type("Result", (), {"returncode": -1})()
+            with patch("grim_dawn_lab.dataset.subprocess.run", side_effect=fake_run):
+                with self.assertRaisesRegex(RuntimeError, "completed=False"):
                     extract_arz(root / "ArchiveTool.exe", root / "input.arz", root / "out")
 
 

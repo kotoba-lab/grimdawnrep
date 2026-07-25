@@ -4,6 +4,8 @@
 
 ## E01: 公式Armor例の再現
 
+対象版: 1.3.0.0 stableで再実施。
+
 目的: 被ダメージ計算器の最小オラクルを作る。
 
 - 入力: 物理100、Armor 50、吸収70%
@@ -17,6 +19,8 @@
 
 ## E02: OA/DA境界
 
+対象版: 1.3.0.0 stableで再実施。
+
 目的: DA低下前後で、命中率とクリティカル域がどう変わるかを確認する。
 
 - 公式PTH式の境界値テストを作る。
@@ -25,7 +29,7 @@
 
 ## E03: Sunderと後続デバフ
 
-目的: 2025年のコミュニティ報告が、安定版 `1.2.1.6` とPublic Test `1.3.0` のそれぞれで再現するか確認する。
+目的: 2025年のコミュニティ報告を安定版 `1.3.0.0` で再実施する。
 
 - 同一Sunderの連続適用
 - Sunder後の耐性低下
@@ -67,8 +71,6 @@
 - Shattered Soul buffなどプレイヤー側の一時効果
 - 単体時との被ダメージ差
 
-## 観測記録の最低要件
-
 ## 1.3.0.0 / Fangs of Asterkarn backlog
 
 Source: Crate Entertainment, [v1.3.0.0 patch notes](https://forums.crateentertainment.com/t/grim-dawn-version-v1-3-0-0/155979). These are research items, not implementation commitments.
@@ -102,6 +104,8 @@ Source: Crate Entertainment, [v1.3.0.0 patch notes](https://forums.crateentertai
 - Question: Does converted DoT non-stacking and pet Energy removal affect any current model?
 - Impact: combat/timeline unsupported-effect boundaries.
 - Evidence: 1.3.0.0 controlled tests; retain `unknown` until then.
+
+## 観測記録の最低要件
 
 各記録は次を必須とします。
 

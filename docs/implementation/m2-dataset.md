@@ -2,7 +2,7 @@
 
 ## 1.3.0.0 migration verification (2026-07-25)
 
-Four-layer extraction produced manifest-backed dataset `03b4dc2b5f596072dcde1d6cd422e69915f3a79a64466661809064be31131917` (29,367 records). Local diffs and queues: `plan130-diff-1b4876.json` (15,908 queue entries) and `plan130-diff-aea4d9.json` (13,461). Moosilauke `nemesis_undead_02a/b` HP fields are unchanged (for example `defensiveLife=50` and `characterLife=0` in both datasets), so the reported boss-health change is a scaling record/runtime effect outside this select closure. Armor and absorption fields are likewise absent from this closure and from the current normalized view; this is documented as coverage, not an extraction omission. Broader balancing-record selection is required before those patch-note values can be asserted from a diff.
+Four-layer extraction produced manifest-backed dataset `022e2492c939aa5dc4a3ee4b29a6cebd79c62ff1c2d1a1a854834786572d6595` (29,367 records). The initial four-layer extraction took about 7m25 (22:42:52–22:50:17); a cached build took about 49s (23:04:51–23:05:40). Local diffs and queues: `plan130-final-diff-1b4876.json` (15,908 queue entries) and `plan130-final-diff-aea4d9.json` (13,461). The 2026-07-13 three-layer measurements are historical only. Moosilauke `nemesis_undead_02a/b` HP fields are unchanged (for example `defensiveLife=50` and `characterLife=0` in both datasets), so the reported boss-health change is a scaling record/runtime effect outside this select closure. Armor and absorption fields are likewise absent from this closure and from the current normalized view; this is documented as coverage, not an extraction omission. Broader balancing-record selection is required before those patch-note values can be asserted from a diff.
 
 ## 現在地
 

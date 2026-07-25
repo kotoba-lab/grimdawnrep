@@ -65,7 +65,7 @@ GrimTools Monster Database の公開説明によると、敵の属性、耐性�
 
 公式 Shattered Realm Guide は、深くなるほど敵が強くなり、Mutator は1個から最大8個まで増え、Shardごとにランダム化されると説明しています。従って「スーパーボスをタンクできる」と「高層SRのランダムな複合条件を安定して通る」は同じ評価軸ではありません。
 
-さらに安定版 `1.2.1.6` では Shard 25+ に最低1体のNemesisが出現し、追加Nemesisの確率も上がりました。敵組合せリスクは現行版で無視できません。
+旧安定版 `1.2.1.6` 時点では Shard 25+ に最低1体のNemesisが出現し、追加Nemesisの確率も上がりました。1.3.0.0での現行挙動は再検証待ちです。
 
 出典: [公式 Shattered Realm Guide](https://www.grimdawn.com/guide/game-settings/shattered-realm/), [v1.2.1.6 Patch Notes](https://forums.crateentertainment.com/t/grim-dawn-version-v1-2-1-6-hotfix/146187)
 
@@ -150,4 +150,4 @@ Sunderについて、2025年のコミュニティ実験では「後続のSunder�
 7. 床・設置物を含む持続的な位置取り試験
 8. SRで危険なNemesis二体の組合せ
 
-敵名を先に固定するより、上記の失敗モードを一つずつ再現できる敵をゲームDB抽出後に選定します。候補として Aleksander、Kaisan、Grava'Thul、Iron Maiden、Moosilauke、Kubacabra と、Ravager / Callagadra / Mogdrogen / Crate を比較対象にしますが、攻撃特性は未検証のまま断定しません。
+敵名を先に固定するより、上記の失敗モードを一つずつ再現できる敵をゲームDB抽出後に選定します。候補として Aleksander、Kaisan、Grava'Thul、Iron Maiden、Moosilauke、Kubacabra と、Ravager / Callagadra / Mogdrogen / Crate を比較対象にします。The Dread、Tempest Totems、Marked by the Voidは1.3.0.0の未検証候補です。攻撃特性は未検証のまま断定しません。

@@ -5,7 +5,7 @@
   "type": "object",
   "required": ["schema_version", "tool_version", "generated_at", "channel", "channel_evidence", "install", "content", "files", "warnings"],
   "properties": {
-    "schema_version": { "const": "1.0.0" },
+    "schema_version": { "const": "1.1.0" },
     "tool_version": { "type": "string" },
     "generated_at": { "type": "string", "format": "date-time" },
     "channel": { "enum": ["unknown", "stable", "public_test"] },
@@ -29,12 +29,13 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["key", "group", "relative_path", "exists"],
+        "required": ["key", "group", "relative_path", "exists", "requirement"],
         "properties": {
           "key": { "type": "string" },
           "group": { "type": "string" },
           "relative_path": { "type": "string" },
           "exists": { "type": "boolean" },
+          "requirement": { "enum": ["required", "optional"] },
           "size_bytes": { "type": "integer", "minimum": 0 },
           "modified_at": { "type": "string", "format": "date-time" },
           "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }

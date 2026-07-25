@@ -8,18 +8,18 @@
 - Spirit-to-Health: 1.3.0 patch notes report 12, but the `characterAttributeEquations` records traversed by `dataset.py` are enemy-bio references, not player Spirit equations. The extracted DBR selection therefore cannot directly verify the value; no repository calculation depends on the prior value 8.
 - Human verification required: E01 armor oracle, E02 PTH boundaries, and E03 Sunder behavior. No hard-coded constant was changed to a dataset lookup because the selected dataset does not safely cover all player-runtime sources.
 
-Updated: 2026-07-13
+Updated: 2026-07-25
 
 | Definition of done | Status | Evidence / remaining boundary |
 | --- | --- | --- |
 | 1. Regenerate from a clean owned install | Verified | `doctor` and `dataset-extract`; real Base/GDX1/GDX2/GDX3/EN/JA inputs; input hashes unchanged. |
-| 2. Ordered expansion integration | Verified | Deterministic Base → GDX1 → GDX2 overlay, future ordered layers supported by the library contract. |
-| 3. Real `player.gdc` and shared URL into one Build model | Verified | Both adapters emit schema 0.1.0. A user-authorized same-save official upload comparison matched 6/6 scalar fields, 12/12 local equipment slots, and 96/96 skills with zero mismatches. Opaque-ID pairs remain explicitly scoped rather than misrepresented as a global map. |
+| 2. Ordered expansion integration | Verified | Deterministic Base → GDX1 → GDX2 → GDX3 overlay. |
+| 3. Real `player.gdc` and shared URL into one Build model | Partially verified | GrimTools 1.3.0.0 import is verified; a 1.3 candidate GDC reports data_version 8 then explicitly fails closed for unknown inventory structure. |
 | 4. Representative enemies, phases, sequences | Verified for the MVP set | 13 real phase records across eight localized enemy names produce 67 scenarios: 61 single hits, four shotgun envelopes, and two DBR-derived DA-debuff/follow-up windows. Hypothetical AI ordering and projectile contacts remain explicit unknowns. |
 | 5. One measured example for four encounter classes | Blocked on observations | Deterministic fixtures cover single hit, shotgun, debuff/follow-up combo, and overlap. Observation comparison works, but four real gameplay observations have not been supplied or fabricated. |
 | 6. Regression and explicit unsupported behavior | Verified | Regression tests cover import, normalization, combat, timeline, advisor, observations, revalidation, and release boundaries; unsupported effects, versions, records, state, AI ordering, and projectile contact count are explicit. |
 | 7. Dataset coexistence, diff, and revalidation | Verified | Content-addressed directories, semantic diff, deterministic claim revalidation queue. |
-| 8. No game/save/large Grim Tools replication | Verified | `release-audit` passes 65 tracked and untracked distribution candidates; generated/raw inputs are ignored. |
+| 8. No game/save/large Grim Tools replication | Verified | `release-audit` passes against the current tracked and untracked distribution candidates; generated/raw inputs are ignored. |
 
 ## External authorization / evidence needed for final closure
 

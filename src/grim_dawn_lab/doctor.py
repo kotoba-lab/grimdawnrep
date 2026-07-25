@@ -13,15 +13,15 @@ from grim_dawn_lab import __version__
 
 REQUIRED_INPUTS = (
     ("base_database", "base", Path("database/database.arz")),
-    ("gdx1_database", "gdx1", Path("gdx1/database/GDX1.arz")),
-    ("gdx2_database", "gdx2", Path("gdx2/database/GDX2.arz")),
-    ("localization_en", "localization", Path("resources/Text_EN.arc")),
-    ("localization_ja", "localization", Path("resources/Text_JA.arc")),
 )
 
 # DLC layers are optional: their absence is retained in the manifest instead of
 # being treated as an invalid base-game installation.
 OPTIONAL_INPUTS = (
+    ("localization_en", "localization", Path("resources/Text_EN.arc")),
+    ("localization_ja", "localization", Path("resources/Text_JA.arc")),
+    ("gdx1_database", "gdx1", Path("gdx1/database/GDX1.arz")),
+    ("gdx2_database", "gdx2", Path("gdx2/database/GDX2.arz")),
     ("gdx3_database", "gdx3", Path("gdx3/database/GDX3.arz")),
     ("gdx3_localization_en", "gdx3_localization", Path("gdx3/resources/Text_EN.arc")),
     ("gdx3_localization_ja", "gdx3_localization", Path("gdx3/resources/Text_JA.arc")),
@@ -65,13 +65,14 @@ def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
-def inspect_file(install_path: Path, key: str, group: str, relative_path: Path) -> dict:
+def inspect_file(install_path: Path, key: str, group: str, relative_path: Path, requirement: str) -> dict:
     path = install_path / relative_path
     item = {
         "key": key,
         "group": group,
         "relative_path": relative_path.as_posix(),
         "exists": path.is_file(),
+        "requirement": requirement,
     }
     if item["exists"]:
         stat = path.stat()
@@ -108,8 +109,11 @@ def create_manifest(
                     "message": f"Install path does not exist: {install_path}",
                 }
             )
-        files = [inspect_file(install_path, *definition) for definition in (*REQUIRED_INPUTS, *OPTIONAL_INPUTS)]
-        for item in files[:len(REQUIRED_INPUTS)]:
+        files = [inspect_file(install_path, *definition, "required") for definition in REQUIRED_INPUTS]
+        files.extend(inspect_file(install_path, *definition, "optional") for definition in OPTIONAL_INPUTS)
+        for item in files:
+            if item["requirement"] != "required":
+                continue
             if not item["exists"]:
                 warnings.append(
                     {
@@ -119,7 +123,7 @@ def create_manifest(
                 )
 
     return {
-        "schema_version": "1.0.0",
+        "schema_version": "1.1.0",
         "tool_version": __version__,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "channel": channel,

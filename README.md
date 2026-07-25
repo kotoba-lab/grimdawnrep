@@ -55,7 +55,7 @@ $env:PYTHONPATH = "src"
 python -m grim_dawn_lab doctor --install-path "C:\Program Files (x86)\Steam\steamapps\common\Grim Dawn"
 python -m grim_dawn_lab single-hit --build tests/fixtures/combat/build.json --skill tests/fixtures/combat/skill.json
 python -m grim_dawn_lab dataset-extract --install-path "C:\Program Files (x86)\Steam\steamapps\common\Grim Dawn" --select "records/creatures/enemies/nemesis/nemesis_undead_02a.dbr"
-python -m grim_dawn_lab sequence --build tests/fixtures/combat/build.json --attacks tests/fixtures/timeline/combo.json
+python -m grim_dawn_lab sequence --build tests/fixtures/combat/build.json --attacks tests/fixtures/combat/attacks.json
 python -m grim_dawn_lab save-import --path "C:\path\to\player.gdc" --redact-name
 python -m grim_dawn_lab grimtools-import https://www.grimtools.com/calc/DV9G4mQN
 python -m grim_dawn_lab same-save-compare --save "C:\path\to\player.gdc" --grimtools-response upload-response.json

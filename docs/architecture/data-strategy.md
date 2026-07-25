@@ -119,12 +119,13 @@ ARZレコードを可能な限り損失なく表現します。原フィール�
 
 ## 現時点の実データ状況と制約
 
-2026-07-13に、この端末のSteam標準配置 `C:\Program Files (x86)\Steam\steamapps\common\Grim Dawn` で次の入力を確認しました。
+2026-07-25に、この端末のSteam標準配置 `C:\Program Files (x86)\Steam\steamapps\common\Grim Dawn` で1.3.0.0の次の入力を確認しました。
 
 - Base Game: `database/database.arz`
 - Ashes of Malmouth: `gdx1/database/GDX1.arz`
 - Forgotten Gods: `gdx2/database/GDX2.arz`
+- Fangs of Asterkarn: `gdx3/database/GDX3.arz`
 - 英語・日本語を含むlocalization ARC
 - Steam Cloud配下の既存 `player.gdc`
 
-これによりローカル抽出とセーブ取込を同じ端末で検証できます。ただし、ARZパーサによるレコード抽出、敵レコードのフィールドマッピング、`player.gdc` の版互換性検証はまだ実施していません。また、Steamマニフェストやファイルの存在だけからstable / public_testを断定せず、dataset作成時にチャンネルを明示指定するか、検証可能な版情報とともに記録します。
+これにより4層overlayのローカル抽出とdataset差分は実施済みです。1.3候補`player.gdc`はdata_version 8を読めるものの未知inventory構造でfail-closedし、部分Buildを出力しません。Steamマニフェストやファイルの存在だけからstable / public_testを断定せず、dataset作成時にチャンネルを明示指定します。
