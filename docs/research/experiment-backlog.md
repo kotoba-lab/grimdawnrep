@@ -69,6 +69,40 @@
 
 ## 観測記録の最低要件
 
+## 1.3.0.0 / Fangs of Asterkarn backlog
+
+Source: Crate Entertainment, [v1.3.0.0 patch notes](https://forums.crateentertainment.com/t/grim-dawn-version-v1-3-0-0/155979). These are research items, not implementation commitments.
+
+### E07: Berserker identity boundary (high)
+
+- Question: Can GrimTools external mastery IDs, `player.gdc`, and the versioned dataset identify Berserker without guessing?
+- Impact: `grimtools.py`, `gdc.py`, dataset mastery records.
+- Evidence: a 1.3.0.0 Berserker URL and a human-authorized save, with explicit local record mapping.
+
+### E08: Ascendant difficulty model (high)
+
+- Question: Does Ascendant require a new encounter channel/difficulty enum or invalidate the current normal/elite/ultimate array index?
+- Impact: `schemas/encounter.schema.json`, `dataset.py` difficulty indexing.
+- Evidence: extracted Ascendant balancing records plus a controlled in-game encounter.
+
+### E09: Awakening and new affix states (medium)
+
+- Question: How do Awakening, Ascendant third affixes, and affix rerolls alter the item model?
+- Impact: item normalization and Build equipment provenance.
+- Evidence: anonymized item records before/after each operation.
+
+### E10: New encounter candidates (medium)
+
+- Question: What records/phases represent The Dread, Tempest Totems, and Marked by the Void?
+- Impact: encounter candidate selection and coverage reports.
+- Evidence: DBR record closure and at least one observation per encounter.
+
+### E11: Changed runtime semantics (medium)
+
+- Question: Does converted DoT non-stacking and pet Energy removal affect any current model?
+- Impact: combat/timeline unsupported-effect boundaries.
+- Evidence: 1.3.0.0 controlled tests; retain `unknown` until then.
+
 各記録は次を必須とします。
 
 - 一意なexperiment ID
