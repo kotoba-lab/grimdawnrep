@@ -6,8 +6,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
-from grim_dawn_lab.dataset import build_dataset_from_dbr_roots, diff_datasets, evaluate_level_expression, evaluate_numeric_expression, parse_dbr, stable_input_manifest, write_versioned_dataset
+from grim_dawn_lab.dataset import build_dataset_from_dbr_roots, diff_datasets, evaluate_level_expression, evaluate_numeric_expression, extract_arz, parse_dbr, stable_input_manifest, write_versioned_dataset
 from test_arc import make_arc
 
 
@@ -122,6 +123,14 @@ class DatasetTests(unittest.TestCase):
     def test_stable_manifest_excludes_only_observation_time(self) -> None:
         manifest = {"generated_at": "now", "files": [{"sha256": "abc"}], "channel": "stable"}
         self.assertEqual({"files": [{"sha256": "abc"}], "channel": "stable"}, stable_input_manifest(manifest))
+
+    def test_archive_failure_reports_bounded_stderr_tail(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with patch("grim_dawn_lab.dataset.subprocess.run") as run:
+                run.return_value.returncode = 7
+                with self.assertRaisesRegex(RuntimeError, "ArchiveTool failed \\(7\\)"):
+                    extract_arz(root / "ArchiveTool.exe", root / "input.arz", root / "out")
 
 
 if __name__ == "__main__":

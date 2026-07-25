@@ -18,7 +18,7 @@ from grim_dawn_lab.release import audit_git_distribution
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="grim-dawn-lab")
+    parser = argparse.ArgumentParser(prog="grim-dawn-lab", allow_abbrev=False)
     subparsers = parser.add_subparsers(dest="command", required=True)
     doctor = subparsers.add_parser("doctor", help="inspect local game inputs read-only")
     doctor.add_argument("--install-path", type=Path)

@@ -9,6 +9,7 @@ import json
 import math
 from pathlib import Path
 import subprocess
+import tempfile
 from typing import Iterable, Mapping
 
 from grim_dawn_lab.arc import parse_localization_arc
@@ -429,14 +430,29 @@ def build_revalidation_queue(diff: Mapping) -> list[dict[str, str | list[str]]]:
 def extract_arz(archive_tool: Path, arz: Path, output: Path) -> None:
     """Invoke the owner-supplied ArchiveTool without modifying its inputs."""
     output.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        [str(archive_tool), str(arz), "-database", str(output.resolve())],
-        check=True,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
+    with tempfile.TemporaryFile(mode="w+b") as stdout, tempfile.TemporaryFile(mode="w+b") as stderr:
+        completed = subprocess.run(
+            [str(archive_tool), str(arz), "-database", str(output.resolve())],
+            stdin=subprocess.DEVNULL,
+            stdout=stdout,
+            stderr=stderr,
+            check=False,
+        )
+        records = output / "records"
+        has_records = records.is_dir() and any(records.rglob("*.dbr"))
+        stdout.seek(0, 2)
+        stdout.seek(max(0, stdout.tell() - 4096))
+        completed_signal = b"Operation completed" in stdout.read()
+        # ArchiveTool 1.3.0.0 returns -1 despite writing a complete DBR tree.
+        # Accept only that observed code and only with the expected structure.
+        accepted = completed.returncode == 0 and has_records
+        accepted = accepted or (completed.returncode == -1 and has_records and completed_signal)
+        if not accepted:
+            stderr.seek(0, 2)
+            size = stderr.tell()
+            stderr.seek(max(0, size - 4096))
+            detail = stderr.read().decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"ArchiveTool failed ({completed.returncode}) for {arz}; records={has_records}; completed={completed_signal}: {detail[-4096:]}")
 
 
 def extract_and_build_dataset(
