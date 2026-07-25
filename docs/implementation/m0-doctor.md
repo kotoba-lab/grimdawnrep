@@ -7,7 +7,7 @@
 ## 対象範囲
 
 - 明示パス、またはWindows上のSteam標準配置からGrim Dawnを検出する。
-- Base、GDX1、GDX2、GDX3、英語・日本語localizationの存在を確認する。Base以外の拡張層は optional として manifest に absent/present を記録する。
+- Base ARZのみをrequiredとして確認する。GDX1、GDX2、GDX3、英語・日本語localizationはoptionalで、manifest各fileにrequired/optional区分とabsent/presentを記録する。
 - 各入力の相対パス、サイズ、UTC更新日時、SHA-256をJSONへ記録する。
 - channelは明示指定がない限り `unknown` とする。
 

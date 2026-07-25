@@ -22,7 +22,7 @@ Grim Dawn のビルドを「キャラクターシート上の強さ」だけで�
 4. 「ワンパン」は一つの分類ではありません。真の単発、同フレーム近傍の多段、耐性低下やSunder後の追撃、床ダメージとの重なりを分けて扱います。
 5. データは GrimTools の画面スクレイピングへ依存せず、ユーザーが所有するゲームの ARZ をローカル解析して生成する方針が有力です。
 
-2026-07-13に、この端末のSteam版インストールからBase Game、GDX1、GDX2、英語・日本語localizationを抽出し、Moosilaukeの全フェーズを版付きdatasetへ正規化しました。既存のSteam Cloudセーブも、入力不変を確認しながら装備・スキルを共通Buildモデルへ読み込めています。
+2026-07-25に、この端末のSteam版1.3.0.0インストールからBase Game、GDX1、GDX2、GDX3、英語・日本語localizationを4層抽出し、Moosilaukeの全フェーズを版付きdatasetへ正規化しました。1.3候補のSteam Cloudセーブはdata_version 8を確認した後、未知inventory構造を明示してfail-closedします。
 
 詳しくは [初期調査](docs/research/initial-findings.md)、[戦闘データ完全収集の境界](docs/research/coverage-boundary.md)、[データ戦略](docs/architecture/data-strategy.md)、[実証実験バックログ](docs/research/experiment-backlog.md) を参照してください。
 

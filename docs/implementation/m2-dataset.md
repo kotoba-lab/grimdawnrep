@@ -9,7 +9,7 @@ Four-layer extraction produced manifest-backed dataset `022e2492c939aa5dc4a3ee4b
 M2のRaw DBR縦切り、ARC v3 localization、敵skill正規化view、一コマンド再生成を実装した。公式同梱 `ArchiveTool.exe -database` が読み取り専用で生成するDBRを入力とし、次を行う。
 
 - CSV形式のフィールドを文字列のまま保持し、重複キーを配列として失わない。
-- Base → GDX1 → GDX2の指定順で同一record idを上書きする。
+- Base → GDX1 → GDX2 → GDX3の指定順で同一record idを上書きする。
 - 各正規化recordにsource layer、上書き元、原record id、normalization rule IDを残す。
 - 選択recordから `records/**/*.dbr` 参照を追跡する。セミコロン区切り参照も個別に扱う。
 - canonical JSONのSHA-256をdataset IDとし、ID別ディレクトリへ保存する。
