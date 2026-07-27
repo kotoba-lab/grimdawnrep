@@ -220,6 +220,8 @@ game install / player.gdc / Grim Tools URL
 
 ## M6: Encounter Advisor MVP
 
+注記（2026-07-27）: 本節のEncounter Advisorとは別に、`docs/implementation/m6-item-query.md` のitem query M6（T0–T4）は完了。耐性ギャップ提案は未着手の別スコープ。
+
 目的: 一つの実ビルドへ、複数の代表的な敵・攻撃列を適用して弱点を説明します。
 
 実装:

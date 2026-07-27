@@ -8,7 +8,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from grim_dawn_lab.dataset import build_dataset_from_dbr_roots, diff_datasets, evaluate_level_expression, evaluate_numeric_expression, extract_arz, parse_dbr, stable_input_manifest, write_versioned_dataset
+from grim_dawn_lab.cli import main
+from grim_dawn_lab.dataset import build_dataset_from_dbr_roots, diff_datasets, enumerate_records_by_prefix, evaluate_level_expression, evaluate_numeric_expression, extract_arz, parse_dbr, stable_input_manifest, write_versioned_dataset
 from test_arc import make_arc
 
 
@@ -48,6 +49,45 @@ class DatasetTests(unittest.TestCase):
         self.assertEqual(2, candidate["initial_timeout_seconds"])
         self.assertEqual(0.75, candidate["chance"])
         self.assertEqual("ShortRange", candidate["range"])
+
+    def test_select_prefix_enumerates_layers_and_preserves_override_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            base = root / "base"
+            gdx1 = root / "gdx1"
+            (base / "records/items/weapons").mkdir(parents=True)
+            (gdx1 / "records/items/weapons").mkdir(parents=True)
+            (base / "records/items/weapons/shared.dbr").write_text("Class,Base,\n", encoding="utf-8")
+            (base / "records/items/weapons/base_only.dbr").write_text("Class,BaseOnly,\n", encoding="utf-8")
+            (gdx1 / "records/items/weapons/shared.dbr").write_text("Class,Expansion,\n", encoding="utf-8")
+            (gdx1 / "records/items/weapons/expansion_only.dbr").write_text("Class,ExpansionOnly,\n", encoding="utf-8")
+            roots = [("base", base), ("gdx1", gdx1)]
+            selected = enumerate_records_by_prefix(roots, "RECORDS\\ITEMS/")
+            self.assertEqual(
+                [
+                    "records/items/weapons/base_only.dbr",
+                    "records/items/weapons/expansion_only.dbr",
+                    "records/items/weapons/shared.dbr",
+                ],
+                selected,
+            )
+            dataset = build_dataset_from_dbr_roots(roots, selected, selected_prefixes=["RECORDS\\ITEMS/"])
+            self.assertEqual(["records/items/"], dataset["selected_prefixes"])
+            self.assertEqual("Expansion", dataset["records"]["records/items/weapons/shared.dbr"]["fields"]["Class"])
+            self.assertEqual(["base"], dataset["records"]["records/items/weapons/shared.dbr"]["provenance"]["overrides"])
+            without_prefix = build_dataset_from_dbr_roots(roots, selected)
+            self.assertNotEqual(without_prefix["dataset_id"], dataset["dataset_id"])
+
+    def test_dataset_build_requires_select_or_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = root / "manifest.json"
+            manifest.write_text("{}", encoding="utf-8")
+            with self.assertRaisesRegex(SystemExit, "at least one --select or --select-prefix"):
+                main([
+                    "dataset-build", "--base", str(FIXTURE / "base"), "--output-root", str(root),
+                    "--input-manifest", str(manifest),
+                ])
 
     def test_level_expression_rejects_code_and_floors_result(self) -> None:
         self.assertEqual(11, evaluate_level_expression("(charLevel/10)+1", 100))

@@ -1,5 +1,10 @@
 # Roadmap verification status
 
+## M6 item query (2026-07-27)
+
+- T0–T4完了: `records/items/` datasetからEN/JA item v1/v2、affix v1、JSONL照会CLIを生成し、未知Class・未解決参照はfail-closedで出力する。
+- 最終検証: 30 pytest、CLI smoke、`release-audit`、`git diff --check`を通過。ゲーム由来raw/generatedとsaveはgit配布候補外。
+
 ## 1.3.0 constant verification (2026-07-25)
 
 - Verified from `base/records/game/combatformulas.dbr`: DA coefficients `level*12`, `physique*0.5`, and `+53`; PTH minimum `55`; PTH thresholds/modifiers; and armor-region weights (head 15, shoulders 15, torso 26, arms 12, legs 20, feet 12).

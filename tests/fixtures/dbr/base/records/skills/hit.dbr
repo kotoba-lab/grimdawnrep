@@ -1,0 +1,5 @@
+offensivePhysicalMin,5;10;15;20;25;30;35;40;45;50;55,
+offensiveAetherMin,1,
+offensivePoisonMin,1,
+offensiveSlowDefensiveAbilityMin,10,
+offensiveSlowDefensiveAbilityDurationMin,2,

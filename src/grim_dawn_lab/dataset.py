@@ -42,6 +42,21 @@ def _portable_record_path(root: Path, record_id: str) -> Path:
     return root.joinpath(*record_id.split("/"))
 
 
+def enumerate_records_by_prefix(roots: Iterable[tuple[str, Path]], prefix: str) -> list[str]:
+    """List normalized DBR record ids matching a prefix in any supplied layer."""
+    normalized_prefix = prefix.replace("\\", "/").lower()
+    records: set[str] = set()
+    for _, root in roots:
+        resolved_root = root.resolve()
+        if not resolved_root.is_dir():
+            continue
+        for path in resolved_root.rglob("*.dbr"):
+            record_id = path.relative_to(resolved_root).as_posix().lower()
+            if record_id.startswith(normalized_prefix):
+                records.add(record_id)
+    return sorted(records)
+
+
 def _references(fields: Mapping[str, str | list[str]]) -> list[str]:
     references: set[str] = set()
     for value in fields.values():
@@ -282,6 +297,7 @@ def build_dataset_from_dbr_roots(
     roots: Iterable[tuple[str, Path]],
     selected_records: Iterable[str],
     *,
+    selected_prefixes: Iterable[str] = (),
     input_manifest: Mapping | None = None,
     localization_arcs: Mapping[str, Path | Iterable[Path]] | None = None,
     enemy_level: int = 100,
@@ -346,7 +362,8 @@ def build_dataset_from_dbr_roots(
         "schema_version": "0.1.0",
         "normalization_rule_id": NORMALIZATION_RULE_ID,
         "layer_precedence": [name for name, _ in layers],
-        "selected_records": sorted(record.replace("\\", "/").lower() for record in selected_records),
+        "selected_records": sorted(set(record.replace("\\", "/").lower() for record in selected_records)),
+        "selected_prefixes": sorted(set(prefix.replace("\\", "/").lower() for prefix in selected_prefixes)),
         "records": dict(sorted(records.items())),
         "missing_references": sorted(missing),
         "referenced_tags": referenced_tags,
@@ -461,6 +478,7 @@ def extract_and_build_dataset(
     output_root: Path,
     selected_records: Iterable[str],
     *,
+    selected_prefixes: Iterable[str] = (),
     channel: str = "unknown",
     enemy_level: int = 100,
     difficulty: str = "ultimate",
@@ -509,9 +527,14 @@ def extract_and_build_dataset(
         "ja": [install_path / "resources" / "Text_JA.arc"],
     }
     localization = {locale: [path for path in paths if path.is_file()] for locale, paths in localization.items()}
+    normalized_prefixes = [prefix.replace("\\", "/").lower() for prefix in selected_prefixes]
+    selected = [record.replace("\\", "/").lower() for record in selected_records]
+    for prefix in normalized_prefixes:
+        selected.extend(enumerate_records_by_prefix(roots, prefix))
     dataset = build_dataset_from_dbr_roots(
         roots,
-        selected_records,
+        selected,
+        selected_prefixes=normalized_prefixes,
         input_manifest=stable_manifest,
         localization_arcs=localization,
         enemy_level=enemy_level,
