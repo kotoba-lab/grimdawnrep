@@ -62,6 +62,19 @@ def test_current_state_transition_invariants_fail_closed(state: SyncState, messa
 def test_valid_commit_phases_round_trip(tmp_path: Path) -> None:
     commit = "c" * 40
     states = [
+        SyncState(
+            last_applied_manifest_root_hash="d" * 64,
+            machine_id="machine",
+            phase="bootstrap_pending",
+            local_commit=commit,
+        ),
+        SyncState(
+            last_applied_manifest_root_hash="d" * 64,
+            machine_id="machine",
+            phase="bootstrap_pending",
+            local_commit=commit,
+            bootstrap_live_applied=True,
+        ),
         _active(),
         _active(phase="committed", local_commit=commit),
         _active(phase="pushed", local_commit=commit, pushed_commit=commit),
@@ -72,6 +85,66 @@ def test_valid_commit_phases_round_trip(tmp_path: Path) -> None:
         path = tmp_path / f"state-{index}.json"
         save_state(path, state)
         assert load_state(path) == state
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        SyncState(machine_id="machine", phase="bootstrap_pending", local_commit="c" * 40),
+        SyncState(
+            last_applied_manifest_root_hash="d" * 64,
+            phase="bootstrap_pending",
+            local_commit="c" * 40,
+        ),
+        SyncState(
+            last_applied_manifest_root_hash="d" * 64,
+            machine_id="machine",
+            phase="bootstrap_pending",
+            local_commit="c" * 40,
+            pushed_commit="c" * 40,
+        ),
+        SyncState(
+            last_applied_remote_commit="c" * 40,
+            last_applied_manifest_root_hash="d" * 64,
+            machine_id="machine",
+            phase="bootstrap_pending",
+            local_commit="c" * 40,
+        ),
+    ],
+)
+def test_bootstrap_pending_requires_only_machine_commit_and_root(state: SyncState) -> None:
+    with pytest.raises(SyncError, match="Bootstrap-pending"):
+        parse_state(state.as_dict())
+
+
+def test_pre_live_marker_current_shape_remains_backward_compatible(tmp_path: Path) -> None:
+    state = SyncState(
+        last_applied_manifest_root_hash="d" * 64,
+        machine_id="machine",
+        phase="bootstrap_pending",
+        local_commit="c" * 40,
+    )
+    old_shape = state.as_dict()
+    old_shape.pop("bootstrap_live_applied")
+    parsed = parse_state(old_shape)
+    assert parsed == state
+    path = tmp_path / "upgraded.json"
+    save_state(path, parsed)
+    assert json.loads(path.read_text(encoding="utf-8"))["bootstrap_live_applied"] is False
+
+
+def test_live_marker_is_boolean_and_bootstrap_only() -> None:
+    invalid_type = SyncState(
+        last_applied_manifest_root_hash="d" * 64,
+        machine_id="machine",
+        phase="bootstrap_pending",
+        local_commit="c" * 40,
+    ).as_dict()
+    invalid_type["bootstrap_live_applied"] = "true"
+    with pytest.raises(SyncError, match="boolean"):
+        parse_state(invalid_type)
+    with pytest.raises(SyncError, match="Inactive state"):
+        parse_state(SyncState(bootstrap_live_applied=True).as_dict())
 
 
 @pytest.mark.parametrize(

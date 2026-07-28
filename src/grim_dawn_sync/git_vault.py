@@ -7,6 +7,7 @@ Locking and the CLI workflow deliberately live in later tickets.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 from pathlib import Path, PurePosixPath
 import shutil
@@ -19,7 +20,13 @@ import uuid
 from typing import Iterable
 
 from grim_dawn_sync.errors import EXIT_CONFLICT, EXIT_CONFIGURATION, EXIT_RECOVERY_REQUIRED, EXIT_VALIDATION, SyncError
-from grim_dawn_sync.manifest import assert_safe_save_file, stable_manifest, validate_manifest_path
+from grim_dawn_sync.manifest import (
+    MANIFEST_SCHEMA_VERSION,
+    assert_safe_save_file,
+    is_character_player_path,
+    stable_manifest,
+    validate_manifest_path,
+)
 from grim_dawn_sync.snapshot import _copy_verified
 from grim_dawn_sync.validation import validate_players
 
@@ -158,10 +165,86 @@ def _oid_value(value: str, label: str = "commit") -> str:
     return value
 
 
+def _valid_snapshot_token(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and len(value) <= 128
+        and not any(char in value for char in "/\\\r\n\0")
+        and ".." not in value
+    )
+
+
 def _snapshot_token(value: str, label: str) -> str:
-    if not isinstance(value, str) or not value or len(value) > 128 or any(char in value for char in "/\\\r\n\0") or ".." in value:
+    if not _valid_snapshot_token(value):
         raise SyncError("invalid_snapshot_token", f"Invalid snapshot {label}.", EXIT_CONFIGURATION)
     return value
+
+
+def _manifest_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    """Reject duplicate JSON members at every nesting level."""
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate manifest member")
+        result[key] = value
+    return result
+
+
+def _validated_manifest(payload: object) -> dict:
+    """Validate committed manifest data without consulting the filesystem."""
+    fields = {
+        "schema_version", "created_at", "machine_id", "root_hash",
+        "file_count", "total_bytes", "character_count", "files",
+    }
+    if not isinstance(payload, dict) or set(payload) != fields:
+        raise ValueError("manifest schema")
+    if payload["schema_version"] != MANIFEST_SCHEMA_VERSION:
+        raise ValueError("manifest version")
+    if not isinstance(payload["created_at"], str) or not payload["created_at"]:
+        raise ValueError("manifest timestamp")
+    if not isinstance(payload["machine_id"], str) or not payload["machine_id"]:
+        raise ValueError("manifest machine")
+    if not isinstance(payload["root_hash"], str) or not re.fullmatch(r"[0-9a-f]{64}", payload["root_hash"]):
+        raise ValueError("manifest root hash")
+    for name in ("file_count", "total_bytes", "character_count"):
+        if isinstance(payload[name], bool) or not isinstance(payload[name], int) or payload[name] < 0:
+            raise ValueError("manifest count")
+    if not isinstance(payload["files"], list):
+        raise ValueError("manifest files")
+
+    files: list[dict[str, object]] = []
+    folded: set[str] = set()
+    previous_key: str | None = None
+    for raw in payload["files"]:
+        if not isinstance(raw, dict) or set(raw) != {"path", "size", "sha256"}:
+            raise ValueError("manifest file schema")
+        path, size, digest = raw["path"], raw["size"], raw["sha256"]
+        if not isinstance(path, str) or validate_manifest_path(path) != path:
+            raise ValueError("manifest file path")
+        key = unicodedata.normalize("NFC", path).casefold()
+        if key in folded or (previous_key is not None and key <= previous_key):
+            raise ValueError("manifest file order")
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            raise ValueError("manifest file size")
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError("manifest file hash")
+        folded.add(key)
+        previous_key = key
+        files.append({"path": path, "size": size, "sha256": digest})
+
+    if payload["file_count"] != len(files):
+        raise ValueError("manifest file count")
+    if payload["total_bytes"] != sum(item["size"] for item in files):
+        raise ValueError("manifest byte count")
+    if payload["character_count"] != sum(1 for item in files if is_character_player_path(str(item["path"]))):
+        raise ValueError("manifest character count")
+    canonical = "\n".join(
+        f"{item['path']}\0{item['size']}\0{item['sha256']}" for item in files
+    ).encode()
+    if hashlib.sha256(canonical).hexdigest() != payload["root_hash"]:
+        raise ValueError("manifest root mismatch")
+    return payload
 
 
 @dataclass(frozen=True)
@@ -266,10 +349,121 @@ class GitVault:
         elif status.relation == "diverged": raise SyncError("vault_diverged", "Vault history diverged; automatic merge is forbidden.", EXIT_CONFLICT, {"local": status.local_oid, "remote": status.remote_oid})
         return status
 
-    def snapshot(self, source: Path, *, machine_id: str, session_id: str, retries: int = 1, window_seconds: float = 0, validator=validate_players) -> str:
+    def read_manifest(self, commit: str) -> dict:
+        """Read and validate a committed manifest without extracting its save."""
+        commit = _oid_value(commit)
+        result = self.runner.run("show", f"{commit}:.sync/manifest.json", check=False)
+        if result.returncode:
+            raise SyncError(
+                "invalid_remote_manifest",
+                "Remote commit has no readable save manifest.",
+                EXIT_VALIDATION,
+            )
+        try:
+            payload = json.loads(result.stdout, object_pairs_hook=_manifest_object)
+            return _validated_manifest(payload)
+        except (json.JSONDecodeError, UnicodeError, ValueError, SyncError) as error:
+            raise SyncError(
+                "invalid_remote_manifest",
+                "Remote commit save manifest is invalid.",
+                EXIT_VALIDATION,
+            ) from error
+
+    def _committed_save_files(self, commit: str) -> dict[str, tuple[int, str]]:
+        """Return the complete, verified ``save/`` blob table for a commit.
+
+        This deliberately consumes NUL-delimited Git output and object bytes;
+        it never checks out or otherwise materializes the committed tree.
+        """
+        try:
+            listing = self.runner.run_bytes("ls-tree", "-r", "-z", commit, "--", "save")
+        except SyncError as error:
+            raise SyncError("invalid_remote_manifest", "Remote commit save tree could not be read.", EXIT_VALIDATION) from error
+        result: dict[str, tuple[int, str]] = {}
+        folded: set[str] = set()
+        for raw in listing.split(b"\0"):
+            if not raw:
+                continue
+            try:
+                meta, encoded_path = raw.split(b"\t", 1)
+                mode, kind, encoded_oid = meta.split()
+                path = encoded_path.decode("utf-8", "strict")
+                oid = encoded_oid.decode("ascii", "strict")
+            except (ValueError, UnicodeError):
+                raise SyncError("unsafe_vault_tree", "Vault tree entry was malformed.", EXIT_VALIDATION)
+            if mode != b"100644" or kind != b"blob" or not _OID.fullmatch(oid) or not path.startswith("save/"):
+                raise SyncError("unsafe_vault_tree", "Vault tree contains a non-file save entry.", EXIT_VALIDATION)
+            try:
+                relative = validate_manifest_path(path[5:])
+            except SyncError as error:
+                raise SyncError("unsafe_vault_tree", "Vault tree contains an unsafe path.", EXIT_VALIDATION) from error
+            key = unicodedata.normalize("NFC", relative).casefold()
+            if relative in result or key in folded:
+                raise SyncError("unsafe_vault_tree", "Vault tree has colliding paths.", EXIT_VALIDATION)
+            try:
+                blob = self.runner.run_bytes("cat-file", "blob", oid)
+            except SyncError as error:
+                raise SyncError("invalid_remote_manifest", "Remote save blob could not be read.", EXIT_VALIDATION) from error
+            folded.add(key)
+            result[relative] = (len(blob), hashlib.sha256(blob).hexdigest())
+        return result
+
+    def read_vault_metadata(self, commit: str) -> dict:
+        """Read exact committed snapshot provenance without materializing it."""
+        commit = _oid_value(commit)
+        result = self.runner.run("show", f"{commit}:.sync/vault.json", check=False)
+        if result.returncode:
+            raise SyncError(
+                "invalid_vault_metadata",
+                "Committed snapshot provenance is missing.",
+                EXIT_VALIDATION,
+            )
+        try:
+            payload = json.loads(result.stdout, object_pairs_hook=_manifest_object)
+        except (json.JSONDecodeError, UnicodeError, ValueError) as error:
+            raise SyncError(
+                "invalid_vault_metadata",
+                "Committed snapshot provenance is invalid.",
+                EXIT_VALIDATION,
+            ) from error
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != {"schema_version", "machine_id", "session_id", "root_hash"}
+            or payload.get("schema_version") != "1.0.0"
+            or not _valid_snapshot_token(payload.get("machine_id"))
+            or not _valid_snapshot_token(payload.get("session_id"))
+            or not isinstance(payload.get("root_hash"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", payload["root_hash"])
+        ):
+            raise SyncError(
+                "invalid_vault_metadata",
+                "Committed snapshot provenance is invalid.",
+                EXIT_VALIDATION,
+            )
+        return payload
+
+    def validate_commit_snapshot(self, commit: str) -> dict:
+        """Fail closed unless every committed save blob matches its manifest."""
+        commit = _oid_value(commit)
+        manifest = self.read_manifest(commit)
+        actual = self._committed_save_files(commit)
+        declared = {str(item["path"]): (int(item["size"]), str(item["sha256"])) for item in manifest["files"]}
+        if actual != declared:
+            raise SyncError("committed_save_mismatch", "Committed save tree does not match its manifest.", EXIT_VALIDATION)
+        return manifest
+
+    def snapshot(self, source: Path, *, machine_id: str, session_id: str, expected_manifest: dict | None = None, retries: int = 1, window_seconds: float = 0, validator=validate_players, state_hook=None) -> str:
         self.preflight()
         machine_id = _snapshot_token(machine_id, "machine ID"); session_id = _snapshot_token(session_id, "session ID")
-        expected = stable_manifest(source, machine_id=machine_id, retries=retries, window_seconds=window_seconds)
+        # New sync callers supply the manifest calculated while planning.  Keep
+        # the old convenience API for direct callers, but never silently use a
+        # caller supplied malformed manifest.
+        expected = _validated_manifest(expected_manifest) if expected_manifest is not None else stable_manifest(source, machine_id=machine_id, retries=retries, window_seconds=window_seconds)
+        if expected["machine_id"] != machine_id:
+            raise SyncError("source_changed", "Snapshot manifest belongs to another machine.", EXIT_VALIDATION)
+        current = stable_manifest(source, machine_id=machine_id, retries=retries, window_seconds=window_seconds)
+        if current["root_hash"] != expected["root_hash"]:
+            raise SyncError("source_changed", "Save source changed before snapshot.", EXIT_VALIDATION)
         validation = validator(source, expected)
         if not validation.get("ok"):
             raise SyncError(validation["classification"], "Save validation did not permit snapshot.", EXIT_VALIDATION)
@@ -277,6 +471,7 @@ class GitVault:
         if stage.exists() or stage.is_symlink() or rollback.exists() or rollback.is_symlink(): raise SyncError("snapshot_name_collision", "Vault snapshot artifacts already exist.", EXIT_RECOVERY_REQUIRED)
         try: stage.parent.mkdir(exist_ok=True)
         except OSError as error: raise SyncError("snapshot_metadata_failed", "Vault snapshot metadata directory could not be prepared.", EXIT_RECOVERY_REQUIRED) from error
+        if state_hook: state_hook("UPDATE_VAULT")
         _copy_verified(source, stage, expected, machine_id, retries, window_seconds, validator)
         parked = False
         try:
@@ -297,11 +492,16 @@ class GitVault:
         staged = self.runner.run("diff", "--cached", "--quiet", check=False).returncode
         if staged not in (0, 1): raise SyncError("git_commit_failed", "Could not inspect vault staged changes.", EXIT_RECOVERY_REQUIRED)
         if staged == 1:
+            if state_hook: state_hook("COMMIT")
             message = f"Save session from {machine_id} root={expected['root_hash']} session={session_id}"
             if self.runner.run("commit", "-m", message, check=False).returncode:
                 raise SyncError("git_commit_failed", "Vault snapshot commit failed; rollback artifact was retained.", EXIT_RECOVERY_REQUIRED)
         oid = self._oid("HEAD")
         if oid is None: raise SyncError("git_commit_failed", "Vault did not produce a commit.", EXIT_RECOVERY_REQUIRED)
+        try:
+            self.validate_commit_snapshot(oid)
+        except SyncError as error:
+            raise SyncError("committed_save_mismatch", "Committed snapshot verification failed; rollback artifact was retained.", EXIT_RECOVERY_REQUIRED) from error
         if rollback.exists():
             try:
                 _remove_safe_tree(rollback)
@@ -327,6 +527,7 @@ class GitVault:
         ancestry = self.runner.run("merge-base", "--is-ancestor", commit, "HEAD", check=False).returncode
         if ancestry == 1: raise SyncError("restore_commit_not_in_history", "Restore commit is not in vault history.", EXIT_VALIDATION)
         if ancestry != 0: raise SyncError("git_command_failed", "Restore commit ancestry could not be verified.", EXIT_CONFLICT)
+        manifest = self.validate_commit_snapshot(commit)
         _safe_destination_ancestors(destination)
         listing = self.runner.run("ls-tree", "-r", "-z", commit, "--", "save").stdout
         tree_files: set[str] = set()
@@ -375,8 +576,12 @@ class GitVault:
                     raise SyncError("historical_extract_failed", "Historical save extraction failed; staging was retained.", EXIT_VALIDATION) from error
                 _safe_lstat(output)
         try:
-            manifest = stable_manifest(stage, machine_id=machine_id, retries=retries, window_seconds=window_seconds)
-            validation = validator(stage, manifest)
+            extracted_manifest = stable_manifest(stage, machine_id=machine_id, retries=retries, window_seconds=window_seconds)
+            if extracted_manifest["root_hash"] != manifest["root_hash"]:
+                try: _remove_safe_tree(stage)
+                except SyncError as error: raise SyncError("historical_extract_mismatch", "Extracted save mismatch could not be safely removed.", EXIT_RECOVERY_REQUIRED) from error
+                raise SyncError("historical_extract_mismatch", "Extracted save did not match committed manifest.", EXIT_VALIDATION)
+            validation = validator(stage, extracted_manifest)
         except OSError as error:
             raise SyncError("historical_extract_validation_failed", "Historical save validation failed; staging was retained.", EXIT_VALIDATION) from error
         if not validation.get("ok"):
@@ -387,4 +592,12 @@ class GitVault:
         except OSError as error: raise SyncError("historical_extract_publish_failed", "Historical save could not be published; staging was retained.", EXIT_VALIDATION) from error
         try: _safe_lstat(destination)
         except SyncError as error: raise SyncError("unsafe_vault_tree", "Published historical save was unsafe.", EXIT_VALIDATION) from error
+        try:
+            published = stable_manifest(destination, machine_id=machine_id, retries=retries, window_seconds=window_seconds)
+        except OSError as error:
+            raise SyncError("historical_extract_validation_failed", "Published historical save could not be verified.", EXIT_RECOVERY_REQUIRED) from error
+        if published["root_hash"] != manifest["root_hash"]:
+            try: _remove_safe_tree(destination)
+            except SyncError as error: raise SyncError("historical_extract_mismatch", "Published save mismatch could not be safely removed.", EXIT_RECOVERY_REQUIRED) from error
+            raise SyncError("historical_extract_mismatch", "Published historical save did not match committed manifest.", EXIT_VALIDATION)
         return destination

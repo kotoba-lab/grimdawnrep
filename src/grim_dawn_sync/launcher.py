@@ -29,11 +29,11 @@ class LaunchResult:
 
 
 class DPYesLauncher:
-    def __init__(self, config: SyncConfig, monitor: ProcessMonitor | None = None, runner: ProcessRunner | None = None, *, clock: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep, poll_seconds: float = 0.1) -> None:
+    def __init__(self, config: SyncConfig, monitor: ProcessMonitor | None = None, runner: ProcessRunner | None = None, *, clock: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep, poll_seconds: float = 0.1, state_hook: Callable[[str], None] | None = None) -> None:
         self.config = config
         self.monitor = WindowsProcessMonitor() if monitor is None else monitor
         self.runner = SubprocessRunner() if runner is None else runner
-        self.clock, self.sleep, self.poll_seconds = clock, sleep, poll_seconds
+        self.clock, self.sleep, self.poll_seconds, self.state_hook = clock, sleep, poll_seconds, state_hook
 
     def run(self) -> LaunchResult:
         before = self._scan()
@@ -46,6 +46,7 @@ class DPYesLauncher:
         launcher = self.config.launcher_path
         if launcher.name.casefold() != "dpyes.exe" or not self._under(launcher, self.config.game_install):
             raise self._error("unsafe_launcher_path", "DPYes launcher path is outside the configured game installation.")
+        if self.state_hook: self.state_hook("START_DPYES")
         try:
             self.runner.start([str(launcher)], cwd=launcher.parent, shell=False)
         except OSError as error:
@@ -60,6 +61,7 @@ class DPYesLauncher:
         return LaunchResult(tuple(sorted(game_pids)))
 
     def _wait_for_start(self, before: ProcessScan, configured: set[str]) -> dict[int, int]:
+        if self.state_hook: self.state_hook("WAIT_GAME_START")
         deadline = self.clock() + self.config.launch_timeout_seconds
         previous = {(item.pid, item.creation_marker) for item in before.processes}
         while self.clock() <= deadline:
@@ -85,6 +87,7 @@ class DPYesLauncher:
         configured: set[str],
         identities_before: set[tuple[int, int]],
     ) -> set[int]:
+        if self.state_hook: self.state_hook("WAIT_GAME_EXIT")
         active = {(pid, marker) for pid, marker in watched.items()}
         observed_pids = set(watched)
         while watched:

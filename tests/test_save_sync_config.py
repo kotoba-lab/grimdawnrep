@@ -79,7 +79,8 @@ def test_doctor_reads_temp_config_without_touching_save_or_network(tmp_path: Pat
     result = json.loads(completed.stdout)
     assert result["read_only"] is True
     assert result["machine_id"] == "test-machine"
-    assert result["warnings"][0]["code"] == "t0_only"
+    assert any(item["code"] == "save_root_missing" for item in result["warnings"])
+    assert result["checks"]["processes"]["status"] in {"clear", "unknown"}
 
 
 def test_doctor_missing_save_is_warning_and_creates_nothing(tmp_path: Path) -> None:

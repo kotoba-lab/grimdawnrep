@@ -54,11 +54,47 @@
         "local_tag": {"$ref": "#/$defs/nullableLocalTag"},
         "phase": {
           "type": ["string", "null"],
-          "enum": [null, "lock_held", "committed", "pushed", "release_pending"]
+          "enum": [null, "bootstrap_pending", "lock_held", "committed", "pushed", "release_pending"]
         },
         "local_commit": {"$ref": "#/$defs/nullableOid"},
-        "pushed_commit": {"$ref": "#/$defs/nullableOid"}
-      }
+        "pushed_commit": {"$ref": "#/$defs/nullableOid"},
+        "bootstrap_live_applied": {"type": "boolean"}
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {"phase": {"const": "bootstrap_pending"}},
+            "required": ["phase"]
+          },
+          "then": {
+            "properties": {
+              "last_applied_remote_commit": {"type": "null"},
+              "last_applied_manifest_root_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+              "session_id": {"type": "null"},
+              "machine_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"},
+              "base_commit": {"type": "null"},
+              "lock_oid": {"type": "null"},
+              "local_tag": {"type": "null"},
+              "local_commit": {"type": "string", "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$"},
+              "pushed_commit": {"type": "null"},
+              "bootstrap_live_applied": {"type": "boolean"}
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "phase": {"not": {"const": "bootstrap_pending"}}
+            },
+            "required": ["phase", "bootstrap_live_applied"]
+          },
+          "then": {
+            "properties": {
+              "bootstrap_live_applied": {"const": false}
+            }
+          }
+        }
+      ]
     }
   },
   "oneOf": [

@@ -1,7 +1,7 @@
 """Fail-closed archive and directory-swap primitives for save restore."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import os
 from pathlib import Path
@@ -20,6 +20,7 @@ Validator = Callable[[Path, dict], dict]
 class RestorePlan:
     session_id: str; source: Path; live: Path; archive: Path | None; stage: Path; rollback: Path
     source_manifest: dict; live_manifest: dict | None
+    archive_complete: bool = False
 
 
 def _manifest(path: Path, machine_id: str, retries: int, window: float, validator: Validator) -> dict:
@@ -141,6 +142,36 @@ def _journal_failure(code: str, message: str, session_id: str, phase: str, error
     return SyncError(code, message, EXIT_RECOVERY_REQUIRED, {"session_id": session_id, "phase": phase, "journal_error": error.code})
 
 
+def archive_before_restore(plan: RestorePlan, *, machine_id: str, retries: int = 1, window_seconds: float = 0, validator: Validator = validate_players, current_manifest: dict | None = None) -> RestorePlan:
+    """Publish the live-save archive before *any* live-save mutation.
+
+    This is intentionally a separately observable operation for the launch
+    state machine.  ``apply_restore`` still archives when called directly, so
+    the small restore API remains safe for callers outside the workflow.
+    """
+    if plan.archive_complete or plan.live_manifest is None:
+        return replace(plan, archive_complete=True)
+    if not _present_safe(plan.live):
+        raise SyncError("live_changed", "Live save changed after planning.", EXIT_VALIDATION)
+    current = current_manifest or _manifest(plan.live, machine_id, retries, window_seconds, validator)
+    if current["root_hash"] != plan.live_manifest["root_hash"]:
+        raise SyncError("live_changed", "Live save changed after planning.", EXIT_VALIDATION)
+    assert plan.archive is not None
+    archive_stage = plan.archive.parent / f".save-sync-archive-stage-{plan.session_id}"
+    if archive_stage.exists() or archive_stage.is_symlink():
+        raise SyncError("snapshot_name_collision", "Snapshot destination already exists.", EXIT_VALIDATION)
+    try:
+        _reject_existing_ancestors(plan.archive.parent)
+        plan.archive.parent.mkdir(parents=True, exist_ok=True); _reject_unsafe(plan.archive.parent)
+        _copy_verified(plan.live, archive_stage, current, machine_id, retries, window_seconds, validator)
+        _reject_existing_ancestors(plan.archive.parent); _reject_existing(plan.archive)
+        if plan.archive.exists() or plan.archive.is_symlink(): raise OSError("archive collision")
+        os.rename(archive_stage, plan.archive); _reject_unsafe(plan.archive)
+    except OSError as error:
+        raise SyncError("archive_publish_failed", "Archive could not be published; live save was unchanged.", EXIT_VALIDATION) from error
+    return replace(plan, archive_complete=True)
+
+
 def apply_restore(plan: RestorePlan, state_root: Path, *, machine_id: str, retries: int = 1, window_seconds: float = 0, validator: Validator = validate_players) -> dict:
     source_manifest = _manifest(plan.source, machine_id, retries, window_seconds, validator)
     if source_manifest["root_hash"] != plan.source_manifest["root_hash"]:
@@ -150,19 +181,8 @@ def apply_restore(plan: RestorePlan, state_root: Path, *, machine_id: str, retri
         current = _manifest(plan.live, machine_id, retries, window_seconds, validator)
         if plan.live_manifest is None or current["root_hash"] != plan.live_manifest["root_hash"]:
             raise SyncError("live_changed", "Live save changed after planning.", EXIT_VALIDATION)
-        assert plan.archive is not None
-        archive_stage = plan.archive.parent / f".save-sync-archive-stage-{plan.session_id}"
-        if archive_stage.exists() or archive_stage.is_symlink():
-            raise SyncError("snapshot_name_collision", "Snapshot destination already exists.", EXIT_VALIDATION)
-        try:
-            _reject_existing_ancestors(plan.archive.parent)
-            plan.archive.parent.mkdir(parents=True, exist_ok=True); _reject_unsafe(plan.archive.parent)
-            _copy_verified(plan.live, archive_stage, current, machine_id, retries, window_seconds, validator)
-            _reject_existing_ancestors(plan.archive.parent); _reject_existing(plan.archive)
-            if plan.archive.exists() or plan.archive.is_symlink(): raise OSError("archive collision")
-            os.rename(archive_stage, plan.archive); _reject_unsafe(plan.archive)
-        except OSError as error:
-            raise SyncError("archive_publish_failed", "Archive could not be published; live save was unchanged.", EXIT_VALIDATION) from error
+        if not plan.archive_complete:
+            plan = archive_before_restore(plan, machine_id=machine_id, retries=retries, window_seconds=window_seconds, validator=validator, current_manifest=current)
     try:
         _reject_existing_ancestors(plan.live.parent)
         if not plan.live.parent.is_dir(): raise OSError("live parent missing")

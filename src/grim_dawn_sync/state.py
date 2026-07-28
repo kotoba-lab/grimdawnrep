@@ -28,8 +28,10 @@ STATE_KEYS = frozenset(
         "phase",
         "local_commit",
         "pushed_commit",
+        "bootstrap_live_applied",
     }
 )
+PRE_BOOTSTRAP_STATE_KEYS = STATE_KEYS - {"bootstrap_live_applied"}
 LEGACY_STATE_KEYS = frozenset(
     {
         "schema_version",
@@ -49,7 +51,7 @@ _OPTIONAL = (
     "local_commit",
     "pushed_commit",
 )
-_PHASES = {None, "lock_held", "committed", "pushed", "release_pending"}
+_PHASES = {None, "bootstrap_pending", "lock_held", "committed", "pushed", "release_pending"}
 _SESSION_FIELDS = ("session_id", "machine_id", "base_commit", "lock_oid", "local_tag")
 _OID = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 _HASH = re.compile(r"^[0-9a-f]{64}$")
@@ -69,6 +71,7 @@ class SyncState:
     phase: str | None = None
     local_commit: str | None = None
     pushed_commit: str | None = None
+    bootstrap_live_applied: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -80,31 +83,68 @@ def parse_state(payload: dict[str, Any]) -> SyncState:
     # The original empty state format is accepted only for backwards-compatible
     # upgrades; all persisted session state uses the complete exact shape.
     keys = frozenset(payload)
-    if keys not in (STATE_KEYS, LEGACY_STATE_KEYS):
+    if keys not in (STATE_KEYS, PRE_BOOTSTRAP_STATE_KEYS, LEGACY_STATE_KEYS):
         raise SyncError("invalid_state", "State must contain exactly the required schema fields.")
     values = {key: payload.get(key) for key in _OPTIONAL}
     if any(value is not None and (not isinstance(value, str) or not value) for value in values.values()):
         raise SyncError("invalid_state", "Optional state identifiers must be non-empty strings or null.")
     phase = payload.get("phase")
+    bootstrap_live_applied = payload.get("bootstrap_live_applied", False)
+    if not isinstance(bootstrap_live_applied, bool):
+        raise SyncError("invalid_state", "Bootstrap live-applied marker must be boolean.")
     if phase not in _PHASES:
         raise SyncError("invalid_state", "State phase is invalid.")
-    if keys == STATE_KEYS:
-        _validate_current_transition(phase, values)
+    if keys in (STATE_KEYS, PRE_BOOTSTRAP_STATE_KEYS):
+        _validate_current_transition(phase, values, bootstrap_live_applied)
     elif values["session_id"] is not None:
         raise SyncError("invalid_state", "Legacy state may not contain an active session.")
     if values["last_applied_remote_commit"] is not None and not _OID.fullmatch(values["last_applied_remote_commit"]):
         raise SyncError("invalid_state", "Last applied commit is invalid.")
     if values["last_applied_manifest_root_hash"] is not None and not _HASH.fullmatch(values["last_applied_manifest_root_hash"]):
         raise SyncError("invalid_state", "Last applied manifest hash is invalid.")
-    return SyncState(phase=phase, **values)
+    return SyncState(
+        phase=phase,
+        bootstrap_live_applied=bootstrap_live_applied,
+        **values,
+    )
 
 
-def _validate_current_transition(phase: str | None, values: dict[str, str | None]) -> None:
+def _validate_current_transition(
+    phase: str | None,
+    values: dict[str, str | None],
+    bootstrap_live_applied: bool,
+) -> None:
     active = [values[key] for key in _SESSION_FIELDS]
     if phase is None:
-        if any(active) or values["local_commit"] is not None or values["pushed_commit"] is not None:
+        if (
+            any(active)
+            or values["local_commit"] is not None
+            or values["pushed_commit"] is not None
+            or bootstrap_live_applied
+        ):
             raise SyncError("invalid_state", "Inactive state must not contain recovery session fields.")
         return
+    if phase == "bootstrap_pending":
+        if (
+            values["machine_id"] is None
+            or values["local_commit"] is None
+            or values["last_applied_manifest_root_hash"] is None
+            or values["last_applied_remote_commit"] is not None
+            or values["session_id"] is not None
+            or values["base_commit"] is not None
+            or values["lock_oid"] is not None
+            or values["local_tag"] is not None
+            or values["pushed_commit"] is not None
+        ):
+            raise SyncError(
+                "invalid_state",
+                "Bootstrap-pending state must contain only its machine, local commit, and root hash.",
+            )
+        if not _TOKEN.fullmatch(values["machine_id"]) or not _OID.fullmatch(values["local_commit"]):
+            raise SyncError("invalid_state", "Bootstrap-pending identifiers are invalid.")
+        return
+    if bootstrap_live_applied:
+        raise SyncError("invalid_state", "Only bootstrap-pending state may contain a live-applied marker.")
     if not all(active):
         raise SyncError("invalid_state", "Active recovery state is missing session identifiers.")
     try:

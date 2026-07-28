@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import io
+import hashlib
+import json
 from pathlib import Path
 import stat
 import subprocess
@@ -11,6 +13,7 @@ import pytest
 
 from grim_dawn_sync.errors import EXIT_RECOVERY_REQUIRED, SyncError
 from grim_dawn_sync.git_vault import GitResult, GitRunner, GitVault
+from grim_dawn_sync.manifest import stable_manifest
 
 
 def git(cwd: Path, *args: str) -> str:
@@ -55,13 +58,36 @@ class ArchiveRunner:
     def __init__(self, listing: str, payload: bytes) -> None:
         self.listing = listing; self.payload = payload; self.commands: list[tuple[str, ...]] = []; self.cwd = Path.cwd(); self.executable = "git"
 
+    def _manifest(self) -> str:
+        files: list[dict[str, object]] = []
+        if not self.payload:
+            return json.dumps({"schema_version": "1.0.0", "created_at": "x", "machine_id": "a", "root_hash": hashlib.sha256(b"").hexdigest(), "file_count": 0, "total_bytes": 0, "character_count": 0, "files": []})
+        with tarfile.open(fileobj=io.BytesIO(self.payload), mode="r:") as archive:
+            for member in archive.getmembers():
+                if not member.isfile() or not member.name.startswith("save/"):
+                    continue
+                stream = archive.extractfile(member); assert stream is not None
+                data = stream.read(); relative = member.name[5:]
+                files.append({"path": relative, "size": len(data), "sha256": hashlib.sha256(data).hexdigest()})
+        files.sort(key=lambda item: str(item["path"]).casefold())
+        canonical = "\n".join(f"{item['path']}\0{item['size']}\0{item['sha256']}" for item in files).encode()
+        return json.dumps({"schema_version": "1.0.0", "created_at": "x", "machine_id": "a", "root_hash": hashlib.sha256(canonical).hexdigest(), "file_count": len(files), "total_bytes": sum(int(item["size"]) for item in files), "character_count": len(files), "files": files})
+
     def run(self, *args: str, check: bool = True, input_text: str | None = None) -> GitResult:
         self.commands.append(("git", *args))
-        stdout = self.listing if args and args[0] == "ls-tree" else ""
+        stdout = self.listing if args and args[0] == "ls-tree" else self._manifest() if args and args[0] == "show" else ""
         return GitResult(tuple(args), stdout, "", 0)
 
     def run_bytes(self, *args: str) -> bytes:
-        self.commands.append(("git", *args)); return self.payload
+        self.commands.append(("git", *args))
+        if args and args[0] == "ls-tree": return self.listing.encode()
+        if args[:2] == ("cat-file", "blob"):
+            with tarfile.open(fileobj=io.BytesIO(self.payload), mode="r:") as archive:
+                for member in archive.getmembers():
+                    if member.isfile():
+                        stream = archive.extractfile(member); assert stream is not None; return stream.read()
+            return b""
+        return self.payload
 
 
 def tar_payload(entries: list[tuple[str, str, bytes | None]]) -> bytes:
@@ -122,6 +148,82 @@ def test_extracts_past_save_without_checkout_and_rejects_bad_destination(tmp_pat
     destination = tmp_path / "restored"; vault.extract_save(old, destination, machine_id="a", validator=valid)
     assert (destination / "main/a/player.gdc").read_bytes() == b"old"
     assert not any(command and command[0] == "checkout" for command in vault.runner.commands)
+
+
+def test_read_manifest_is_read_only_and_does_not_extract_or_stage(tmp_path: Path) -> None:
+    _, one, _ = clone_pair(tmp_path)
+    vault = GitVault(one)
+    commit = vault.snapshot(save(tmp_path / "source"), machine_id="a", session_id="one", validator=valid)
+    local_root = tmp_path / "terminal-local"
+    before = {
+        path.relative_to(tmp_path).as_posix()
+        for path in tmp_path.rglob("*")
+    }
+    command_index = len(vault.runner.commands)
+
+    manifest = vault.read_manifest(commit)
+
+    after = {
+        path.relative_to(tmp_path).as_posix()
+        for path in tmp_path.rglob("*")
+    }
+    assert manifest["root_hash"] and manifest["file_count"] == 1
+    assert before == after and not local_root.exists()
+    assert commands(vault)[command_index:] == [
+        ("show", f"{commit}:.sync/manifest.json"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("stdout", "returncode"),
+    [
+        ("", 1),
+        ('{"schema_version":"1.0.0","schema_version":"1.0.0"}', 0),
+        ('{"schema_version":"1.0.0"}', 0),
+        ('{"schema_version":"1.0.0","created_at":"x","machine_id":"x","root_hash":"BAD","file_count":0,"total_bytes":0,"character_count":0,"files":[]}', 0),
+    ],
+)
+def test_read_manifest_missing_duplicate_or_malformed_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stdout: str, returncode: int
+) -> None:
+    vault = GitVault(tmp_path)
+    monkeypatch.setattr(
+        vault.runner,
+        "run",
+        lambda *args, **kwargs: GitResult(tuple(args), stdout, "missing", returncode),
+    )
+
+    with pytest.raises(SyncError) as caught:
+        vault.read_manifest("a" * 40)
+
+    assert caught.value.code == "invalid_remote_manifest"
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"schema_version":"1.0.0","machine_id":"a","machine_id":"a","session_id":"s","root_hash":"' + "d" * 64 + '"}',
+        '{"schema_version":"1.0.0","machine_id":"a","session_id":"s","root_hash":"' + "d" * 64 + '","extra":true}',
+        '{"schema_version":"1.0.0","machine_id":"a","session_id":"../bad","root_hash":"' + "d" * 64 + '"}',
+        '{"schema_version":"1.0.0","machine_id":"a","session_id":"s","root_hash":"BAD"}',
+    ],
+)
+def test_read_vault_metadata_rejects_duplicate_schema_token_and_hash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, payload: str
+) -> None:
+    vault = GitVault(tmp_path)
+    monkeypatch.setattr(
+        vault.runner,
+        "run",
+        lambda *args, **kwargs: GitResult(tuple(args), payload, "", 0),
+    )
+
+    with pytest.raises(SyncError) as caught:
+        vault.read_vault_metadata("a" * 40)
+
+    assert caught.value.code == "invalid_vault_metadata"
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_invalid_identifiers_and_remote_confirmation_failure_fail_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -241,7 +343,7 @@ def test_extract_rejects_symbolic_nonhex_and_unrelated_commit_ids(tmp_path: Path
 def test_extract_rejects_malformed_and_symlink_git_tree(tmp_path: Path, listing: str) -> None:
     runner = ArchiveRunner(listing, b""); vault = GitVault(tmp_path, runner=runner)
     with pytest.raises(SyncError) as caught: vault.extract_save("a" * 40, tmp_path / "destination", machine_id="a", validator=valid)
-    assert caught.value.code == "unsafe_vault_tree" and not (tmp_path / "destination").exists()
+    assert caught.value.code in {"unsafe_vault_tree", "committed_save_mismatch"} and not (tmp_path / "destination").exists()
 
 
 @pytest.mark.parametrize("entries", [
@@ -255,7 +357,7 @@ def test_mocked_malicious_tar_never_creates_destination_or_writes_outside(tmp_pa
     outside = tmp_path / "outside"; listing = tree_listing("save/main/a/player.gdc")
     runner = ArchiveRunner(listing, tar_payload(entries)); vault = GitVault(tmp_path, runner=runner); destination = tmp_path / "destination"
     with pytest.raises(SyncError) as caught: vault.extract_save("a" * 40, destination, machine_id="a", validator=valid)
-    assert caught.value.code == "unsafe_vault_tree" and not destination.exists() and not outside.exists()
+    assert caught.value.code in {"unsafe_vault_tree", "invalid_remote_manifest", "committed_save_mismatch"} and not destination.exists() and not outside.exists()
 
 
 def test_extract_rejects_dangling_destination_symlink_without_writing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -341,3 +443,59 @@ def test_historical_extract_atomically_publishes_validated_stage(tmp_path: Path,
     assert validated and events == [(validated[0].name, "destination")]
     assert (destination / "main/a/player.gdc").read_bytes() == b"atomic"
     assert not retained_extract_stages(tmp_path)
+
+
+@pytest.mark.parametrize("change", ["hash", "extra", "missing"])
+def test_validate_commit_snapshot_rejects_each_manifest_tree_difference(tmp_path: Path, change: str) -> None:
+    _, clone, _ = clone_pair(tmp_path)
+    vault = GitVault(clone)
+    vault.snapshot(save(tmp_path / "source", b"original"), machine_id="a", session_id="base", validator=valid)
+    player = clone / "save/main/a/player.gdc"
+    if change == "hash":
+        player.write_bytes(b"tampered")
+        git(clone, "add", "save/main/a/player.gdc")
+    elif change == "extra":
+        extra = clone / "save/main/a/extra.gdc"; extra.write_bytes(b"extra")
+        git(clone, "add", "save/main/a/extra.gdc")
+    else:
+        player.unlink()
+        git(clone, "add", "-u", "save")
+    git(clone, "commit", "-m", f"tamper-{change}")
+    with pytest.raises(SyncError) as caught:
+        vault.validate_commit_snapshot(vault._oid("HEAD") or "")
+    assert caught.value.code == "committed_save_mismatch"
+
+
+def test_validate_commit_snapshot_is_strictly_read_only(tmp_path: Path) -> None:
+    _, clone, _ = clone_pair(tmp_path); vault = GitVault(clone)
+    commit = vault.snapshot(save(tmp_path / "source"), machine_id="a", session_id="base", validator=valid)
+    before = {path.relative_to(clone).as_posix() for path in clone.rglob("*")}
+    assert vault.validate_commit_snapshot(commit)["root_hash"]
+    assert before == {path.relative_to(clone).as_posix() for path in clone.rglob("*")}
+
+
+def test_snapshot_refuses_source_changed_since_caller_manifest(tmp_path: Path) -> None:
+    _, clone, _ = clone_pair(tmp_path); source = save(tmp_path / "source", b"before")
+    expected = stable_manifest(source, machine_id="a", retries=1)
+    save(source, b"after")
+    with pytest.raises(SyncError) as caught:
+        GitVault(clone).snapshot(source, machine_id="a", session_id="changed", expected_manifest=expected, validator=valid)
+    assert caught.value.code == "source_changed" and not (clone / "save").exists()
+
+
+def test_extract_manifest_mismatch_removes_unpublished_stage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import grim_dawn_sync.git_vault as module
+    _, clone, _ = clone_pair(tmp_path); vault = GitVault(clone)
+    commit = vault.snapshot(save(tmp_path / "source", b"original"), machine_id="a", session_id="base", validator=valid)
+    real_manifest = module.stable_manifest
+    def mismatch(root: Path, *args, **kwargs):
+        result = real_manifest(root, *args, **kwargs)
+        if root.name.startswith(".save-sync-extract-stage-"):
+            result = dict(result); result["root_hash"] = "0" * 64
+        return result
+    monkeypatch.setattr(module, "stable_manifest", mismatch)
+    destination = tmp_path / "destination"
+    with pytest.raises(SyncError) as caught:
+        vault.extract_save(commit, destination, machine_id="a", validator=valid)
+    assert caught.value.code == "historical_extract_mismatch"
+    assert not destination.exists() and not retained_extract_stages(tmp_path)

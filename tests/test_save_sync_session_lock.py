@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+import hashlib
 import json
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
@@ -11,7 +12,17 @@ import pytest
 
 from grim_dawn_sync.errors import SyncError
 from grim_dawn_sync.git_vault import GitResult, GitVault
-from grim_dawn_sync.session_lock import acquire_lock, inspect_remote_lock, recover_session, release_lock
+from grim_dawn_sync.session_lock import (
+    Lock,
+    acquire_lock,
+    inspect_remote_lock,
+    inspect_remote_lock_readonly,
+    mark_bootstrap_live_applied,
+    prepare_bootstrap,
+    push_bootstrap,
+    recover_session,
+    release_lock,
+)
 from grim_dawn_sync.state import SyncState, load_state, save_state
 
 
@@ -29,6 +40,83 @@ def _vaults(tmp_path: Path) -> tuple[GitVault, GitVault]:
         _git(clone, "checkout", "-b", "main", "origin/main")
         _git(clone, "config", "user.email", "test@example.invalid"); _git(clone, "config", "user.name", "test")
     return GitVault(a), GitVault(b)
+
+
+def _unborn_bootstrap(tmp_path: Path) -> tuple[GitVault, str]:
+    remote = tmp_path / "remote.git"
+    _git(tmp_path, "init", "--bare", str(remote))
+    clone = tmp_path / "bootstrap"
+    _git(tmp_path, "clone", str(remote), str(clone))
+    _git(clone, "config", "user.email", "test@example.invalid")
+    _git(clone, "config", "user.name", "test")
+    (clone / "save").write_text("bootstrap", encoding="utf-8")
+    _git(clone, "add", "save")
+    _git(clone, "commit", "-m", "bootstrap")
+    return GitVault(clone), _git(clone, "rev-parse", "HEAD")
+
+
+def _prepare_applied(
+    vault: GitVault,
+    commit: str,
+    state_path: Path,
+    root_hash: str = "d" * 64,
+) -> SyncState:
+    prepare_bootstrap(
+        vault,
+        "machine-a",
+        commit,
+        root_hash,
+        state_path=state_path,
+    )
+    return mark_bootstrap_live_applied(
+        "machine-a",
+        commit,
+        root_hash,
+        root_hash,
+        state_path=state_path,
+    )
+
+
+def _commit_session_snapshot(
+    vault: GitVault,
+    lock: Lock,
+    *,
+    machine_id: str = "machine-a",
+    session_id: str | None = None,
+    metadata_root: str | None = None,
+) -> tuple[str, str]:
+    relative = "main/a/player.gdc"
+    content = b"recovered snapshot"
+    digest = hashlib.sha256(content).hexdigest()
+    root_hash = hashlib.sha256(
+        f"{relative}\0{len(content)}\0{digest}".encode()
+    ).hexdigest()
+    target = vault.repo / "save" / "main" / "a"
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "player.gdc").write_bytes(content)
+    sync = vault.repo / ".sync"
+    sync.mkdir(exist_ok=True)
+    manifest = {
+        "schema_version": "1.0.0",
+        "created_at": "2026-07-29T00:00:00+00:00",
+        "machine_id": machine_id,
+        "root_hash": root_hash,
+        "file_count": 1,
+        "total_bytes": len(content),
+        "character_count": 1,
+        "files": [{"path": relative, "size": len(content), "sha256": digest}],
+    }
+    metadata = {
+        "schema_version": "1.0.0",
+        "machine_id": machine_id,
+        "session_id": session_id or lock.session.session_id,
+        "root_hash": metadata_root or root_hash,
+    }
+    (sync / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (sync / "vault.json").write_text(json.dumps(metadata), encoding="utf-8")
+    _git(vault.repo, "add", "save", ".sync/manifest.json", ".sync/vault.json")
+    _git(vault.repo, "commit", "-m", "session snapshot")
+    return _git(vault.repo, "rev-parse", "HEAD"), root_hash
 
 
 def _forged_lock_tag(
@@ -72,6 +160,40 @@ def test_annotated_lock_is_exclusive_and_releases_only_its_session(tmp_path: Pat
     assert inspect_remote_lock(a) is None
 
 
+def test_readonly_lock_inspection_preserves_refs_objects_and_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import grim_dawn_sync.session_lock as module
+
+    owner, observer = _vaults(tmp_path)
+    base = owner.remote_oid()
+    assert base
+    lock = acquire_lock(owner, "machine-a", base, state_path=tmp_path / "owner-state.json")
+    temp_parent = tmp_path / "inspection-temp"
+    temp_parent.mkdir()
+    monkeypatch.setattr(module.tempfile, "tempdir", str(temp_parent))
+    before = {
+        "refs": _git(observer.repo, "for-each-ref", "--format=%(refname) %(objectname)"),
+        "objects": _git(observer.repo, "count-objects", "-v"),
+        "status": _git(observer.repo, "status", "--porcelain=v1", "--untracked-files=all"),
+    }
+    command_index = len(observer.runner.commands)
+
+    inspected = inspect_remote_lock_readonly(observer)
+
+    assert inspected == Lock(lock.session, lock.oid)
+    assert {
+        "refs": _git(observer.repo, "for-each-ref", "--format=%(refname) %(objectname)"),
+        "objects": _git(observer.repo, "count-objects", "-v"),
+        "status": _git(observer.repo, "status", "--porcelain=v1", "--untracked-files=all"),
+    } == before
+    assert list(temp_parent.iterdir()) == []
+    assert observer.runner.commands[command_index:] == [
+        ("git", "ls-remote", "--refs", "origin", "refs/tags/grim-dawn-sync-active"),
+        ("git", "remote", "get-url", "origin"),
+    ]
+
+
 def test_state_atomic_round_trip_and_corruption_fail_closed(tmp_path: Path) -> None:
     sid = "00000000-0000-4000-8000-000000000001"
     path = tmp_path / "state.json"; value = SyncState(session_id=sid, machine_id="m", base_commit="a" * 40, lock_oid="b" * 40, local_tag=f"grim-dawn-sync-{sid}", phase="lock_held")
@@ -79,6 +201,207 @@ def test_state_atomic_round_trip_and_corruption_fail_closed(tmp_path: Path) -> N
     path.write_text("not json", encoding="utf-8")
     with pytest.raises(SyncError) as caught: load_state(path)
     assert caught.value.exit_code == 6
+
+
+def test_bootstrap_push_initializes_unborn_remote_without_lock_or_force(tmp_path: Path) -> None:
+    vault, commit = _unborn_bootstrap(tmp_path)
+    state_path = tmp_path / "state.json"
+    root_hash = "d" * 64
+    _prepare_applied(vault, commit, state_path, root_hash)
+
+    assert push_bootstrap(
+        vault,
+        "machine-a",
+        commit,
+        root_hash,
+        state_path=state_path,
+    ) == commit
+
+    assert vault.remote_oid() == commit
+    assert inspect_remote_lock(vault) is None
+    state = load_state(state_path)
+    assert state == SyncState(
+        last_applied_remote_commit=commit,
+        last_applied_manifest_root_hash=root_hash,
+    )
+    pushes = [command for command in vault.runner.commands if len(command) > 1 and command[1] == "push"]
+    assert pushes == [("git", "push", "origin", f"{commit}:refs/heads/main")]
+
+
+def test_bootstrap_prepared_but_not_live_applied_never_inspects_or_pushes_remote(
+    tmp_path: Path
+) -> None:
+    vault, commit = _unborn_bootstrap(tmp_path)
+    state_path = tmp_path / "state.json"
+    pending = prepare_bootstrap(
+        vault,
+        "machine-a",
+        commit,
+        "d" * 64,
+        state_path=state_path,
+    )
+    command_index = len(vault.runner.commands)
+    before = state_path.read_bytes()
+
+    with pytest.raises(SyncError) as caught:
+        recover_session(vault, pending, "machine-a", state_path=state_path)
+
+    assert caught.value.code == "bootstrap_apply_required"
+    assert caught.value.exit_code == 6
+    assert vault.runner.commands[command_index:] == []
+    assert state_path.read_bytes() == before
+
+
+def test_bootstrap_live_marker_requires_exact_observed_root(tmp_path: Path) -> None:
+    vault, commit = _unborn_bootstrap(tmp_path)
+    state_path = tmp_path / "state.json"
+    prepared = prepare_bootstrap(
+        vault,
+        "machine-a",
+        commit,
+        "d" * 64,
+        state_path=state_path,
+    )
+
+    with pytest.raises(SyncError) as caught:
+        mark_bootstrap_live_applied(
+            "machine-a",
+            commit,
+            "d" * 64,
+            "e" * 64,
+            state_path=state_path,
+        )
+
+    assert caught.value.code == "bootstrap_live_mismatch"
+    assert load_state(state_path) == prepared
+
+
+def test_bootstrap_failed_push_stays_pending_then_recovery_pushes_exact_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    vault, commit = _unborn_bootstrap(tmp_path)
+    state_path = tmp_path / "state.json"
+    root_hash = "d" * 64
+    _prepare_applied(vault, commit, state_path, root_hash)
+    original = vault.runner.run
+
+    def fail_push(*args, **kwargs):
+        if args and args[0] == "push":
+            raise SyncError("git_unavailable", "injected failure", 2)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(vault.runner, "run", fail_push)
+    with pytest.raises(SyncError) as caught:
+        push_bootstrap(vault, "machine-a", commit, root_hash, state_path=state_path)
+
+    pending = load_state(state_path)
+    assert caught.value.code == "bootstrap_push_incomplete"
+    assert caught.value.exit_code == 6
+    assert pending.phase == "bootstrap_pending"
+    assert pending.local_commit == commit
+    assert pending.last_applied_manifest_root_hash == root_hash
+
+    monkeypatch.setattr(vault.runner, "run", original)
+    assert recover_session(vault, pending, "machine-a", state_path=state_path) == "bootstrap_complete"
+    assert vault.remote_oid() == commit
+    assert load_state(state_path).last_applied_remote_commit == commit
+
+
+def test_bootstrap_ambiguous_push_success_is_confirmed_and_finalized(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    vault, commit = _unborn_bootstrap(tmp_path)
+    state_path = tmp_path / "state.json"
+    _prepare_applied(vault, commit, state_path)
+    original = vault.runner.run
+
+    def ambiguous_push(*args, **kwargs):
+        result = original(*args, **kwargs)
+        if args and args[0] == "push":
+            return GitResult(tuple(args), result.stdout, "lost success response", 1)
+        return result
+
+    monkeypatch.setattr(vault.runner, "run", ambiguous_push)
+    assert push_bootstrap(
+        vault,
+        "machine-a",
+        commit,
+        "d" * 64,
+        state_path=state_path,
+    ) == commit
+    assert vault.remote_oid() == commit
+    assert load_state(state_path).phase is None
+
+
+def test_bootstrap_recovery_refuses_other_machine_and_competing_remote(
+    tmp_path: Path
+) -> None:
+    vault, commit = _unborn_bootstrap(tmp_path)
+    state_path = tmp_path / "state.json"
+    pending = SyncState(
+        last_applied_manifest_root_hash="d" * 64,
+        machine_id="machine-a",
+        phase="bootstrap_pending",
+        local_commit=commit,
+        bootstrap_live_applied=True,
+    )
+    save_state(state_path, pending)
+    before = state_path.read_bytes()
+
+    with pytest.raises(SyncError) as wrong_machine:
+        recover_session(vault, pending, "machine-b", state_path=state_path)
+    assert wrong_machine.value.code == "bootstrap_recovery_mismatch"
+    assert vault.remote_oid() is None and state_path.read_bytes() == before
+
+    competitor = tmp_path / "competitor"
+    _git(tmp_path, "clone", str(tmp_path / "remote.git"), str(competitor))
+    _git(competitor, "config", "user.email", "test@example.invalid")
+    _git(competitor, "config", "user.name", "test")
+    (competitor / "other").write_text("other", encoding="utf-8")
+    _git(competitor, "add", "other")
+    _git(competitor, "commit", "-m", "other")
+    other = _git(competitor, "rev-parse", "HEAD")
+    _git(competitor, "push", "origin", f"{other}:refs/heads/main")
+
+    with pytest.raises(SyncError) as conflict:
+        recover_session(vault, pending, "machine-a", state_path=state_path)
+    assert conflict.value.code == "bootstrap_remote_conflict"
+    assert vault.remote_oid() == other and state_path.read_bytes() == before
+
+
+def test_bootstrap_final_state_failure_remains_pending_and_recovers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import grim_dawn_sync.session_lock as module
+
+    vault, commit = _unborn_bootstrap(tmp_path)
+    state_path = tmp_path / "state.json"
+    root_hash = "d" * 64
+    _prepare_applied(vault, commit, state_path, root_hash)
+    actual_save = module.save_state
+    writes = 0
+
+    def fail_final(path: Path, state: SyncState) -> None:
+        nonlocal writes
+        writes += 1
+        if writes == 1:
+            raise SyncError("state_write_failed", "injected failure", 6)
+        actual_save(path, state)
+
+    monkeypatch.setattr(module, "save_state", fail_final)
+    with pytest.raises(SyncError) as caught:
+        push_bootstrap(vault, "machine-a", commit, root_hash, state_path=state_path)
+    pending = load_state(state_path)
+    assert caught.value.code == "state_write_failed"
+    assert pending.phase == "bootstrap_pending"
+    assert vault.remote_oid() == commit
+
+    monkeypatch.setattr(module, "save_state", actual_save)
+    assert recover_session(vault, pending, "machine-a", state_path=state_path) == "bootstrap_complete"
+    assert load_state(state_path) == SyncState(
+        last_applied_remote_commit=commit,
+        last_applied_manifest_root_hash=root_hash,
+    )
 
 
 def test_recovery_pushes_exact_local_commit_then_releases(tmp_path: Path) -> None:
@@ -89,6 +412,154 @@ def test_recovery_pushes_exact_local_commit_then_releases(tmp_path: Path) -> Non
     save_state(state_path, SyncState(session_id=lock.session.session_id, machine_id="machine-a", base_commit=base, lock_oid=lock.oid, local_tag=lock.local_tag, local_commit=local, phase="committed"))
     assert recover_session(vault, load_state(state_path), "machine-a", state_path=state_path) == "released"
     assert vault.remote_oid() == local and inspect_remote_lock(vault) is None
+
+
+def test_recovery_adopts_verified_snapshot_head_then_pushes_and_releases(tmp_path: Path) -> None:
+    vault, _ = _vaults(tmp_path)
+    base = vault.remote_oid()
+    assert base
+    state_path = tmp_path / "state.json"
+    lock = acquire_lock(vault, "machine-a", base, state_path=state_path)
+    commit, root_hash = _commit_session_snapshot(vault, lock)
+
+    assert recover_session(
+        vault,
+        load_state(state_path),
+        "machine-a",
+        state_path=state_path,
+    ) == "released"
+
+    assert vault.remote_oid() == commit
+    assert inspect_remote_lock_readonly(vault) is None
+    assert load_state(state_path) == SyncState(
+        last_applied_remote_commit=commit,
+        last_applied_manifest_root_hash=root_hash,
+    )
+
+
+def test_recovery_adopts_snapshot_when_remote_already_has_exact_head(tmp_path: Path) -> None:
+    vault, _ = _vaults(tmp_path)
+    base = vault.remote_oid()
+    assert base
+    state_path = tmp_path / "state.json"
+    lock = acquire_lock(vault, "machine-a", base, state_path=state_path)
+    commit, root_hash = _commit_session_snapshot(vault, lock)
+    _git(vault.repo, "push", "origin", f"{commit}:refs/heads/main")
+
+    assert recover_session(
+        vault,
+        load_state(state_path),
+        "machine-a",
+        state_path=state_path,
+    ) == "released"
+    assert load_state(state_path) == SyncState(
+        last_applied_remote_commit=commit,
+        last_applied_manifest_root_hash=root_hash,
+    )
+
+
+@pytest.mark.parametrize("tamper", ["machine", "session", "root"])
+def test_recovery_rejects_snapshot_provenance_mismatch_without_mutation(
+    tmp_path: Path, tamper: str
+) -> None:
+    vault, _ = _vaults(tmp_path)
+    base = vault.remote_oid()
+    assert base
+    state_path = tmp_path / "state.json"
+    lock = acquire_lock(vault, "machine-a", base, state_path=state_path)
+    changes = {
+        "machine_id": "machine-b" if tamper == "machine" else "machine-a",
+        "session_id": (
+            "00000000-0000-4000-8000-000000000999"
+            if tamper == "session"
+            else lock.session.session_id
+        ),
+        "metadata_root": "e" * 64 if tamper == "root" else None,
+    }
+    _commit_session_snapshot(vault, lock, **changes)
+    before = state_path.read_bytes()
+
+    with pytest.raises(SyncError) as caught:
+        recover_session(vault, load_state(state_path), "machine-a", state_path=state_path)
+
+    assert caught.value.code == "recovery_commit_unproven"
+    assert vault.remote_oid() == base
+    assert inspect_remote_lock_readonly(vault).oid == lock.oid  # type: ignore[union-attr]
+    assert state_path.read_bytes() == before
+
+
+@pytest.mark.parametrize("tamper", ["wrong_parent", "unrelated_head", "dirty"])
+def test_recovery_rejects_unproven_or_dirty_head_without_mutation(
+    tmp_path: Path, tamper: str
+) -> None:
+    vault, _ = _vaults(tmp_path)
+    base = vault.remote_oid()
+    assert base
+    state_path = tmp_path / "state.json"
+    lock = acquire_lock(vault, "machine-a", base, state_path=state_path)
+    if tamper == "unrelated_head":
+        (vault.repo / "unrelated").write_text("not a snapshot", encoding="utf-8")
+        _git(vault.repo, "add", "unrelated")
+        _git(vault.repo, "commit", "-m", "unrelated")
+    else:
+        _commit_session_snapshot(vault, lock)
+        if tamper == "wrong_parent":
+            (vault.repo / "extra").write_text("extra commit", encoding="utf-8")
+            _git(vault.repo, "add", "extra")
+            _git(vault.repo, "commit", "-m", "extra")
+        else:
+            (vault.repo / "dirty").write_text("untracked", encoding="utf-8")
+    before = state_path.read_bytes()
+
+    with pytest.raises(SyncError) as caught:
+        recover_session(vault, load_state(state_path), "machine-a", state_path=state_path)
+
+    assert caught.value.code == "recovery_commit_unproven"
+    assert vault.remote_oid() == base
+    assert inspect_remote_lock_readonly(vault).oid == lock.oid  # type: ignore[union-attr]
+    assert state_path.read_bytes() == before
+
+
+def test_recovery_adoption_state_failure_keeps_lock_state_and_never_pushes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import grim_dawn_sync.session_lock as module
+
+    vault, _ = _vaults(tmp_path)
+    base = vault.remote_oid()
+    assert base
+    state_path = tmp_path / "state.json"
+    lock = acquire_lock(vault, "machine-a", base, state_path=state_path)
+    commit, root_hash = _commit_session_snapshot(vault, lock)
+    previous = state_path.read_bytes()
+    actual_save = module.save_state
+    monkeypatch.setattr(
+        module,
+        "save_state",
+        lambda *_: (_ for _ in ()).throw(
+            SyncError("state_write_failed", "injected adoption failure", 6)
+        ),
+    )
+
+    with pytest.raises(SyncError) as caught:
+        recover_session(vault, load_state(state_path), "machine-a", state_path=state_path)
+
+    assert caught.value.code == "state_write_failed"
+    assert vault.remote_oid() == base
+    assert inspect_remote_lock_readonly(vault).oid == lock.oid  # type: ignore[union-attr]
+    assert state_path.read_bytes() == previous
+
+    monkeypatch.setattr(module, "save_state", actual_save)
+    assert recover_session(
+        vault,
+        load_state(state_path),
+        "machine-a",
+        state_path=state_path,
+    ) == "released"
+    assert load_state(state_path) == SyncState(
+        last_applied_remote_commit=commit,
+        last_applied_manifest_root_hash=root_hash,
+    )
 
 
 def test_stale_base_and_state_write_failure_never_create_remote_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -432,6 +903,52 @@ def test_release_local_tag_cleanup_failure_is_exit6_and_keeps_pending_state(
     monkeypatch.setattr(vault.runner, "run", original)
     assert inspect_remote_lock(vault) is None
     assert _git(vault.repo, "rev-parse", "--verify", f"refs/tags/{lock.local_tag}") == lock.oid
+
+
+def test_release_final_state_failure_retains_root_hash_and_recovers_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import grim_dawn_sync.session_lock as module
+
+    vault, _ = _vaults(tmp_path)
+    base = vault.remote_oid()
+    assert base
+    root_hash = "f" * 64
+    state_path = tmp_path / "state.json"
+    lock = acquire_lock(vault, "machine-a", base, state_path=state_path)
+    actual_save_state = module.save_state
+    writes = 0
+
+    def fail_final_write(path: Path, state: SyncState) -> None:
+        nonlocal writes
+        writes += 1
+        if writes == 2:
+            raise SyncError("state_write_failed", "injected final write failure", 6)
+        actual_save_state(path, state)
+
+    monkeypatch.setattr(module, "save_state", fail_final_write)
+    with pytest.raises(SyncError) as caught:
+        release_lock(
+            vault,
+            lock,
+            base,
+            state_path=state_path,
+            confirmed_root_hash=root_hash,
+        )
+
+    pending = load_state(state_path)
+    assert caught.value.code == "state_write_failed"
+    assert pending.phase == "release_pending"
+    assert pending.pushed_commit == base
+    assert pending.last_applied_manifest_root_hash == root_hash
+    assert inspect_remote_lock(vault) is None
+
+    monkeypatch.setattr(module, "save_state", actual_save_state)
+    assert recover_session(vault, pending, "machine-a", state_path=state_path) == "complete"
+    complete = load_state(state_path)
+    assert complete.phase is None
+    assert complete.last_applied_remote_commit == base
+    assert complete.last_applied_manifest_root_hash == root_hash
 
 
 def test_second_stale_base_check_cleans_intent_and_local_tag(
