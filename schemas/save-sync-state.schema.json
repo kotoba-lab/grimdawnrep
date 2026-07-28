@@ -1,13 +1,68 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Grim Dawn Save Sync terminal-local state",
-  "type": "object",
-  "additionalProperties": false,
-  "required": ["schema_version", "last_applied_remote_commit", "last_applied_manifest_root_hash", "session_id"],
-  "properties": {
-    "schema_version": {"const": "1.0.0"},
-    "last_applied_remote_commit": {"type": ["string", "null"], "minLength": 1},
-    "last_applied_manifest_root_hash": {"type": ["string", "null"], "minLength": 1},
-    "session_id": {"type": ["string", "null"], "minLength": 1}
-  }
+  "$defs": {
+    "nullableIdentifier": {
+      "type": ["string", "null"],
+      "minLength": 1
+    },
+    "nullableOid": {"type": ["string", "null"], "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$"},
+    "nullableHash": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+    "nullableUuid": {"type": ["string", "null"], "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"},
+    "nullableMachine": {"type": ["string", "null"], "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"},
+    "nullableLocalTag": {"type": ["string", "null"], "pattern": "^grim-dawn-sync-[0-9a-f-]{36}$"},
+    "legacy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "last_applied_remote_commit",
+        "last_applied_manifest_root_hash",
+        "session_id"
+      ],
+      "properties": {
+        "schema_version": {"const": "1.0.0"},
+        "last_applied_remote_commit": {"$ref": "#/$defs/nullableOid"},
+        "last_applied_manifest_root_hash": {"$ref": "#/$defs/nullableHash"},
+        "session_id": {"type": "null"}
+      }
+    },
+    "current": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "last_applied_remote_commit",
+        "last_applied_manifest_root_hash",
+        "session_id",
+        "machine_id",
+        "base_commit",
+        "lock_oid",
+        "local_tag",
+        "phase",
+        "local_commit",
+        "pushed_commit"
+      ],
+      "properties": {
+        "schema_version": {"const": "1.0.0"},
+        "last_applied_remote_commit": {"$ref": "#/$defs/nullableOid"},
+        "last_applied_manifest_root_hash": {"$ref": "#/$defs/nullableHash"},
+        "session_id": {"$ref": "#/$defs/nullableUuid"},
+        "machine_id": {"$ref": "#/$defs/nullableMachine"},
+        "base_commit": {"$ref": "#/$defs/nullableOid"},
+        "lock_oid": {"$ref": "#/$defs/nullableOid"},
+        "local_tag": {"$ref": "#/$defs/nullableLocalTag"},
+        "phase": {
+          "type": ["string", "null"],
+          "enum": [null, "lock_held", "committed", "pushed", "release_pending"]
+        },
+        "local_commit": {"$ref": "#/$defs/nullableOid"},
+        "pushed_commit": {"$ref": "#/$defs/nullableOid"}
+      }
+    }
+  },
+  "oneOf": [
+    {"$ref": "#/$defs/legacy"},
+    {"$ref": "#/$defs/current"}
+  ]
 }
