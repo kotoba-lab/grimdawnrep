@@ -214,7 +214,7 @@ def recover(config_path: Path) -> dict[str, Any]:
 
 def restore(config_path: Path, commit: str, *, apply: bool) -> dict[str, Any]:
     config = load_config(config_path); vault = _vault(config); vault.preflight()
-    root = Path(config_path).parent; destination = root / "staging" / f"restore-{commit}"
+    root = Path(config_path).parent
     if not apply:
         # Do not use extract_save here: extraction necessarily creates a
         # staging directory.  A default restore is an inspection only.
@@ -223,6 +223,13 @@ def restore(config_path: Path, commit: str, *, apply: bool) -> dict[str, Any]:
     _validate_restore_ancestry(vault, commit)
     _process_preflight(config)
     # Extract validates the historical manifest before any live-save operation.
+    # ``extract_save`` publishes through a create-only staging sibling.  The
+    # CLI owns its staging parent, so prepare it safely before extraction.
+    _safe_archive_parent(root / "staging")
+    # Keep every attempt create-only.  A prior successful restore may retain
+    # its extracted tree for recovery inspection, so its destination must not
+    # prevent the same historical commit from being restored again.
+    destination = root / "staging" / f"restore-{commit}-{uuid.uuid4().hex}"
     vault.extract_save(commit, destination, machine_id=config.machine_id, retries=config.stable_scan_retries, window_seconds=config.stable_window_seconds)
     result = restore_from_directory(destination, config.save_root, root / "archives", root / "recovery", machine_id=config.machine_id, apply=apply, retries=config.stable_scan_retries, window_seconds=config.stable_window_seconds)
     return {"schema_version":"1.0.0", "command":"restore", "commit":commit, **result}

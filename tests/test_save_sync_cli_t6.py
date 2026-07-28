@@ -74,6 +74,99 @@ def test_restore_dry_run_and_apply_only_delegate_apply_to_domain(monkeypatch: py
     assert not config.save_root.exists()
 
 
+def test_restore_apply_prepares_its_owned_staging_parent(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    config_path = tmp_path / "config.local.json"
+    config = SimpleNamespace(save_root=tmp_path / "live", machine_id="t6", stable_scan_retries=1, stable_window_seconds=1)
+
+    class Vault:
+        def preflight(self) -> None: pass
+        def extract_save(self, _commit: str, destination: Path, **_kwargs: object) -> None:
+            assert destination.parent == tmp_path / "staging"
+            assert destination.parent.is_dir() and not destination.parent.is_symlink()
+            destination.mkdir()
+
+    monkeypatch.setattr(cli, "load_config", lambda _: config)
+    monkeypatch.setattr(cli, "_vault", lambda _: Vault())
+    monkeypatch.setattr(cli, "_validate_restore_ancestry", lambda *_: None)
+    monkeypatch.setattr(cli, "_process_preflight", lambda *_: {"status": "stopped"})
+    monkeypatch.setattr(cli, "restore_from_directory", lambda *args, **kwargs: {"dry_run": False})
+
+    assert cli.restore(config_path, "commit", apply=True)["dry_run"] is False
+    assert (tmp_path / "staging").is_dir()
+
+
+def test_restore_apply_rejects_unsafe_staging_before_extract_or_live(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    config_path = tmp_path / "state" / "config.local.json"
+    staging = config_path.parent / "staging"; staging.parent.mkdir()
+    staging.write_text("not a directory", encoding="utf-8")
+    config = SimpleNamespace(save_root=tmp_path / "live", machine_id="t6", stable_scan_retries=1, stable_window_seconds=0)
+    calls: list[str] = []
+
+    class Vault:
+        def preflight(self) -> None: pass
+        def extract_save(self, *_args: object, **_kwargs: object) -> None: calls.append("extract")
+
+    monkeypatch.setattr(cli, "load_config", lambda _: config)
+    monkeypatch.setattr(cli, "_vault", lambda _: Vault())
+    monkeypatch.setattr(cli, "_validate_restore_ancestry", lambda *_: None)
+    monkeypatch.setattr(cli, "_process_preflight", lambda *_: {"status": "stopped"})
+    monkeypatch.setattr(cli, "restore_from_directory", lambda *_args, **_kwargs: calls.append("restore"))
+
+    with pytest.raises(SyncError) as error:
+        cli.restore(config_path, "a" * 40, apply=True)
+    assert error.value.code == "unsafe_archive_path"
+    assert calls == [] and not config.save_root.exists()
+
+
+def test_restore_apply_rejects_reparse_staging_before_extract_or_live(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    config_path = tmp_path / "state" / "config.local.json"
+    staging = config_path.parent / "staging"; staging.mkdir(parents=True)
+    config = SimpleNamespace(save_root=tmp_path / "live", machine_id="t6", stable_scan_retries=1, stable_window_seconds=0)
+    calls: list[str] = []; original_lstat = Path.lstat
+
+    def reparse_lstat(path: Path):
+        if path == staging:
+            return SimpleNamespace(st_mode=stat.S_IFDIR, st_file_attributes=0x400)
+        return original_lstat(path)
+
+    class Vault:
+        def preflight(self) -> None: pass
+        def extract_save(self, *_args: object, **_kwargs: object) -> None: calls.append("extract")
+
+    monkeypatch.setattr(cli, "load_config", lambda _: config)
+    monkeypatch.setattr(cli, "_vault", lambda _: Vault())
+    monkeypatch.setattr(cli, "_validate_restore_ancestry", lambda *_: None)
+    monkeypatch.setattr(cli, "_process_preflight", lambda *_: {"status": "stopped"})
+    monkeypatch.setattr(Path, "lstat", reparse_lstat)
+
+    with pytest.raises(SyncError) as error:
+        cli.restore(config_path, "a" * 40, apply=True)
+    assert error.value.code == "unsafe_archive_path"
+    assert calls == [] and not config.save_root.exists()
+
+
+def test_restore_apply_uses_a_fresh_create_only_destination_each_time(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    config_path = tmp_path / "config.local.json"
+    config = SimpleNamespace(save_root=tmp_path / "live", machine_id="t6", stable_scan_retries=1, stable_window_seconds=0)
+    destinations: list[Path] = []
+
+    class Vault:
+        def preflight(self) -> None: pass
+        def extract_save(self, _commit: str, destination: Path, **_kwargs: object) -> None:
+            assert not destination.exists()
+            destination.mkdir(); destinations.append(destination)
+
+    monkeypatch.setattr(cli, "load_config", lambda _: config)
+    monkeypatch.setattr(cli, "_vault", lambda _: Vault())
+    monkeypatch.setattr(cli, "_validate_restore_ancestry", lambda *_: None)
+    monkeypatch.setattr(cli, "_process_preflight", lambda *_: {"status": "stopped"})
+    monkeypatch.setattr(cli, "restore_from_directory", lambda *_args, **_kwargs: {"dry_run": False})
+
+    cli.restore(config_path, "a" * 40, apply=True)
+    cli.restore(config_path, "a" * 40, apply=True)
+    assert len(destinations) == 2 and destinations[0] != destinations[1]
+
+
 def test_restore_dry_run_inspects_only_and_leaves_filesystem_unchanged(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     config_path = tmp_path / "config.local.json"
     config = SimpleNamespace(save_root=tmp_path / "live", machine_id="t6", stable_scan_retries=1, stable_window_seconds=1)
