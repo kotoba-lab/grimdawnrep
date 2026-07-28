@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import stat
 from types import SimpleNamespace
 
 import pytest
@@ -528,6 +529,136 @@ def test_bootstrap_crash_after_prepare_resumes_same_timestamped_oid_without_snap
     assert vault.snapshots - before_resume == 0
     assert mutation_calls.count("snapshot:1") == 1
     assert mutation_calls[-5:] == ["validate", "extract", "apply", "mark", "push"]
+
+
+def test_bootstrap_resume_creates_only_safe_state_staging_parent_before_extract(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A pending bootstrap may resume before any state-local staging exists."""
+    root_hash = "a" * 64; oid = "b" * 40
+    config_path = tmp_path / "state" / "config.local.json"
+    config = SimpleNamespace(
+        save_root=tmp_path / "live", machine_id="t6", stable_scan_retries=1,
+        stable_window_seconds=0,
+    )
+    pending = cli.SyncState(
+        machine_id="t6", phase="bootstrap_pending", local_commit=oid,
+        last_applied_manifest_root_hash=root_hash, bootstrap_live_applied=False,
+    )
+    calls: list[str] = []
+
+    class Vault:
+        runner = SimpleNamespace(run=lambda *_a, **_k: SimpleNamespace(returncode=0, stdout=oid))
+        def remote_oid(self): return None
+        def validate_commit_snapshot(self, actual_oid):
+            assert actual_oid == oid; calls.append("validate")
+            return {"root_hash": root_hash}
+        def extract_save(self, actual_oid, destination, **_kwargs):
+            assert actual_oid == oid
+            assert destination.parent == config_path.parent / "staging"
+            assert destination.parent.is_dir() and not destination.parent.is_symlink()
+            calls.append("extract")
+            destination.mkdir()
+            return destination
+
+    monkeypatch.setattr(cli, "stable_manifest", lambda *_a, **_k: {"root_hash": root_hash})
+    monkeypatch.setattr(cli, "restore_from_directory", lambda _source, destination, *_a, **_k: (destination.mkdir(), calls.append("apply"), {"root_hash": root_hash})[-1])
+    monkeypatch.setattr(cli, "mark_bootstrap_live_applied", lambda *_a, **_k: calls.append("mark"))
+    monkeypatch.setattr(cli, "push_bootstrap", lambda *_a, **_k: calls.append("push") or oid)
+
+    result = cli._resume_bootstrap_cli(config_path, config, Vault(), pending, {"root_hash": root_hash})
+    assert result["commit"] == oid
+    assert calls == ["validate", "extract", "apply", "mark", "push"]
+    assert config.save_root.is_dir()
+
+
+def test_bootstrap_resume_rejects_unmanaged_staging_parent_before_live_or_push(
+    tmp_path: Path,
+) -> None:
+    root_hash = "a" * 64; oid = "b" * 40
+    config_path = tmp_path / "state" / "config.local.json"; config_path.parent.mkdir()
+    (config_path.parent / "staging").write_text("not a directory", encoding="utf-8")
+    config = SimpleNamespace(
+        save_root=tmp_path / "live", machine_id="t6", stable_scan_retries=1,
+        stable_window_seconds=0,
+    )
+    pending = cli.SyncState(
+        machine_id="t6", phase="bootstrap_pending", local_commit=oid,
+        last_applied_manifest_root_hash=root_hash, bootstrap_live_applied=False,
+    )
+    calls: list[str] = []
+
+    class Vault:
+        runner = SimpleNamespace(run=lambda *_a, **_k: SimpleNamespace(returncode=0, stdout=oid))
+        def remote_oid(self): calls.append("remote"); return None
+        def validate_commit_snapshot(self, _oid): calls.append("validate"); return {"root_hash": root_hash}
+        def extract_save(self, *_a, **_k): calls.append("extract")
+
+    with pytest.raises(SyncError) as error:
+        cli._resume_bootstrap_cli(config_path, config, Vault(), pending, {"root_hash": root_hash})
+    assert error.value.code == "unsafe_archive_path"
+    assert calls == ["validate", "remote"]
+    assert not config.save_root.exists()
+    assert pending.local_commit == oid and pending.bootstrap_live_applied is False
+
+
+def test_bootstrap_resume_rejects_reparse_staging_parent_before_live_or_push(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    root_hash = "a" * 64; oid = "b" * 40
+    config_path = tmp_path / "state" / "config.local.json"; config_path.parent.mkdir()
+    staging = config_path.parent / "staging"; staging.mkdir()
+    config = SimpleNamespace(
+        save_root=tmp_path / "live", machine_id="t6", stable_scan_retries=1,
+        stable_window_seconds=0,
+    )
+    pending = cli.SyncState(machine_id="t6", phase="bootstrap_pending", local_commit=oid,
+                            last_applied_manifest_root_hash=root_hash, bootstrap_live_applied=False)
+    calls: list[str] = []; original_lstat = Path.lstat
+    def reparse_lstat(path: Path):
+        if path == staging:
+            return SimpleNamespace(st_mode=stat.S_IFDIR, st_file_attributes=0x400)
+        return original_lstat(path)
+
+    class Vault:
+        runner = SimpleNamespace(run=lambda *_a, **_k: SimpleNamespace(returncode=0, stdout=oid))
+        def remote_oid(self): calls.append("remote"); return None
+        def validate_commit_snapshot(self, _oid): calls.append("validate"); return {"root_hash": root_hash}
+        def extract_save(self, *_a, **_k): calls.append("extract")
+
+    monkeypatch.setattr(Path, "lstat", reparse_lstat)
+    with pytest.raises(SyncError) as error:
+        cli._resume_bootstrap_cli(config_path, config, Vault(), pending, {"root_hash": root_hash})
+    assert error.value.code == "unsafe_archive_path"
+    assert calls == ["validate", "remote"] and not config.save_root.exists()
+    assert pending.local_commit == oid and pending.bootstrap_live_applied is False
+
+
+def test_bootstrap_resume_accepts_existing_empty_safe_staging_parent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    root_hash = "a" * 64; oid = "b" * 40
+    config_path = tmp_path / "state" / "config.local.json"; staging = config_path.parent / "staging"
+    staging.mkdir(parents=True)
+    config = SimpleNamespace(save_root=tmp_path / "live", machine_id="t6", stable_scan_retries=1, stable_window_seconds=0)
+    pending = cli.SyncState(machine_id="t6", phase="bootstrap_pending", local_commit=oid,
+                            last_applied_manifest_root_hash=root_hash, bootstrap_live_applied=False)
+    calls: list[str] = []
+
+    class Vault:
+        runner = SimpleNamespace(run=lambda *_a, **_k: SimpleNamespace(returncode=0, stdout=oid))
+        def remote_oid(self): return None
+        def validate_commit_snapshot(self, _oid): return {"root_hash": root_hash}
+        def extract_save(self, _oid, destination, **_k):
+            assert destination.parent == staging and destination.parent.is_dir()
+            calls.append("extract"); destination.mkdir(); return destination
+
+    monkeypatch.setattr(cli, "stable_manifest", lambda *_a, **_k: {"root_hash": root_hash})
+    monkeypatch.setattr(cli, "restore_from_directory", lambda _source, destination, *_a, **_k: (destination.mkdir(), calls.append("restore"), {"root_hash": root_hash})[-1])
+    monkeypatch.setattr(cli, "mark_bootstrap_live_applied", lambda *_a, **_k: calls.append("mark"))
+    monkeypatch.setattr(cli, "push_bootstrap", lambda *_a, **_k: calls.append("push") or oid)
+    assert cli._resume_bootstrap_cli(config_path, config, Vault(), pending, {"root_hash": root_hash})["commit"] == oid
+    assert calls == ["extract", "restore", "mark", "push"]
 
 
 def test_bootstrap_retry_wrong_cloud_source_is_rejected_before_vault_or_live_mutation(

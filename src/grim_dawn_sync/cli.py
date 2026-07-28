@@ -341,7 +341,12 @@ def _resume_bootstrap_cli(
         raise SyncError("bootstrap_live_mismatch", "Applied bootstrap live save is missing.", 6)
     else:
         root = Path(config_path).parent
-        extracted = root / "staging" / f"bootstrap-{oid}-{uuid.uuid4().hex}"
+        # The CLI owns its state-local staging parent.  GitVault owns only
+        # the create-only extraction destination below it, so prepare this
+        # ordinary directory without following links/reparse points first.
+        staging_root = root / "staging"
+        _safe_archive_parent(staging_root)
+        extracted = staging_root / f"bootstrap-{oid}-{uuid.uuid4().hex}"
         vault.extract_save(oid, extracted, machine_id=config.machine_id, retries=config.stable_scan_retries, window_seconds=config.stable_window_seconds)
         applied = restore_from_directory(extracted, config.save_root, root / "archives", root / "recovery", machine_id=config.machine_id, apply=True, retries=config.stable_scan_retries, window_seconds=config.stable_window_seconds)
         observed = stable_manifest(config.save_root, machine_id=config.machine_id, retries=config.stable_scan_retries, window_seconds=config.stable_window_seconds)
