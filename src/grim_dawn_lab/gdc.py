@@ -87,7 +87,17 @@ class _Reader:
         if length < 0 or length > 1_000_000:
             raise GdcError("invalid_string_length")
         byte_length = length * 2 if encoding == "utf-16-le" else length
-        return self.encrypted_bytes(byte_length).decode(encoding, errors="strict")
+        raw = self.encrypted_bytes(byte_length)
+        if encoding != "ascii":
+            return raw.decode(encoding, errors="strict")
+        # GDC's one-byte strings are normally ASCII record paths.  Preserve that
+        # public representation, but render any other byte losslessly and without
+        # changing the encrypted-stream alignment.  Backslashes and controls are
+        # escaped too, so this representation is unambiguous and reversible.
+        return "".join(
+            chr(value) if 0x20 <= value <= 0x7E and value != 0x5C else f"\\x{value:02x}"
+            for value in raw
+        )
 
     def array(self, item_reader: Callable[[], Any]) -> list[Any]:
         count = self.integer()
@@ -96,7 +106,7 @@ class _Reader:
         return [item_reader() for _ in range(count)]
 
 
-def _read_item(reader: _Reader) -> dict[str, Any]:
+def _read_item(reader: _Reader, version: int) -> dict[str, Any]:
     item = {
         "base": reader.string(),
         "prefix": reader.string(),
@@ -108,41 +118,50 @@ def _read_item(reader: _Reader) -> dict[str, Any]:
         "component_bonus": reader.string(),
         "component_seed": reader.integer(),
         "augment": reader.string(),
+    }
+    if version >= 8:
+        item["ascendant_record"] = reader.string()
+        item["ascendant_rerolls"] = reader.integer()
+    item.update({
         "unknown": reader.integer(),
         "augment_seed": reader.integer(),
         "component_completion_level": reader.integer(),
         "stack_count": reader.integer(),
-    }
+    })
+    if version >= 8:
+        item["seed_rerolls"] = reader.integer()
+    if version >= 11:
+        item["affix_rerolls"] = reader.integer()
     return item
 
 
-def _read_equipment_item(reader: _Reader) -> dict[str, Any]:
-    item = _read_item(reader)
-    item["attached"] = reader.boolean()
+def _read_equipment_item(reader: _Reader, version: int) -> dict[str, Any]:
+    item = _read_item(reader, version)
+    item["attached"] = reader.byte()
     return item
 
 
-def _read_inventory_item(reader: _Reader) -> dict[str, Any]:
-    item = _read_item(reader)
+def _read_inventory_item(reader: _Reader, version: int) -> dict[str, Any]:
+    item = _read_item(reader, version)
     item["x"] = reader.integer()
     item["y"] = reader.integer()
     return item
 
 
-def _read_nested_sack(reader: _Reader) -> dict[str, Any]:
+def _read_nested_sack(reader: _Reader, version: int) -> dict[str, Any]:
     block_id = reader.integer()
     length = reader.block_length()
     end = reader.position + length
     if block_id != 0:
         raise GdcError("unexpected_inventory_block")
-    result = {"unused": reader.boolean(), "items": reader.array(lambda: _read_inventory_item(reader))}
+    result = {"unused": reader.byte(), "items": reader.array(lambda: _read_inventory_item(reader, version))}
     if reader.position != end:
         raise GdcError("inventory_block_length_mismatch")
     _verify_checksum(reader)
     return result
 
 
-def _read_nested_stash(reader: _Reader) -> None:
+def _read_nested_stash(reader: _Reader, version: int) -> None:
     block_id = reader.integer()
     length = reader.block_length()
     end = reader.position + length
@@ -150,7 +169,13 @@ def _read_nested_stash(reader: _Reader) -> None:
         raise GdcError("unexpected_stash_block")
     reader.integer()  # width
     reader.integer()  # height
-    reader.array(lambda: _read_inventory_item(reader))
+    reader.array(lambda: _read_inventory_item(reader, version))
+    if version >= 9:
+        reader.integer()  # border index
+        reader.integer()  # border color index
+        reader.integer()  # symbol index
+        reader.integer()  # symbol color index
+        reader.string("utf-16-le")  # button name
     if reader.position != end:
         raise GdcError("stash_block_length_mismatch")
     _verify_checksum(reader, "stash_block")
@@ -158,11 +183,14 @@ def _read_nested_stash(reader: _Reader) -> None:
 
 def _read_block4(reader: _Reader) -> dict[str, Any]:
     version = reader.integer()
+    if version not in range(6, 12):
+        raise UnsupportedGdcVersion(f"unsupported_block_version:4:{version}")
     count = reader.integer()
     if count < 0 or count > 100:
         raise GdcError("invalid_stash_count")
     for _ in range(count):
-        _read_nested_stash(reader)
+        # Stash item layout is keyed to Block 4's own version, not Block 3.
+        _read_nested_stash(reader, version)
     return {"version": version, "stash_count": count}
 
 
@@ -178,7 +206,10 @@ def _read_block2(reader: _Reader) -> dict[str, Any]:
 
 
 def _read_block3(reader: _Reader) -> dict[str, Any]:
-    result: dict[str, Any] = {"version": reader.integer(), "has_data": reader.boolean()}
+    version = reader.integer()
+    if version not in range(4, 12):
+        raise UnsupportedGdcVersion(f"unsupported_block_version:3:{version}")
+    result: dict[str, Any] = {"version": version, "has_data": reader.boolean()}
     if not result["has_data"]:
         return result
     sack_count = reader.integer()
@@ -187,24 +218,33 @@ def _read_block3(reader: _Reader) -> dict[str, Any]:
     result.update({
         "focused_sack": reader.integer(),
         "selected_sack": reader.integer(),
-        "inventory_sacks": [_read_nested_sack(reader) for _ in range(sack_count)],
-        "use_alternate_weapon_set": reader.boolean(),
-        "equipment": [_read_equipment_item(reader) for _ in range(12)],
-        "alternate_set_1_enabled": reader.boolean(),
-        "alternate_set_1": [_read_equipment_item(reader) for _ in range(2)],
-        "alternate_set_2_enabled": reader.boolean(),
-        "alternate_set_2": [_read_equipment_item(reader) for _ in range(2)],
+        "inventory_sacks": [_read_nested_sack(reader, version) for _ in range(sack_count)],
+        # These are selectors/indexes, not validated boolean flags.  Keeping the
+        # original field names avoids a public-model shape change while retaining
+        # every valid byte value from the v4 layout.
+        "use_alternate_weapon_set": reader.byte(),
+        "equipment": [_read_equipment_item(reader, version) for _ in range(12)],
+        "alternate_set_1_enabled": reader.byte(),
+        "alternate_set_1": [_read_equipment_item(reader, version) for _ in range(2)],
+        "alternate_set_2_enabled": reader.byte(),
+        "alternate_set_2": [_read_equipment_item(reader, version) for _ in range(2)],
     })
     return result
 
 
-def _read_character_skill(reader: _Reader) -> dict[str, Any]:
-    return {
+def _read_character_skill(reader: _Reader, version: int) -> dict[str, Any]:
+    skill = {
         "record": reader.string(), "level": reader.integer(), "enabled": reader.boolean(),
         "devotion_level": reader.integer(), "devotion_experience": reader.integer(),
-        "sublevel": reader.integer(), "active": reader.boolean(), "transition": reader.boolean(),
-        "autocast_skill": reader.string(), "autocast_controller": reader.string(),
+        "sublevel": reader.integer(),
     }
+    if version >= 8:
+        skill["unknown_v8"] = reader.byte()
+    skill.update({
+        "active": reader.boolean(), "transition": reader.boolean(),
+        "autocast_skill": reader.string(), "autocast_controller": reader.string(),
+    })
+    return skill
 
 
 def _read_item_skill(reader: _Reader) -> dict[str, Any]:
@@ -215,18 +255,32 @@ def _read_item_skill(reader: _Reader) -> dict[str, Any]:
     }
 
 
+def _read_character_sub_skill(reader: _Reader) -> dict[str, Any]:
+    return {
+        "name": reader.string(),
+        "autocast_skill": reader.string(),
+        "autocast_controller": reader.string(),
+        "parent_skill": reader.string(),
+    }
+
+
 def _read_block8(reader: _Reader) -> dict[str, Any]:
     version = reader.integer()
+    if version not in range(5, 9):
+        raise UnsupportedGdcVersion(f"unsupported_block_version:8:{version}")
     result = {
         "version": version,
-        "skills": reader.array(lambda: _read_character_skill(reader)),
+        "skills": reader.array(lambda: _read_character_skill(reader, version)),
         "masteries_allowed": reader.integer(),
         "skill_points_reclaimed": reader.integer(),
         "devotion_points_reclaimed": reader.integer(),
         "item_skills": reader.array(lambda: _read_item_skill(reader)),
     }
     if version >= 6:
-        result["unknown_v6"] = reader.integer()
+        sub_skill_count = reader.integer()
+        if sub_skill_count < 0 or sub_skill_count > 1_000_000:
+            raise GdcError("invalid_sub_skill_count")
+        result["sub_skills"] = [_read_character_sub_skill(reader) for _ in range(sub_skill_count)]
     return result
 
 
