@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Grim Dawn Save Sync remote session lock",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "session_id", "machine_id", "base_commit", "started_at"],
+  "properties": {
+    "schema_version": {"const": "1.0.0"},
+    "session_id": {"type": "string", "minLength": 1},
+    "machine_id": {"type": "string", "minLength": 1},
+    "base_commit": {"type": "string", "minLength": 1},
+    "started_at": {"type": "string", "format": "date-time"}
+  }
+}

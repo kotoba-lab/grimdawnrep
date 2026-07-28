@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Grim Dawn Save Sync local configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "machine_id", "save_root", "vault_repo", "remote", "branch", "game_install", "launcher_mode", "launcher_path", "game_process_names", "launch_timeout_seconds", "stable_window_seconds", "stable_scan_retries", "offline_policy"],
+  "properties": {
+    "schema_version": {"const": "1.0.0"},
+    "machine_id": {"type": "string", "minLength": 1},
+    "save_root": {"type": "string", "minLength": 1},
+    "vault_repo": {"type": "string", "minLength": 1},
+    "remote": {"type": "string", "minLength": 1},
+    "branch": {"type": "string", "minLength": 1},
+    "game_install": {"type": "string", "minLength": 1},
+    "launcher_mode": {"const": "dpyes"},
+    "launcher_path": {"type": "string", "minLength": 1},
+    "game_process_names": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+    "launch_timeout_seconds": {"type": "integer", "minimum": 1},
+    "stable_window_seconds": {"type": "integer", "minimum": 1},
+    "stable_scan_retries": {"type": "integer", "minimum": 1},
+    "offline_policy": {"const": "deny"}
+  }
+}

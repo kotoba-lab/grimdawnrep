@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Grim Dawn Save Sync terminal-local state",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "last_applied_remote_commit", "last_applied_manifest_root_hash", "session_id"],
+  "properties": {
+    "schema_version": {"const": "1.0.0"},
+    "last_applied_remote_commit": {"type": ["string", "null"], "minLength": 1},
+    "last_applied_manifest_root_hash": {"type": ["string", "null"], "minLength": 1},
+    "session_id": {"type": ["string", "null"], "minLength": 1}
+  }
+}
