@@ -141,6 +141,92 @@ def test_preflight_rejects_unmanaged_dirty_and_hooks(tmp_path: Path) -> None:
     with pytest.raises(SyncError, match="hooks"): GitVault(one).preflight()
 
 
+def test_preflight_allows_fresh_clone_default_inactive_hook_samples(tmp_path: Path) -> None:
+    remote = tmp_path / "remote.git"; git(tmp_path, "init", "--bare", str(remote))
+    fresh = tmp_path / "fresh"; git(tmp_path, "clone", str(remote), str(fresh))
+
+    hooks = fresh / ".git" / "hooks"
+    assert any(path.suffix == ".sample" for path in hooks.iterdir())
+    GitVault(fresh).preflight()
+
+
+def test_preflight_rejects_active_default_hook_and_custom_hookspath(tmp_path: Path) -> None:
+    _, one, _ = clone_pair(tmp_path)
+    git(one, "config", "--unset", "core.hooksPath")
+    hooks = one / ".git" / "hooks"
+    (hooks / "pre-commit").write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    with pytest.raises(SyncError) as caught:
+        GitVault(one).preflight()
+    assert caught.value.code == "vault_hooks_present"
+
+    (hooks / "pre-commit").unlink()
+    custom = one / ".sync" / "other-hooks"; custom.mkdir()
+    git(one, "config", "core.hooksPath", ".sync/other-hooks")
+    with pytest.raises(SyncError) as caught:
+        GitVault(one).preflight()
+    assert caught.value.code == "vault_hooks_present"
+
+    git(one, "config", "--unset", "core.hooksPath")
+
+
+def test_preflight_rejects_linked_default_sample_hook(tmp_path: Path) -> None:
+    _, one, _ = clone_pair(tmp_path)
+    git(one, "config", "--unset", "core.hooksPath")
+    hooks = one / ".git" / "hooks"
+    linked = hooks / "pre-push.sample"
+    target = tmp_path / "outside-sample"; target.write_text("not a hook", encoding="utf-8")
+    linked.unlink()
+    try:
+        linked.symlink_to(target)
+    except (NotImplementedError, OSError):
+        pytest.skip("symbolic links unavailable in this test environment")
+    with pytest.raises(SyncError) as caught:
+        GitVault(one).preflight()
+    assert caught.value.code == "vault_hooks_present"
+
+
+def test_preflight_rejects_reparse_marked_default_sample_hook(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import grim_dawn_sync.git_vault as module
+
+    _, one, _ = clone_pair(tmp_path)
+    git(one, "config", "--unset", "core.hooksPath")
+    sample = one / ".git" / "hooks" / "pre-commit.sample"
+    original = module._safe_lstat
+
+    def unsafe_sample(path: Path):
+        if Path(path) == sample:
+            raise SyncError("unsafe_vault_tree", "reparse", EXIT_RECOVERY_REQUIRED)
+        return original(path)
+
+    monkeypatch.setattr(module, "_safe_lstat", unsafe_sample)
+    with pytest.raises(SyncError) as caught:
+        GitVault(one).preflight()
+    assert caught.value.code == "vault_hooks_present"
+
+
+@pytest.mark.parametrize("unsafe_path", [".git/hooks", ".sync"])
+def test_preflight_rejects_reparse_hook_directory_or_controlled_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unsafe_path: str
+) -> None:
+    import grim_dawn_sync.git_vault as module
+
+    _, one, _ = clone_pair(tmp_path)
+    if unsafe_path == ".git/hooks":
+        git(one, "config", "--unset", "core.hooksPath")
+    unsafe = one / unsafe_path
+    original = module._safe_lstat
+
+    def unsafe_directory(path: Path):
+        if Path(path) == unsafe:
+            raise SyncError("unsafe_vault_tree", "reparse", EXIT_RECOVERY_REQUIRED)
+        return original(path)
+
+    monkeypatch.setattr(module, "_safe_lstat", unsafe_directory)
+    with pytest.raises(SyncError) as caught:
+        GitVault(one).preflight()
+    assert caught.value.code == "vault_hooks_present"
+
+
 def test_extracts_past_save_without_checkout_and_rejects_bad_destination(tmp_path: Path) -> None:
     _, one, _ = clone_pair(tmp_path); source = save(tmp_path / "source", b"old"); vault = GitVault(one)
     old = vault.snapshot(source, machine_id="a", session_id="1", validator=valid)

@@ -51,6 +51,45 @@ def _safe_lstat(path: Path) -> os.stat_result:
     return value
 
 
+def _safe_ordinary_directory(path: Path) -> bool:
+    """Return whether ``path`` is an ordinary directory without links."""
+    try:
+        value = _safe_lstat(path)
+        return stat.S_ISDIR(value.st_mode)
+    except (FileNotFoundError, OSError, SyncError):
+        return False
+
+
+def _safe_empty_directory(path: Path) -> bool:
+    """Return whether ``path`` is an ordinary, empty directory without links."""
+    if not _safe_ordinary_directory(path):
+        return False
+    try:
+        with os.scandir(path) as entries:
+            return next(entries, None) is None
+    except OSError:
+        return False
+
+
+def _inactive_default_hook_samples(path: Path) -> bool:
+    """Accept only ordinary ``*.sample`` files in Git's inactive default hook dir."""
+    try:
+        directory = _safe_lstat(path)
+        if not stat.S_ISDIR(directory.st_mode):
+            return False
+        with os.scandir(path) as entries:
+            for entry in entries:
+                item = _safe_lstat(Path(entry.path))
+                if not stat.S_ISREG(item.st_mode) or not entry.name.endswith(".sample"):
+                    return False
+        return True
+    except FileNotFoundError:
+        # A missing default hook directory has no executable hooks either.
+        return True
+    except (OSError, SyncError):
+        return False
+
+
 def _remove_safe_tree(root: Path) -> None:
     """Remove only a verified ordinary tree; never follow a reparse point."""
     root_stat = _safe_lstat(root)
@@ -305,8 +344,13 @@ class GitVault:
         hooks = self.runner.run("config", "--get", "core.hooksPath", check=False).stdout.strip()
         default_hooks = self.repo / ".git" / "hooks"
         controlled_hooks = self.repo / ".sync" / "empty-hooks"
-        allowed_hooks = hooks == ".sync/empty-hooks" and controlled_hooks.is_dir() and not any(controlled_hooks.iterdir())
-        if not allowed_hooks and (hooks or (default_hooks.is_dir() and any(default_hooks.iterdir()))):
+        allowed_controlled_hooks = (
+            hooks == ".sync/empty-hooks"
+            and _safe_ordinary_directory(controlled_hooks.parent)
+            and _safe_empty_directory(controlled_hooks)
+        )
+        allowed_default_hooks = not hooks and _inactive_default_hook_samples(default_hooks)
+        if not (allowed_controlled_hooks or allowed_default_hooks):
             raise SyncError("vault_hooks_present", "Vault Git hooks are not permitted.", EXIT_CONFLICT)
         tracked = self.runner.run_bytes("ls-files", "-z").split(b"\0")
         allowed = set(_MANAGED)
