@@ -82,6 +82,35 @@ def test_doctor_reads_temp_config_without_touching_save_or_network(tmp_path: Pat
     assert result["warnings"][0]["code"] == "t0_only"
 
 
+def test_doctor_missing_save_is_warning_and_creates_nothing(tmp_path: Path) -> None:
+    missing_save = tmp_path / "missing-save"
+    payload = config_payload(); payload["save_root"] = str(missing_save)
+    config_path = tmp_path / "config.local.json"; config_path.write_text(json.dumps(payload), encoding="utf-8")
+    completed = subprocess.run([sys.executable, "-m", "grim_dawn_sync", "--config", str(config_path), "--json", "doctor"], cwd=ROOT, env={**__import__("os").environ, "PYTHONPATH": str(ROOT / "src")}, capture_output=True, text=True)
+    result = json.loads(completed.stdout)
+    assert completed.returncode == 0
+    assert any(item["code"] == "save_root_missing" for item in result["warnings"])
+    assert not missing_save.exists()
+
+
+def test_doctor_reports_only_safe_manifest_summary_for_temp_save(tmp_path: Path) -> None:
+    save_root = tmp_path / "save"
+    (save_root / "main/private").mkdir(parents=True)
+    (save_root / "main/private/player.gdc").write_bytes(b"not parsed by doctor")
+    payload = config_payload()
+    payload["save_root"] = str(save_root)
+    config_path = tmp_path / "config.local.json"
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+    completed = subprocess.run(
+        [sys.executable, "-m", "grim_dawn_sync", "--config", str(config_path), "--json", "doctor"],
+        cwd=ROOT, env={**__import__("os").environ, "PYTHONPATH": str(ROOT / "src")}, capture_output=True, text=True,
+    )
+    result = json.loads(completed.stdout)
+    summary = result["checks"]["save_root"]["manifest"]
+    assert summary["file_count"] == 1 and summary["character_count"] == 1
+    assert "private" not in completed.stdout
+
+
 def test_doctor_returns_machine_readable_config_error(tmp_path: Path) -> None:
     missing = tmp_path / "missing.local.json"
     completed = subprocess.run(

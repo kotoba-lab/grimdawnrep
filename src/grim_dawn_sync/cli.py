@@ -11,6 +11,8 @@ from typing import Any
 from grim_dawn_sync import __version__
 from grim_dawn_sync.config import default_config_path, load_config
 from grim_dawn_sync.errors import EXIT_OK, SyncError
+from grim_dawn_sync.manifest import stable_manifest
+from grim_dawn_sync.discovery import cloud_candidates, game_candidates, inspect_path
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -24,6 +26,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 def doctor(config_path: Path) -> dict[str, Any]:
     config = load_config(config_path)
+    save = {"configured": True, "exists": config.save_root.exists(), "manifest": None}
+    warnings = [{"code": "t0_only", "message": "No process, Git, or network operation was performed."}]
+    if config.save_root.is_dir():
+        try:
+            manifest = stable_manifest(config.save_root, machine_id=config.machine_id, retries=config.stable_scan_retries, window_seconds=config.stable_window_seconds)
+            save["manifest"] = {key: manifest[key] for key in ("root_hash", "file_count", "total_bytes", "character_count")}
+        except SyncError as error:
+            save["validation"] = error.code
+    else:
+        warnings.append({"code": "save_root_missing", "message": "Configured save root was not found; nothing was created."})
     return {
         "schema_version": "1.0.0",
         "tool_version": __version__,
@@ -33,11 +45,14 @@ def doctor(config_path: Path) -> dict[str, Any]:
         "machine_id": config.machine_id,
         "checks": {
             "config": {"ok": True},
-            "save_sync_implementation": {"ok": False, "detail": "T0 boundary only; discovery and synchronization are not implemented."},
+            "save_root": save,
+            "cloud": cloud_candidates(config.game_install),
+            "vault": inspect_path(config.vault_repo),
+            "launcher": game_candidates(config.game_install, config.launcher_path),
+            "processes": {"status": "unknown", "detail": "T5 process detection is not implemented."},
+            "save_sync_implementation": {"ok": False, "detail": "T1 read-only discovery and validation only."},
         },
-        "warnings": [
-            {"code": "t0_only", "message": "No save, process, Git, or network operation was performed."}
-        ],
+        "warnings": warnings,
     }
 
 
