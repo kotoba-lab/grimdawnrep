@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:grim-dawn-encounter-lab:schema:build:0.1.0",
+  "title": "Build",
+  "type": "object",
+  "required": ["schema_version", "build_id", "source", "character", "attributes", "equipment", "skills", "defense_snapshots", "unknowns"],
+  "properties": {
+    "schema_version": {"const": "0.1.0"},
+    "build_id": {"type": "string"},
+    "source": {"type": "object"},
+    "character": {"type": "object"},
+    "attributes": {"type": "object"},
+    "equipment": {"type": "array", "items": {"type": "object"}},
+    "skills": {"type": "array", "items": {"type": "object"}},
+    "defense_snapshots": {"type": "object"},
+    "unknowns": {"type": "array", "items": {"type": "object"}}
+  }
+}

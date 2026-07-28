@@ -11,6 +11,7 @@
     "level": { "type": "integer", "minimum": 1 },
     "health": { "type": "number", "exclusiveMinimum": 0 },
     "defensive_ability": { "type": "number", "minimum": 0 },
+    "physical_resistance": { "type": "number", "minimum": -1, "maximum": 1 },
     "resistances": {
       "type": "object",
       "additionalProperties": { "$ref": "#/$defs/resistance" }
@@ -55,6 +56,14 @@
       }
     },
     "absorption": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "percent": { "type": "number", "minimum": 0, "maximum": 1 },
+        "flat": { "type": "number", "minimum": 0 }
+      }
+    },
+    "monster_type_reduction": {
       "type": "object",
       "additionalProperties": false,
       "properties": {

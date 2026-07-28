@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:grim-dawn-encounter-lab:schema:observation:0.1.0",
+  "title": "CombatObservation",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "game_version", "observed_at", "scenario", "events", "provenance"],
+  "properties": {
+    "schema_version": { "const": "0.1.0" },
+    "game_version": { "type": "string", "minLength": 1 },
+    "observed_at": { "type": "string", "format": "date-time" },
+    "scenario": { "type": "object" },
+    "events": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["time_seconds", "kind"],
+        "properties": {
+          "time_seconds": { "type": "number", "minimum": 0 },
+          "kind": { "enum": ["hit", "debuff", "heal", "death", "unknown"] },
+          "source_record_id": { "type": ["string", "null"] },
+          "observed_value": { "type": ["number", "null"] },
+          "notes": { "type": "string" }
+        }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "required": ["method"],
+      "properties": {
+        "method": { "enum": ["video", "manual", "combat_log", "fixture"] },
+        "source_hash": { "type": "string" }
+      }
+    }
+  }
+}

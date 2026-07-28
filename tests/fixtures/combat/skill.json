@@ -1,0 +1,8 @@
+{
+  "record_id": "fixture/enemy/single-hit",
+  "offensive_ability": 1000,
+  "damage_packets": [
+    {"damage_type": "physical", "minimum": 100, "maximum": 100},
+    {"damage_type": "fire", "minimum": 100, "maximum": 100}
+  ]
+}

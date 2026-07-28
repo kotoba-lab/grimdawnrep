@@ -1,0 +1,13 @@
+[
+  {
+    "id": "cold-exposure",
+    "time": 0.0,
+    "skill": {"damage_packets": [{"damage_type": "fire", "minimum": 100, "maximum": 100}]},
+    "applies": [{"kind": "resistance_reduction", "damage_type": "fire", "value": 50, "duration_seconds": 3}]
+  },
+  {
+    "id": "follow-up",
+    "time": 1.0,
+    "skill": {"damage_packets": [{"damage_type": "fire", "minimum": 100, "maximum": 100}]}
+  }
+]

@@ -1,0 +1,11 @@
+{
+  "schema_version": "0.1.0",
+  "game_version": "fixture",
+  "observed_at": "2026-07-13T00:00:00Z",
+  "scenario": {"id": "debuff-followup"},
+  "events": [
+    {"time_seconds": 0, "kind": "hit", "observed_value": 20},
+    {"time_seconds": 1, "kind": "hit", "observed_value": 50}
+  ],
+  "provenance": {"method": "fixture", "source_hash": "fixture"}
+}

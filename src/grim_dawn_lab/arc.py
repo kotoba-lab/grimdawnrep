@@ -1,4 +1,4 @@
-"""Reader for Grim Dawn ARC v3 localization archives."""
+"""Read-only reader for Grim Dawn ARC v3 archives."""
 
 from __future__ import annotations
 
@@ -6,103 +6,120 @@ import struct
 from pathlib import Path
 
 
-def _lz4_block(data: bytes, expected_size: int) -> bytes:
-    """Decode the raw LZ4 blocks used by ARC v3 file parts."""
+class ArcFormatError(ValueError):
+    pass
+
+
+def decompress_lz4_block(data: bytes, expected_size: int) -> bytes:
+    """Decode the raw LZ4 block variant used by ARC v3 parts."""
     output = bytearray()
-    position = 0
-    while position < len(data):
-        token = data[position]
-        position += 1
+    cursor = 0
+    while cursor < len(data):
+        token = data[cursor]
+        cursor += 1
         literal_length = token >> 4
         if literal_length == 15:
             while True:
-                if position >= len(data):
-                    raise ValueError("truncated LZ4 literal length")
-                extra = data[position]
-                position += 1
-                literal_length += extra
-                if extra != 255:
+                if cursor >= len(data):
+                    raise ArcFormatError("truncated LZ4 literal length")
+                extension = data[cursor]
+                cursor += 1
+                literal_length += extension
+                if extension != 255:
                     break
-        if position + literal_length > len(data):
-            raise ValueError("truncated LZ4 literals")
-        output.extend(data[position : position + literal_length])
-        position += literal_length
-        if position == len(data):
+        if cursor + literal_length > len(data):
+            raise ArcFormatError("truncated LZ4 literals")
+        output.extend(data[cursor : cursor + literal_length])
+        cursor += literal_length
+        if cursor == len(data):
             break
-        if position + 2 > len(data):
-            raise ValueError("truncated LZ4 match offset")
-        offset = data[position] | (data[position + 1] << 8)
-        position += 2
+        if cursor + 2 > len(data):
+            raise ArcFormatError("truncated LZ4 match offset")
+        offset = int.from_bytes(data[cursor : cursor + 2], "little")
+        cursor += 2
         if offset == 0 or offset > len(output):
-            raise ValueError("invalid LZ4 match offset")
+            raise ArcFormatError("invalid LZ4 match offset")
         match_length = token & 0x0F
         if match_length == 15:
             while True:
-                if position >= len(data):
-                    raise ValueError("truncated LZ4 match length")
-                extra = data[position]
-                position += 1
-                match_length += extra
-                if extra != 255:
+                if cursor >= len(data):
+                    raise ArcFormatError("truncated LZ4 match length")
+                extension = data[cursor]
+                cursor += 1
+                match_length += extension
+                if extension != 255:
                     break
         match_length += 4
         start = len(output) - offset
         for index in range(match_length):
             output.append(output[start + index])
     if len(output) != expected_size:
-        raise ValueError(f"LZ4 size mismatch: expected {expected_size}, got {len(output)}")
+        raise ArcFormatError(f"LZ4 size mismatch: expected {expected_size}, got {len(output)}")
     return bytes(output)
 
 
-def _parse_tag_text(payload: bytes) -> dict[str, str]:
-    text = payload.decode("utf-8-sig")
-    result: dict[str, str] = {}
-    for line in text.splitlines():
-        key, separator, value = line.partition("=")
-        if separator and key.startswith("tag"):
-            result[key] = value
+def read_arc(path: Path) -> dict[str, bytes]:
+    data = path.read_bytes()
+    if len(data) < 28:
+        raise ArcFormatError("ARC header is truncated")
+    magic, version, file_count, part_count, parts_size, names_size, table_offset = struct.unpack_from(
+        "<4s6I", data, 0
+    )
+    if magic != b"ARC\0" or version != 3:
+        raise ArcFormatError(f"unsupported ARC magic/version: {magic!r}/{version}")
+    if parts_size != part_count * 12:
+        raise ArcFormatError("ARC part table size is inconsistent")
+    parts_offset = table_offset
+    names_offset = parts_offset + parts_size
+    files_offset = names_offset + names_size
+    expected_end = files_offset + file_count * 44
+    if expected_end > len(data):
+        raise ArcFormatError("ARC tables extend beyond end of file")
+    parts = [struct.unpack_from("<3I", data, parts_offset + index * 12) for index in range(part_count)]
+    names = data[names_offset:files_offset]
+    result: dict[str, bytes] = {}
+    for index in range(file_count):
+        entry = struct.unpack_from("<11I", data, files_offset + index * 44)
+        storage_type, _, _, expected_size, _, _, _, file_parts, first_part, name_length, name_start = entry
+        if first_part + file_parts > len(parts) or name_start + name_length > len(names):
+            raise ArcFormatError("ARC file entry references an invalid table range")
+        name = names[name_start : name_start + name_length].decode("utf-8")
+        chunks: list[bytes] = []
+        for part_offset, compressed_size, uncompressed_size in parts[first_part : first_part + file_parts]:
+            compressed = data[part_offset : part_offset + compressed_size]
+            if len(compressed) != compressed_size:
+                raise ArcFormatError("ARC part is truncated")
+            if compressed_size == uncompressed_size:
+                chunk = compressed
+            elif storage_type == 3:
+                chunk = decompress_lz4_block(compressed, uncompressed_size)
+            else:
+                raise ArcFormatError(f"unsupported ARC storage type: {storage_type}")
+            chunks.append(chunk)
+        content = b"".join(chunks)
+        if len(content) != expected_size:
+            raise ArcFormatError(f"ARC file size mismatch for {name}")
+        result[name] = content
     return result
 
 
-def parse_localization_arc(path: Path) -> dict[str, str]:
-    """Read tag=value localization files from a Grim Dawn ARC v3 archive.
+def _parse_tag_text(payload: bytes) -> dict[str, str]:
+    tags: dict[str, str] = {}
+    for line in payload.decode("utf-8-sig").splitlines():
+        if not line or line.lstrip().startswith("#") or "=" not in line:
+            continue
+        tag, value = line.split("=", 1)
+        tags[tag.strip()] = value.strip()
+    return tags
 
-    Plain UTF-8 tag files are also accepted for small synthetic fixtures.
-    """
+
+def parse_localization_arc(path: Path) -> dict[str, str]:
+    """Read tag=value localization files from ARC or plain synthetic fixtures."""
     data = path.read_bytes()
     if data[:4] != b"ARC\0":
         return _parse_tag_text(data)
-    if len(data) < 28:
-        raise ValueError(f"truncated ARC header: {path}")
-    _, version, file_count, part_count, part_table_size, string_table_size, part_table_offset = struct.unpack_from("<7I", data)
-    if version != 3 or part_table_size != part_count * 12:
-        raise ValueError(f"unsupported ARC layout: {path}")
-    string_table_offset = part_table_offset + part_table_size
-    toc_offset = string_table_offset + string_table_size
-    toc_size = file_count * 44
-    if toc_offset + toc_size != len(data):
-        raise ValueError(f"invalid ARC table bounds: {path}")
-    strings = data[string_table_offset:toc_offset]
-    parts = [struct.unpack_from("<3I", data, part_table_offset + index * 12) for index in range(part_count)]
     tags: dict[str, str] = {}
-    for index in range(file_count):
-        entry = struct.unpack_from("<5IQ4I", data, toc_offset + index * 44)
-        entry_type, file_offset, compressed_size, decompressed_size, _, _, file_parts, first_part, name_length, name_offset = entry
-        if name_offset + name_length > len(strings):
-            raise ValueError(f"invalid ARC string table entry: {path}")
-        name = strings[name_offset : name_offset + name_length].decode("utf-8")
-        if not name.lower().endswith(".txt"):
-            continue
-        if first_part + file_parts > len(parts):
-            raise ValueError(f"invalid ARC part range: {path}")
-        chunks: list[bytes] = []
-        for part_offset, compressed_length, decompressed_length in parts[first_part : first_part + file_parts]:
-            if part_offset + compressed_length > len(data):
-                raise ValueError(f"invalid ARC part bounds: {path}")
-            chunk = data[part_offset : part_offset + compressed_length]
-            chunks.append(chunk if compressed_length == decompressed_length else _lz4_block(chunk, decompressed_length))
-        payload = b"".join(chunks)
-        if len(payload) != decompressed_size:
-            raise ValueError(f"invalid ARC file entry: {path}:{name}")
-        tags.update(_parse_tag_text(payload))
+    for name, content in read_arc(path).items():
+        if name.lower().endswith(".txt"):
+            tags.update(_parse_tag_text(content))
     return tags

@@ -1,0 +1,13 @@
+{
+  "schema_version": "0.1.0",
+  "game_version": "fixture",
+  "level": 100,
+  "health": 1000,
+  "defensive_ability": 1000,
+  "resistances": {"fire": {"current": 80, "maximum": 80, "uncapped": 100}},
+  "armor": {
+    "absorption": 0.7,
+    "slots": {"head": 50, "shoulders": 50, "torso": 50, "arms": 50, "legs": 50, "feet": 50}
+  },
+  "absorption": {"percent": 0, "flat": 0}
+}
