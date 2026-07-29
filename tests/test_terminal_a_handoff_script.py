@@ -44,6 +44,11 @@ def test_terminal_a_handoff_accepts_any_python_311_or_later() -> None:
     assert "import sys; print(sys.executable)" in SCRIPT
     assert "sys.version_info >= (3, 11)" in SCRIPT
     assert "Invoke-Quiet $interpreterPython @('-m', 'venv', $venvPath) 'venv_create_failed'" in SCRIPT
+    assert "function Install-SourcePath" in SCRIPT
+    assert "grim_dawn_sync_source.pth" in SCRIPT
+    assert "'-m', 'pip', 'install'" not in SCRIPT
+    assert "sysconfig.get_path(chr(112)+chr(117)+chr(114)+chr(101)+chr(108)+chr(105)+chr(98))" in SCRIPT
+    assert "source_package_import_failed" in SCRIPT
     assert "-3.11" not in SCRIPT
     assert "Python 3.11以上" in DOC
 
@@ -53,7 +58,10 @@ def test_terminal_a_handoff_reports_sanitized_stage_failure_codes() -> None:
     assert "python_launcher_not_found" in SCRIPT
     assert "source_fetch_failed" in SCRIPT
     assert "venv_create_failed" in SCRIPT
-    assert "package_install_failed" in SCRIPT
+    assert "source_path_install" in SCRIPT
+    assert "source_package_missing" in SCRIPT
+    assert "venv_site_packages_unavailable" in SCRIPT
+    assert "source_package_import_failed" in SCRIPT
     assert "vault_clone_failed" in SCRIPT
     assert "doctor_command_failed" in SCRIPT
     assert "enroll_dry_run_failed" in SCRIPT

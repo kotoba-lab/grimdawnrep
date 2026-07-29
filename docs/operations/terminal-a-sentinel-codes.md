@@ -10,8 +10,9 @@ create the virtual environment.
 
 The setup-specific codes are `python_launcher_not_found`,
 `python_3_11_or_later_required`, `source_fetch_failed`, `venv_create_failed`,
-`package_install_failed`, `vault_clone_failed`, `doctor_command_failed`,
+`source_package_missing`, `venv_site_packages_unavailable`,
+`source_package_import_failed`, `vault_clone_failed`, `doctor_command_failed`,
 `enroll_dry_run_failed`, and `enroll_apply_failed`. Other unexpected errors are
 reported as `<stage>_failed`, with the stage limited to validation, Python
-discovery, source-current checking, venv creation, package installation, vault
+discovery, source-current checking, venv creation, source-path installation, vault
 clone, config write, doctor, or enrollment.

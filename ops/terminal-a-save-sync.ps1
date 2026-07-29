@@ -57,6 +57,25 @@ function Get-PythonExecutable {
     throw 'python_launcher_not_found'
 }
 
+function Install-SourcePath([string]$Python, [string]$Source) {
+    # The sync tool has no third-party runtime dependencies.  Do not use pip
+    # here: an editable install invokes the build backend and can fail on a
+    # fresh offline venv when its bundled setuptools is older than pyproject's
+    # build requirement.  A .pth entry makes only this already-verified source
+    # tree importable by the venv's interpreter.
+    $sourcePackageRoot = Join-Path $Source 'src'
+    $entryPoint = Join-Path $sourcePackageRoot 'grim_dawn_sync\__main__.py'
+    if (-not (Test-Path -LiteralPath $entryPoint -PathType Leaf)) { throw 'source_package_missing' }
+    # Avoid quote-dependent native argument parsing on Windows PowerShell 5.1.
+    $sitePackages = (& $Python '-c' 'import sysconfig; print(sysconfig.get_path(chr(112)+chr(117)+chr(114)+chr(101)+chr(108)+chr(105)+chr(98)))' 2>$null)
+    if ($LASTEXITCODE -ne 0) { throw 'venv_site_packages_unavailable' }
+    $sitePackages = ($sitePackages -join [Environment]::NewLine).Trim()
+    if (-not (Test-Path -LiteralPath $sitePackages -PathType Container)) { throw 'venv_site_packages_unavailable' }
+    $pthPath = Join-Path $sitePackages 'grim_dawn_sync_source.pth'
+    [System.IO.File]::WriteAllText($pthPath, $sourcePackageRoot + [Environment]::NewLine, (New-Object System.Text.UTF8Encoding($false)))
+    Invoke-Quiet $Python @('-c', 'import grim_dawn_sync; import grim_dawn_sync.__main__') 'source_package_import_failed'
+}
+
 function Test-VaultRemoteUrl([string]$Value) {
     # HTTPS userinfo is a credential-bearing URL.  SSH's conventional git@host
     # selector is allowed, but passwords/tokens in either form are rejected.
@@ -185,8 +204,8 @@ try {
     }
     $python = Join-Path $venvPath 'Scripts\python.exe'
     if (-not (Test-Path -LiteralPath $python -PathType Leaf)) { throw 'venv_invalid' }
-    $setupStage = 'package_install'
-    Invoke-Quiet $python @('-m', 'pip', 'install', '--no-deps', '--no-build-isolation', '-e', $source) 'package_install_failed'
+    $setupStage = 'source_path_install'
+    Install-SourcePath $python $source
 
     $setupStage = 'vault_clone'
     if (-not (Assert-Vault $vaultPath)) {
