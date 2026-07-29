@@ -6,6 +6,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = (ROOT / "ops" / "terminal-a-save-sync.ps1").read_text(encoding="utf-8")
 DOC = (ROOT / "docs" / "operations" / "terminal-a-handoff.md").read_text(encoding="utf-8")
+AGENT_ENROLL_DOC = (ROOT / "docs" / "operations" / "terminal-a-agent-enroll.md").read_text(encoding="utf-8")
 
 
 def test_terminal_a_handoff_requires_explicit_safe_inputs_and_uses_distinct_machine_id() -> None:
@@ -74,3 +75,30 @@ def test_terminal_a_handoff_doc_uses_placeholder_and_describes_return_sentinel()
     assert "<PRIVATE_VAULT_URL>" in DOC
     assert "TERMINAL_A_HANDOFF" in DOC
     assert "資格情報をURLに埋め込まず" in DOC
+
+
+def test_terminal_a_agent_enroll_runbook_uses_existing_vault_origin_without_disclosure() -> None:
+    assert "$vaultRemoteUrl = ((& git -C $vault remote get-url origin 2>$null)" in AGENT_ENROLL_DOC
+    assert "-VaultRemoteUrl $vaultRemoteUrl -CloudDisabledConfirmed -ApplyEnroll" in AGENT_ENROLL_DOC
+    assert "git -C $source pull --ff-only" in AGENT_ENROLL_DOC
+    assert "github.com/" not in AGENT_ENROLL_DOC
+    assert "<PRIVATE_VAULT_URL>" not in AGENT_ENROLL_DOC
+
+
+def test_terminal_a_agent_enroll_runbook_checks_processes_and_reports_sentinel_only() -> None:
+    assert "Get-Process -Name 'Grim Dawn', 'DPYes'" in AGENT_ENROLL_DOC
+    assert "game_or_dpyes_running" in AGENT_ENROLL_DOC
+    assert "post_enroll_doctor" in AGENT_ENROLL_DOC
+    assert "--json doctor *> $null" in AGENT_ENROLL_DOC
+    assert "--json status *> $null" in AGENT_ENROLL_DOC
+    assert "Report that one JSON line only." in AGENT_ENROLL_DOC
+    assert "Windows PowerShell 5.1" in AGENT_ENROLL_DOC
+
+
+def test_terminal_a_agent_enroll_runbook_relays_canonical_blocked_sentinel() -> None:
+    assert "$enrollExitCode = $LASTEXITCODE" in AGENT_ENROLL_DOC
+    assert "if (-not $enrollSentinel) { throw 'enroll_apply_failed' }" in AGENT_ENROLL_DOC
+    assert "$enroll.status -eq 'blocked'" in AGENT_ENROLL_DOC
+    assert "Write-Output $enrollSentinel" in AGENT_ENROLL_DOC
+    assert "$enrollExitCode -ne 0 -or $enroll.status -ne 'enrolled'" in AGENT_ENROLL_DOC
+    assert "Enrollment never overwrites a different existing live save" in AGENT_ENROLL_DOC
