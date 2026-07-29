@@ -4,9 +4,9 @@ This runbook performs the first leg of the A -> B -> A acceptance test on the al
 
 ## Required user coordination
 
-Before running the PowerShell block, the agent must tell the user: **the block will open DPYes/Grim Dawn; please make a short, unmistakable visual save change (for example pick up an item or change a character position), then exit the game normally. Do not start another game instance while it is running.** Wait for the user to acknowledge this instruction. The CLI below is the only permitted game launch method.
+Before running the PowerShell block, the agent must ask the user to name one known property that identifies B's newer save, such as recent progress, an inventory item, or character position. Record only the user's description in the conversation, never any path, hash, or raw save data. Then tell the user: **the block will first reconcile Terminal A with Terminal B's newer authoritative save and then open DPYes/Grim Dawn. When the game opens, first verify the named B-save property on A. Do not make or save a new change until that property is visibly confirmed. Tell the agent whether it is present. If it is present, make one short, unmistakable A-side change (for example pick up an item or change character position), save normally, and exit the game normally. If it is absent, make no deliberate change, do not save, and exit normally. Do not start another game instance.** Wait for the user to name the property and acknowledge this instruction. The CLI below is the only permitted game launch method.
 
-If the user does not acknowledge, stop without running anything. The agent must not kill a process, retry launch, or attempt recovery. When the game closes, the command waits for the save to stabilize and completes its normal protected workflow.
+If the user does not identify a known B-save property and acknowledge the instructions, stop without running anything. The agent must not kill a process, retry launch, or attempt recovery. When the game closes, the command waits for the save to stabilize and completes its normal protected workflow. Because the script cannot observe the game screen, the agent must obtain the user's explicit visual result. If the user reports that the named B-save property was absent, the leg failed regardless of the command result: do not launch again and report only `{"sentinel":"TERMINAL_A_ROUNDTRIP","status":"blocked","leg":"A1","machine_id":"desktop-a","code":"b_save_not_visible"}`.
 
 ## Boundaries
 
@@ -17,7 +17,7 @@ If the user does not acknowledge, stop without running anything. The agent must 
 
 ## Copy-paste execution
 
-Run this block only after the required user acknowledgement. It suppresses all command output and emits one final sentinel. It requires a ready, complete process scan with no active lock or recovery before launch; after launch it additionally requires that the remote commit changed and the Vault is equal again.
+Run this block only after the required user acknowledgement. It suppresses all command output and emits one final sentinel. It requires a complete, clear process scan with no active lock or recovery before launch. The expected starting state may be either equal, or `remote_changed_or_unknown` because B advanced the remote while A still records its older applied commit. The launch workflow itself performs the authoritative fetch and reconciliation, and refuses an unsafe ahead or diverged relation. After launch the block additionally requires that the remote commit changed and the Vault is equal again.
 
 ```powershell
 $source = Join-Path $env:USERPROFILE 'grimdawnrep'
@@ -54,10 +54,20 @@ try {
     if ($existingConfig.machine_id -ne $machineId) { throw 'existing_config_mismatch' }
 
     $before = Get-Status 'pre_status_failed'
-    if ($before.readiness -ne 'ready' -or
-        $before.processes.status -ne 'clear' -or -not $before.processes.complete -or
+    if ($before.processes.status -ne 'clear' -or -not $before.processes.complete -or
         $before.active_lock -ne $null -or $before.recovery_phase -ne $null -or
-        $before.vault_relation -ne 'equal' -or -not ($before.remote_commit -match '^[0-9a-f]{40}(?:[0-9a-f]{24})?$')) {
+        -not ($before.remote_commit -match '^[0-9a-f]{40}(?:[0-9a-f]{24})?$')) {
+        throw 'preflight_not_ready'
+    }
+    if ($before.vault_relation -eq 'equal') {
+        if ($before.readiness -ne 'ready') { throw 'preflight_not_ready' }
+    } elseif ($before.vault_relation -eq 'remote_changed_or_unknown') {
+        if ($before.readiness -ne 'blocked' -or
+            -not ($before.last_pushed_commit -match '^[0-9a-f]{40}(?:[0-9a-f]{24})?$') -or
+            $before.last_pushed_commit -eq $before.remote_commit) {
+            throw 'preflight_remote_state_inconsistent'
+        }
+    } else {
         throw 'preflight_not_ready'
     }
 
@@ -86,7 +96,7 @@ try {
     exit 0
 }
 catch {
-    $code = if ($_.Exception.Message -match '^(source_pull_failed|existing_environment_missing|existing_config_invalid|existing_config_mismatch|pre_status_failed|preflight_not_ready|launch_failed|launch_result_invalid|post_status_failed|postflight_verification_failed)$') {
+    $code = if ($_.Exception.Message -match '^(source_pull_failed|existing_environment_missing|existing_config_invalid|existing_config_mismatch|pre_status_failed|preflight_not_ready|preflight_remote_state_inconsistent|launch_failed|launch_result_invalid|post_status_failed|postflight_verification_failed)$') {
         $_.Exception.Message
     } else {
         $stage

@@ -141,3 +141,23 @@ def test_terminal_a_roundtrip_leg1_validates_machine_id_from_existing_config_not
     assert "existing_config_mismatch" in ROUNDTRIP_LEG1_DOC
     assert "$before.machine_id" not in ROUNDTRIP_LEG1_DOC
     assert "$after.machine_id" not in ROUNDTRIP_LEG1_DOC
+
+
+def test_terminal_a_roundtrip_leg1_accepts_only_the_expected_stale_a_boundary() -> None:
+    assert "$before.vault_relation -eq 'equal'" in ROUNDTRIP_LEG1_DOC
+    assert "$before.vault_relation -eq 'remote_changed_or_unknown'" in ROUNDTRIP_LEG1_DOC
+    assert "$before.readiness -ne 'blocked'" in ROUNDTRIP_LEG1_DOC
+    assert "$before.last_pushed_commit -match '^[0-9a-f]{40}(?:[0-9a-f]{24})?$'" in ROUNDTRIP_LEG1_DOC
+    assert "$before.last_pushed_commit -eq $before.remote_commit" in ROUNDTRIP_LEG1_DOC
+    assert "preflight_remote_state_inconsistent" in ROUNDTRIP_LEG1_DOC
+    assert "launch workflow itself performs the authoritative fetch and reconciliation" in ROUNDTRIP_LEG1_DOC
+
+
+def test_terminal_a_roundtrip_leg1_requires_known_b_save_property_before_a_change() -> None:
+    assert "ask the user to name one known property that identifies B's newer save" in ROUNDTRIP_LEG1_DOC
+    assert "such as recent progress, an inventory item, or character position" in ROUNDTRIP_LEG1_DOC
+    assert "first verify the named B-save property on A" in ROUNDTRIP_LEG1_DOC
+    assert "Do not make or save a new change until that property is visibly confirmed" in ROUNDTRIP_LEG1_DOC
+    assert "If the user does not identify a known B-save property" in ROUNDTRIP_LEG1_DOC
+    assert '"code":"b_save_not_visible"' in ROUNDTRIP_LEG1_DOC
+    assert "do not launch again" in ROUNDTRIP_LEG1_DOC
