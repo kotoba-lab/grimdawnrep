@@ -49,13 +49,27 @@ function Write-Diagnosis([string]$Status, [string]$Code, [bool]$RecoveryRequired
     } | ConvertTo-Json -Compress
 }
 
-function Invoke-ReadOnlyJson([string]$Command) {
-    $output = @(& $python -m grim_dawn_sync --config $config --json $Command 2>$null)
+function Get-StatusOrThrow {
+    $output = @(& $python -m grim_dawn_sync --config $config --json status 2>$null)
     $exitCode = $LASTEXITCODE
     $raw = @($output) -join [Environment]::NewLine
-    if ($exitCode -ne 0 -or -not $raw) { return $null }
-    try { return ($raw | ConvertFrom-Json -ErrorAction Stop) }
-    catch { return $null }
+    if ($exitCode -ne 0 -or -not $raw) { throw 'status_command_failed' }
+    try { $status = $raw | ConvertFrom-Json -ErrorAction Stop }
+    catch { throw 'status_parse_failed' }
+    if ($status.schema_version -ne '1.0.0' -or $status.command -ne 'status') { throw 'status_shape_invalid' }
+    return $status
+}
+
+function Get-DoctorOptional {
+    try {
+        $output = @(& $python -m grim_dawn_sync --config $config --json doctor 2>$null)
+        $exitCode = $LASTEXITCODE
+        $raw = @($output) -join [Environment]::NewLine
+        if ($exitCode -ne 0 -or -not $raw) { return $false }
+        $doctor = $raw | ConvertFrom-Json -ErrorAction Stop
+        return ($doctor.schema_version -eq '1.0.0' -and $doctor.command -eq 'doctor' -and $doctor.read_only -and $doctor.machine_id -eq $machineId)
+    }
+    catch { return $false }
 }
 
 function Get-ProcessClass($Status) {
@@ -95,22 +109,15 @@ function Get-LaunchFailure([string]$LogPath) {
 $processes = 'unknown_incomplete'; $readiness = 'unknown'; $vaultRelation = 'unknown'
 $recoveryRequired = $false; $lockPresent = $false
 $failure = [pscustomobject]@{ code = 'none'; last_state = 'none'; next_command = 'none' }
-$statusOut = 'blocked'; $code = 'diagnosis_unavailable'
+$statusOut = 'blocked'; $code = 'environment_check_failed'
 
 try {
-    if (-not (Test-Path -LiteralPath $python -PathType Leaf) -or -not (Test-Path -LiteralPath $config -PathType Leaf)) { throw 'existing_environment_missing' }
+    if (-not (Test-Path -LiteralPath $python -PathType Leaf) -or -not (Test-Path -LiteralPath $config -PathType Leaf)) { throw 'environment_check_failed' }
     try { $existingConfig = Get-Content -LiteralPath $config -Raw -Encoding utf8 | ConvertFrom-Json -ErrorAction Stop }
-    catch { throw 'existing_config_invalid' }
-    if ($existingConfig.machine_id -ne $machineId) { throw 'existing_config_mismatch' }
+    catch { throw 'config_check_failed' }
+    if ($existingConfig.machine_id -ne $machineId) { throw 'config_check_failed' }
 
-    $status = Invoke-ReadOnlyJson 'status'
-    $doctor = Invoke-ReadOnlyJson 'doctor'
-    $logPath = Join-Path (Split-Path -LiteralPath $config -Parent) 'logs\launch.jsonl'
-    $failure = Get-LaunchFailure $logPath
-
-    if ($null -eq $status -or $status.schema_version -ne '1.0.0' -or $status.command -ne 'status') { throw 'status_unavailable' }
-    if ($null -eq $doctor -or $doctor.schema_version -ne '1.0.0' -or $doctor.command -ne 'doctor' -or -not $doctor.read_only) { throw 'doctor_unavailable' }
-    if ($doctor.machine_id -ne $machineId) { throw 'doctor_machine_mismatch' }
+    $status = Get-StatusOrThrow
 
     $processes = Get-ProcessClass $status.processes
     $readiness = Get-ReadinessClass $status.readiness
@@ -118,9 +125,17 @@ try {
     $lockPresent = ($status.active_lock -ne $null)
     $recoveryRequired = ($lockPresent -or $status.recovery_phase -ne $null -or $readiness -eq 'recovery_required')
     $statusOut = 'diagnosed'; $code = 'diagnosis_complete'
+
+    # Optional observations must never downgrade an otherwise valid status diagnosis.
+    [void](Get-DoctorOptional)
+    try {
+        $logPath = Join-Path ([System.IO.Path]::GetDirectoryName($config)) 'logs\launch.jsonl'
+        $failure = Get-LaunchFailure $logPath
+    }
+    catch { $failure = [pscustomobject]@{ code = 'none'; last_state = 'none'; next_command = 'none' } }
 }
 catch {
-    if ($_.Exception.Message -in @('existing_environment_missing','existing_config_invalid','existing_config_mismatch','status_unavailable','doctor_unavailable','doctor_machine_mismatch')) { $code = $_.Exception.Message }
+    if ($_.Exception.Message -in @('environment_check_failed','config_check_failed','status_command_failed','status_parse_failed','status_shape_invalid')) { $code = $_.Exception.Message }
 }
 
 Write-Output (Write-Diagnosis $statusOut $code $recoveryRequired $lockPresent $processes $readiness $vaultRelation $failure.code $failure.last_state $failure.next_command)

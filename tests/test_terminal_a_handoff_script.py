@@ -178,13 +178,20 @@ def test_terminal_a_roundtrip_diagnosis_is_ps51_read_only_and_sanitized() -> Non
 def test_terminal_a_roundtrip_diagnosis_parses_known_schema_and_allowlists_output() -> None:
     command = ROUNDTRIP_DIAGNOSE_DOC.split("```powershell", 1)[1].split("```", 1)[0]
     assert "$existingConfig.machine_id -ne $machineId" in command
-    assert "$status.schema_version -ne '1.0.0' -or $status.command -ne 'status'" in command
-    assert "$doctor.schema_version -ne '1.0.0' -or $doctor.command -ne 'doctor' -or -not $doctor.read_only" in command
+    assert "function Get-StatusOrThrow" in command
+    assert "throw 'status_command_failed'" in command
+    assert "throw 'status_parse_failed'" in command
+    assert "throw 'status_shape_invalid'" in command
+    assert "function Get-DoctorOptional" in command
     assert "Get-LaunchFailure" in command
     assert "'grim-dawn-sync recover'" in command
     assert "'grim-dawn-sync status'" in command
     assert "ConvertTo-Json -Compress" in command
     assert "Get-Content -LiteralPath $LogPath -Encoding utf8 -ErrorAction Stop" in command
     assert "$recoveryRequired = ($lockPresent -or $status.recovery_phase -ne $null -or $readiness -eq 'recovery_required')" in command
+    assert "$statusOut = 'diagnosed'; $code = 'diagnosis_complete'" in command
+    assert "[void](Get-DoctorOptional)" in command
+    assert "[System.IO.Path]::GetDirectoryName($config)" in command
+    assert "Split-Path -LiteralPath $config -Parent" not in command
     for forbidden in ("remote_commit", "last_pushed_commit", "safe_oid", "safe_root_hash", "session_id", "archive_id"):
         assert forbidden not in command
