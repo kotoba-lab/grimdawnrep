@@ -7,6 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = (ROOT / "ops" / "terminal-a-save-sync.ps1").read_text(encoding="utf-8")
 DOC = (ROOT / "docs" / "operations" / "terminal-a-handoff.md").read_text(encoding="utf-8")
 AGENT_ENROLL_DOC = (ROOT / "docs" / "operations" / "terminal-a-agent-enroll.md").read_text(encoding="utf-8")
+ROUNDTRIP_LEG1_DOC = (ROOT / "docs" / "operations" / "terminal-a-roundtrip-leg1.md").read_text(encoding="utf-8")
 
 
 def test_terminal_a_handoff_requires_explicit_safe_inputs_and_uses_distinct_machine_id() -> None:
@@ -102,3 +103,41 @@ def test_terminal_a_agent_enroll_runbook_relays_canonical_blocked_sentinel() -> 
     assert "Write-Output $enrollSentinel" in AGENT_ENROLL_DOC
     assert "$enrollExitCode -ne 0 -or $enroll.status -ne 'enrolled'" in AGENT_ENROLL_DOC
     assert "Enrollment never overwrites a different existing live save" in AGENT_ENROLL_DOC
+
+
+def test_terminal_a_roundtrip_leg1_runbook_is_a_sanitized_ps51_launch_boundary() -> None:
+    assert "Windows PowerShell 5.1" in ROUNDTRIP_LEG1_DOC
+    assert "git -C $source pull --ff-only" in ROUNDTRIP_LEG1_DOC
+    assert "python -m grim_dawn_sync" in ROUNDTRIP_LEG1_DOC
+    assert "--json launch" in ROUNDTRIP_LEG1_DOC
+    assert "TERMINAL_A_ROUNDTRIP" in ROUNDTRIP_LEG1_DOC
+    assert "launch_complete" in ROUNDTRIP_LEG1_DOC
+    assert "Report exactly one JSON line" in ROUNDTRIP_LEG1_DOC
+
+
+def test_terminal_a_roundtrip_leg1_runbook_validates_both_status_boundaries_without_leaks() -> None:
+    command = ROUNDTRIP_LEG1_DOC.split("```powershell", 1)[1].split("```", 1)[0]
+    assert "$before = Get-Status 'pre_status_failed'" in ROUNDTRIP_LEG1_DOC
+    assert "$after = Get-Status 'post_status_failed'" in ROUNDTRIP_LEG1_DOC
+    assert "$before.readiness -ne 'ready'" in ROUNDTRIP_LEG1_DOC
+    assert "$before.processes.status -ne 'clear' -or -not $before.processes.complete" in ROUNDTRIP_LEG1_DOC
+    assert "$before.active_lock -ne $null -or $before.recovery_phase -ne $null" in ROUNDTRIP_LEG1_DOC
+    assert "$after.vault_relation -ne 'equal'" in ROUNDTRIP_LEG1_DOC
+    assert "$after.remote_commit -eq $before.remote_commit" in ROUNDTRIP_LEG1_DOC
+    assert "^[0-9a-f]{40}(?:[0-9a-f]{24})?$" in ROUNDTRIP_LEG1_DOC
+    assert "*> $null" in command
+    assert "@($output) -join [Environment]::NewLine" in command
+    assert "@($launchOutput) -join [Environment]::NewLine" in command
+    assert "$status.schema_version -ne '1.0.0' -or $status.command -ne 'status'" in command
+    assert "$launch.schema_version -ne '1.0.0' -or $launch.command -ne 'launch'" in command
+    assert "Where-Object" not in command
+    for forbidden in (" recover", " bootstrap", " snapshot", " restore", " reset", " rebase", " force", "Stop-Process"):
+        assert forbidden not in command
+
+
+def test_terminal_a_roundtrip_leg1_validates_machine_id_from_existing_config_not_status() -> None:
+    assert "Get-Content -LiteralPath $config -Raw -Encoding utf8 | ConvertFrom-Json" in ROUNDTRIP_LEG1_DOC
+    assert "$existingConfig.machine_id -ne $machineId" in ROUNDTRIP_LEG1_DOC
+    assert "existing_config_mismatch" in ROUNDTRIP_LEG1_DOC
+    assert "$before.machine_id" not in ROUNDTRIP_LEG1_DOC
+    assert "$after.machine_id" not in ROUNDTRIP_LEG1_DOC
