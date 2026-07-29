@@ -87,6 +87,16 @@ def test_valid_commit_phases_round_trip(tmp_path: Path) -> None:
         assert load_state(path) == state
 
 
+def test_inactive_machine_baseline_requires_complete_snapshot_and_round_trips(tmp_path: Path) -> None:
+    baseline = SyncState(last_applied_remote_commit="c" * 40, last_applied_manifest_root_hash="d" * 64, machine_id="machine")
+    path = tmp_path / "baseline.json"; save_state(path, baseline)
+    assert load_state(path) == baseline
+    with pytest.raises(SyncError, match="baseline requires"):
+        parse_state(SyncState(machine_id="machine").as_dict())
+    with pytest.raises(SyncError, match="Inactive state"):
+        parse_state(SyncState(last_applied_remote_commit="c" * 40, last_applied_manifest_root_hash="d" * 64, machine_id="machine", session_id="orphan").as_dict())
+
+
 @pytest.mark.parametrize(
     "state",
     [

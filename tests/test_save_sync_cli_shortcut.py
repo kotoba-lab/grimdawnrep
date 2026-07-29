@@ -15,6 +15,8 @@ def test_parser_requires_explicit_bootstrap_source_and_restore_commit() -> None:
     with pytest.raises(SystemExit): parser.parse_args(["restore"])
     assert parser.parse_args(["bootstrap", "--source-cloud", "cloud"]).apply is False
     assert parser.parse_args(["restore", "--commit", "a" * 40]).apply is False
+    assert parser.parse_args(["enroll"]).apply is False
+    assert parser.parse_args(["join"]).command == "join"
 
 
 def test_install_shortcut_dry_run_does_not_create_or_call_adapter(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

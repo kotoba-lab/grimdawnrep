@@ -223,6 +223,7 @@ def test_bootstrap_push_initializes_unborn_remote_without_lock_or_force(tmp_path
     assert state == SyncState(
         last_applied_remote_commit=commit,
         last_applied_manifest_root_hash=root_hash,
+        machine_id="machine-a",
     )
     pushes = [command for command in vault.runner.commands if len(command) > 1 and command[1] == "push"]
     assert pushes == [("git", "push", "origin", f"{commit}:refs/heads/main")]
@@ -401,6 +402,7 @@ def test_bootstrap_final_state_failure_remains_pending_and_recovers(
     assert load_state(state_path) == SyncState(
         last_applied_remote_commit=commit,
         last_applied_manifest_root_hash=root_hash,
+        machine_id="machine-a",
     )
 
 
@@ -434,6 +436,7 @@ def test_recovery_adopts_verified_snapshot_head_then_pushes_and_releases(tmp_pat
     assert load_state(state_path) == SyncState(
         last_applied_remote_commit=commit,
         last_applied_manifest_root_hash=root_hash,
+        machine_id="machine-a",
     )
 
 
@@ -455,6 +458,7 @@ def test_recovery_adopts_snapshot_when_remote_already_has_exact_head(tmp_path: P
     assert load_state(state_path) == SyncState(
         last_applied_remote_commit=commit,
         last_applied_manifest_root_hash=root_hash,
+        machine_id="machine-a",
     )
 
 
@@ -559,6 +563,7 @@ def test_recovery_adoption_state_failure_keeps_lock_state_and_never_pushes(
     assert load_state(state_path) == SyncState(
         last_applied_remote_commit=commit,
         last_applied_manifest_root_hash=root_hash,
+        machine_id="machine-a",
     )
 
 

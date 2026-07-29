@@ -22,6 +22,7 @@ def test_parser_exposes_full_t6_command_contract() -> None:
     assert parser.parse_args(["restore", "--commit", "deadbeef", "--apply"]).apply is True
     assert parser.parse_args(["bootstrap", "--source-cloud", "cloud"]).apply is False
     assert parser.parse_args(["bootstrap", "--source-cloud", "cloud", "--apply"]).apply is True
+    assert parser.parse_args(["enroll", "--apply"]).apply is True
     assert parser.parse_args(["install-shortcut"]).apply is False
     with pytest.raises(SystemExit):
         parser.parse_args(["restore"])
@@ -38,18 +39,19 @@ def test_main_routes_every_t6_command_and_keeps_json_serializable(monkeypatch: p
             return {"schema_version": "1.0.0", "command": name, "path": tmp_path / name}
         return handler
 
-    for name in ("status", "recover", "restore", "snapshot", "bootstrap"):
+    for name in ("status", "recover", "restore", "snapshot", "bootstrap", "enroll"):
         monkeypatch.setattr(cli, name, fake(name))
     config = tmp_path / "config.local.json"
     for command in (
         ["status"], ["recover"], ["snapshot"],
         ["restore", "--commit", "c0ffee", "--apply"],
         ["bootstrap", "--source-cloud", str(tmp_path / "cloud"), "--apply"],
+        ["enroll", "--apply"],
     ):
         assert cli.main(["--config", str(config), "--json", *command]) == 0
         payload = json.loads(capsys.readouterr().out)
         assert payload["path"] == str(tmp_path / payload["command"])
-    assert [name for name, _, _ in calls] == ["status", "recover", "snapshot", "restore", "bootstrap"]
+    assert [name for name, _, _ in calls] == ["status", "recover", "snapshot", "restore", "bootstrap", "enroll"]
     assert calls[-2][2] == {"apply": True}
     assert calls[-1][2] == {"apply": True}
 

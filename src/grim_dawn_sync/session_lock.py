@@ -224,6 +224,7 @@ def _resume_bootstrap(
         SyncState(
             last_applied_remote_commit=commit,
             last_applied_manifest_root_hash=state.last_applied_manifest_root_hash,
+            machine_id=machine_id,
         ),
     )
     return commit
@@ -348,6 +349,10 @@ def release_lock(
         SyncState(
             last_applied_remote_commit=pushed_commit,
             last_applied_manifest_root_hash=confirmed_root_hash,
+            # Older direct callers may not have a verified manifest root;
+            # retain their legacy baseline shape rather than persisting an
+            # incomplete machine-owned baseline.
+            machine_id=lock.session.machine_id if confirmed_root_hash is not None else None,
         ),
     )
 
@@ -428,6 +433,7 @@ def recover_session(vault: GitVault, state: SyncState, machine_id: str, *, state
                 SyncState(
                     last_applied_remote_commit=state.pushed_commit,
                     last_applied_manifest_root_hash=state.last_applied_manifest_root_hash,
+                    machine_id=machine_id if state.last_applied_manifest_root_hash is not None else None,
                 ),
             )
             return "complete"

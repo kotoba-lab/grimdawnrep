@@ -117,12 +117,19 @@ def _validate_current_transition(
     active = [values[key] for key in _SESSION_FIELDS]
     if phase is None:
         if (
-            any(active)
+            any(values[key] for key in _SESSION_FIELDS if key != "machine_id")
             or values["local_commit"] is not None
             or values["pushed_commit"] is not None
             or bootstrap_live_applied
         ):
             raise SyncError("invalid_state", "Inactive state must not contain recovery session fields.")
+        if values["machine_id"] is not None and not _TOKEN.fullmatch(values["machine_id"]):
+            raise SyncError("invalid_state", "Inactive state machine identifier is invalid.")
+        if values["machine_id"] is not None and (
+            values["last_applied_remote_commit"] is None
+            or values["last_applied_manifest_root_hash"] is None
+        ):
+            raise SyncError("invalid_state", "Inactive machine baseline requires commit and root hash.")
         return
     if phase == "bootstrap_pending":
         if (

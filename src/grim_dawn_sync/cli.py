@@ -47,6 +47,8 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("snapshot", help="snapshot the current save")
     bootstrap = subparsers.add_parser("bootstrap", help="initialize from an explicit cloud source")
     bootstrap.add_argument("--source-cloud", type=Path, required=True); bootstrap.add_argument("--apply", action="store_true")
+    enroll = subparsers.add_parser("enroll", aliases=["join"], help="adopt the current remote snapshot on a new terminal")
+    enroll.add_argument("--apply", action="store_true")
     subparsers.add_parser("launch", help="run the synchronized DPYes launch workflow")
     shortcut = subparsers.add_parser("install-shortcut", help="create the Save Sync desktop shortcut")
     shortcut.add_argument("--apply", action="store_true")
@@ -184,6 +186,11 @@ def _live_remote_relation(vault: GitVault, remote: str | None) -> str:
     return "equal" if local == remote else "remote_changed_or_unknown"
 
 
+def _local_head_oid(vault: GitVault) -> str | None:
+    result = vault.runner.run("rev-parse", "--verify", "--quiet", "HEAD", check=False)
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
 def status(config_path: Path, *, monitor: ProcessMonitor | None = None) -> dict[str, Any]:
     config = load_config(config_path); vault = _vault(config); state_path = _state_path(config_path)
     try:
@@ -301,6 +308,117 @@ def bootstrap(config_path: Path, source: Path, *, apply: bool) -> dict[str, Any]
         raise SyncError("bootstrap_remote_not_empty", "Bootstrap requires an empty or exactly matching pending remote.", 4)
     pending = prepare_bootstrap(vault, config.machine_id, oid, manifest["root_hash"], state_path=_state_path(config_path))
     return _resume_bootstrap_cli(config_path, config, vault, pending, manifest)
+
+
+def _enroll_existing_state(state_path: Path, config: Any, commit: str, root_hash: str) -> bool:
+    """Return true only for this terminal's already-complete exact baseline."""
+    try:
+        state = load_state(state_path)
+    except SyncError as error:
+        if error.code == "state_missing":
+            return False
+        raise
+    if state.phase is not None:
+        raise SyncError("recovery_required", "An interrupted session must be recovered before enrollment.", 6)
+    if (
+        state.machine_id == config.machine_id
+        and state.last_applied_remote_commit == commit
+        and state.last_applied_manifest_root_hash == root_hash
+    ):
+        return True
+    raise SyncError("enroll_state_exists", "Existing terminal state does not match this remote snapshot.", 6)
+
+
+def enroll(config_path: Path, *, apply: bool) -> dict[str, Any]:
+    """Join a non-empty vault without pushing or overwriting an existing save.
+
+    Dry-run deliberately does not fetch: it reports the advertised remote OID
+    but cannot attest its snapshot until ``--apply`` has fetched it locally.
+    """
+    config = load_config(config_path); vault = _vault(config); state_path = _state_path(config_path)
+    vault.preflight()
+    remote = vault.remote_oid()
+    lock = inspect_remote_lock_readonly(vault)
+    if lock is not None:
+        raise SyncError("lock_held", "Another terminal holds the remote sync lock.", 6)
+    if remote is None:
+        raise SyncError("remote_main_missing", "Remote main is missing; enrollment cannot continue.", 4)
+    if not apply:
+        if _local_head_oid(vault) != remote:
+            raise SyncError("vault_not_reconciled", "Dry-run requires local HEAD to equal advertised remote main.", 4)
+        return {"schema_version": "1.0.0", "command": "enroll", "dry_run": True,
+                "remote_commit": remote, "remote_snapshot_verified": False,
+                "note": "Dry-run does not fetch or create staging; use --apply to verify and enroll."}
+    _process_preflight(config)
+    # Refuse an interrupted local session before fetch can advance this clone.
+    # A missing state is the normal first-enrollment condition.
+    try:
+        preliminary_state = load_state(state_path)
+    except SyncError as error:
+        if error.code != "state_missing":
+            raise
+    else:
+        if preliminary_state.phase is not None:
+            raise SyncError("recovery_required", "An interrupted session must be recovered before enrollment.", 6)
+    status_value = vault.update_fast_forward()
+    # ``update_fast_forward`` reports the pre-merge relation, so ``behind``
+    # is acceptable only when the subsequent HEAD equality check proves its
+    # fast-forward completed.  All other non-equal relations are unsafe.
+    if status_value.relation in {"ahead", "diverged", "unborn"}:
+        raise SyncError("vault_not_reconciled", "Vault must fast-forward to remote main before enrollment.", 4)
+    remote = vault.remote_oid()
+    if remote is None:
+        raise SyncError("remote_main_missing", "Remote main disappeared during enrollment.", 4)
+    if _local_head_oid(vault) != remote:
+        raise SyncError("vault_not_reconciled", "Vault HEAD did not match fetched remote main.", 4)
+    if inspect_remote_lock_readonly(vault) is not None:
+        raise SyncError("lock_held", "Another terminal holds the remote sync lock.", 6)
+    manifest = vault.validate_commit_snapshot(remote)
+    root_hash = manifest["root_hash"]
+    idempotent = _enroll_existing_state(state_path, config, remote, root_hash)
+    live_manifest: dict[str, Any] | None = None
+    if config.save_root.exists() or config.save_root.is_symlink():
+        if config.save_root.is_symlink() or not config.save_root.is_dir():
+            raise SyncError("enroll_live_unsafe", "Existing live save path is not a safe directory.", 6)
+        live_manifest = stable_manifest(config.save_root, machine_id=config.machine_id,
+                                        retries=config.stable_scan_retries, window_seconds=config.stable_window_seconds)
+        if live_manifest.get("file_count", 0) == 0:
+            raise SyncError("enroll_live_conflict", "Existing live save is empty; no overwrite was made.", 4)
+        validation = validate_players(config.save_root, live_manifest)
+        if not validation.get("ok"):
+            raise SyncError(validation.get("classification", "save_invalid"), "Existing live save validation failed.", 3)
+        if live_manifest["root_hash"] != root_hash:
+            raise SyncError("enroll_live_conflict", "Existing live save differs from remote; no overwrite was made.", 4)
+    if idempotent:
+        if live_manifest is None:
+            raise SyncError("enroll_live_missing", "Enrolled live save is missing; recovery is required.", 6)
+        return {"schema_version": "1.0.0", "command": "enroll", "dry_run": False,
+                "commit": remote, "root_hash": root_hash, "idempotent": True}
+    if live_manifest is None:
+        root = Path(config_path).parent
+        _safe_archive_parent(root / "staging")
+        destination = root / "staging" / f"enroll-{remote}-{uuid.uuid4().hex}"
+        vault.extract_save(remote, destination, machine_id=config.machine_id,
+                           retries=config.stable_scan_retries, window_seconds=config.stable_window_seconds)
+        if vault.remote_oid() != remote or inspect_remote_lock_readonly(vault) is not None:
+            raise SyncError("enroll_remote_changed", "Remote changed or became locked before restore; no live save was changed.", 4)
+        _process_preflight(config)
+        result = restore_from_directory(destination, config.save_root, root / "archives", root / "recovery",
+                                        machine_id=config.machine_id, apply=True,
+                                        retries=config.stable_scan_retries, window_seconds=config.stable_window_seconds)
+        if result.get("root_hash") != root_hash:
+            raise SyncError("enroll_live_mismatch", "Restored live save did not match remote snapshot.", 6)
+    observed = stable_manifest(config.save_root, machine_id=config.machine_id,
+                               retries=config.stable_scan_retries, window_seconds=config.stable_window_seconds)
+    if observed["root_hash"] != root_hash:
+        raise SyncError("enroll_live_mismatch", "Live save did not match remote snapshot.", 6)
+    if vault.remote_oid() != remote or inspect_remote_lock_readonly(vault) is not None:
+        raise SyncError("enroll_remote_changed", "Remote changed or became locked before state was saved.", 4)
+    save_state(state_path, SyncState(last_applied_remote_commit=remote,
+                                     last_applied_manifest_root_hash=root_hash,
+                                     machine_id=config.machine_id))
+    return {"schema_version": "1.0.0", "command": "enroll", "dry_run": False,
+            "commit": remote, "root_hash": root_hash, "idempotent": False}
 
 
 def _resume_bootstrap_cli(
@@ -438,6 +556,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "restore": payload = restore(args.config, args.commit, apply=args.apply)
         elif args.command == "snapshot": payload = snapshot(args.config)
         elif args.command == "bootstrap": payload = bootstrap(args.config, args.source_cloud, apply=args.apply)
+        elif args.command in {"enroll", "join"}: payload = enroll(args.config, apply=args.apply)
         elif args.command == "launch":
             config = load_config(args.config)
             result = LaunchWorkflow(config, args.config.parent).run()
