@@ -8,6 +8,7 @@ SCRIPT = (ROOT / "ops" / "terminal-a-save-sync.ps1").read_text(encoding="utf-8")
 DOC = (ROOT / "docs" / "operations" / "terminal-a-handoff.md").read_text(encoding="utf-8")
 AGENT_ENROLL_DOC = (ROOT / "docs" / "operations" / "terminal-a-agent-enroll.md").read_text(encoding="utf-8")
 ROUNDTRIP_LEG1_DOC = (ROOT / "docs" / "operations" / "terminal-a-roundtrip-leg1.md").read_text(encoding="utf-8")
+ROUNDTRIP_DIAGNOSE_DOC = (ROOT / "docs" / "operations" / "terminal-a-roundtrip-diagnose.md").read_text(encoding="utf-8")
 
 
 def test_terminal_a_handoff_requires_explicit_safe_inputs_and_uses_distinct_machine_id() -> None:
@@ -161,3 +162,29 @@ def test_terminal_a_roundtrip_leg1_requires_known_b_save_property_before_a_chang
     assert "If the user does not identify a known B-save property" in ROUNDTRIP_LEG1_DOC
     assert '"code":"b_save_not_visible"' in ROUNDTRIP_LEG1_DOC
     assert "do not launch again" in ROUNDTRIP_LEG1_DOC
+
+
+def test_terminal_a_roundtrip_diagnosis_is_ps51_read_only_and_sanitized() -> None:
+    assert "Windows PowerShell 5.1" in ROUNDTRIP_DIAGNOSE_DOC
+    assert "TERMINAL_A_DIAGNOSIS" in ROUNDTRIP_DIAGNOSE_DOC
+    assert "--json status" in ROUNDTRIP_DIAGNOSE_DOC
+    assert "--json doctor" in ROUNDTRIP_DIAGNOSE_DOC
+    assert "git -C $source pull" not in ROUNDTRIP_DIAGNOSE_DOC
+    assert "--json launch" not in ROUNDTRIP_DIAGNOSE_DOC
+    assert "--json recover" not in ROUNDTRIP_DIAGNOSE_DOC
+    assert "Stop-Process" not in ROUNDTRIP_DIAGNOSE_DOC
+
+
+def test_terminal_a_roundtrip_diagnosis_parses_known_schema_and_allowlists_output() -> None:
+    command = ROUNDTRIP_DIAGNOSE_DOC.split("```powershell", 1)[1].split("```", 1)[0]
+    assert "$existingConfig.machine_id -ne $machineId" in command
+    assert "$status.schema_version -ne '1.0.0' -or $status.command -ne 'status'" in command
+    assert "$doctor.schema_version -ne '1.0.0' -or $doctor.command -ne 'doctor' -or -not $doctor.read_only" in command
+    assert "Get-LaunchFailure" in command
+    assert "'grim-dawn-sync recover'" in command
+    assert "'grim-dawn-sync status'" in command
+    assert "ConvertTo-Json -Compress" in command
+    assert "Get-Content -LiteralPath $LogPath -Encoding utf8 -ErrorAction Stop" in command
+    assert "$recoveryRequired = ($lockPresent -or $status.recovery_phase -ne $null -or $readiness -eq 'recovery_required')" in command
+    for forbidden in ("remote_commit", "last_pushed_commit", "safe_oid", "safe_root_hash", "session_id", "archive_id"):
+        assert forbidden not in command
