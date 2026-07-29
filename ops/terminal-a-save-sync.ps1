@@ -24,16 +24,37 @@ function Stop-Safely([string]$Code) {
     exit 1
 }
 
-function Invoke-Quiet([string]$File, [string[]]$Arguments) {
+function Invoke-Quiet([string]$File, [string[]]$Arguments, [string]$FailureCode) {
     & $File @Arguments *> $null
-    if ($LASTEXITCODE -ne 0) { throw "external_command_failed" }
+    if ($LASTEXITCODE -ne 0) { throw $FailureCode }
 }
 
-function Invoke-Json([string]$File, [string[]]$Arguments) {
+function Invoke-Json([string]$File, [string[]]$Arguments, [string]$FailureCode) {
     $output = & $File @Arguments 2>$null
-    if ($LASTEXITCODE -ne 0) { throw 'sync_command_failed' }
+    if ($LASTEXITCODE -ne 0) { throw $FailureCode }
     try { return (($output -join [Environment]::NewLine) | ConvertFrom-Json -ErrorAction Stop) }
-    catch { throw 'sync_json_invalid' }
+    catch { throw ($FailureCode + '_json_invalid') }
+}
+
+function Get-PythonExecutable {
+    # Resolve an actual interpreter, rather than retaining a launcher alias.
+    # That same executable is then used for both the version check and venv.
+    $resolvedInterpreter = $false
+    foreach ($name in @('py', 'python', 'python3')) {
+        $candidate = Get-Command -Name $name -CommandType Application -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if (-not $candidate) { continue }
+        $arguments = if ($name -eq 'py') { @('-3', '-c', 'import sys; print(sys.executable)') } else { @('-c', 'import sys; print(sys.executable)') }
+        $resolved = & $candidate.Source @arguments 2>$null
+        if ($LASTEXITCODE -ne 0) { continue }
+        $path = ($resolved -join [Environment]::NewLine).Trim()
+        if (-not ($path -and (Test-Path -LiteralPath $path -PathType Leaf))) { continue }
+        $resolvedInterpreter = $true
+        & $path '-c' 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' *> $null
+        if ($LASTEXITCODE -eq 0) { return $path }
+    }
+    if ($resolvedInterpreter) { throw 'python_3_11_or_later_required' }
+    throw 'python_launcher_not_found'
 }
 
 function Test-VaultRemoteUrl([string]$Value) {
@@ -69,7 +90,7 @@ function Get-GameInstall {
 }
 
 function Assert-SourceCurrent([string]$Source) {
-    Invoke-Quiet git @('-C', $Source, 'rev-parse', '--is-inside-work-tree')
+    Invoke-Quiet git @('-C', $Source, 'rev-parse', '--is-inside-work-tree') 'source_not_repository'
     $dirty = (& git -C $Source status --porcelain)
     if ($LASTEXITCODE -ne 0 -or $dirty) { throw 'source_not_clean' }
     $remote = (& git -C $Source remote get-url origin)
@@ -110,7 +131,7 @@ function Assert-ProcessesStopped {
 
 function Assert-Vault([string]$Vault) {
     if (-not (Test-Path -LiteralPath $Vault -PathType Container)) { return $false }
-    Invoke-Quiet git @('-C', $Vault, 'rev-parse', '--is-inside-work-tree')
+    Invoke-Quiet git @('-C', $Vault, 'rev-parse', '--is-inside-work-tree') 'vault_existing_not_repository'
     $dirty = (& git -C $Vault status --porcelain)
     $origin = (& git -C $Vault remote get-url origin).Trim()
     if ($LASTEXITCODE -ne 0 -or $dirty -or $origin -ne $VaultRemoteUrl) { throw 'vault_existing_not_clean_or_origin_mismatch' }
@@ -118,6 +139,7 @@ function Assert-Vault([string]$Vault) {
 }
 
 try {
+    $setupStage = 'validation'
     if (-not $CloudDisabledConfirmed) { throw 'cloud_disabled_confirmation_required' }
     if ($MachineId -eq 'melofla') { throw 'machine_id_collision' }
     if (-not (Test-VaultRemoteUrl $VaultRemoteUrl)) { throw 'vault_remote_url_invalid_or_credential_bearing' }
@@ -148,28 +170,31 @@ try {
         exit 0
     }
 
-    $py = Get-Command py -ErrorAction Stop
-    # Let the Windows launcher choose the installed Python 3.  Do not pin a
-    # minor version: terminal A may legitimately have only 3.12 or later.
-    & $py.Source '-3' '-c' 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' *> $null
-    if ($LASTEXITCODE -ne 0) { throw 'python_3_11_or_later_required' }
+    $setupStage = 'python_discovery'
+    $interpreterPython = Get-PythonExecutable
     $env:GIT_TERMINAL_PROMPT = '0'
-    Invoke-Quiet git @('-C', $source, 'fetch', 'origin')
+    $setupStage = 'source_fetch'
+    Invoke-Quiet git @('-C', $source, 'fetch', 'origin') 'source_fetch_failed'
+    $setupStage = 'source_current_check'
     Assert-SourceCurrent $source
     Assert-ProcessesStopped
 
+    $setupStage = 'venv_create'
     if (-not (Test-Path -LiteralPath $venvPath -PathType Container)) {
-        Invoke-Quiet $py.Source @('-3', '-m', 'venv', $venvPath)
+        Invoke-Quiet $interpreterPython @('-m', 'venv', $venvPath) 'venv_create_failed'
     }
     $python = Join-Path $venvPath 'Scripts\python.exe'
     if (-not (Test-Path -LiteralPath $python -PathType Leaf)) { throw 'venv_invalid' }
-    Invoke-Quiet $python @('-m', 'pip', 'install', '--no-deps', '--no-build-isolation', '-e', $source)
+    $setupStage = 'package_install'
+    Invoke-Quiet $python @('-m', 'pip', 'install', '--no-deps', '--no-build-isolation', '-e', $source) 'package_install_failed'
 
+    $setupStage = 'vault_clone'
     if (-not (Assert-Vault $vaultPath)) {
-        Invoke-Quiet git @('clone', $VaultRemoteUrl, $vaultPath)
+        Invoke-Quiet git @('clone', $VaultRemoteUrl, $vaultPath) 'vault_clone_failed'
         [void](Assert-Vault $vaultPath)
     }
 
+    $setupStage = 'config_write'
     if (-not (Test-Path -LiteralPath $configPath)) {
         New-Item -ItemType Directory -Force -Path $localRoot | Out-Null
         $json = $expectedConfig | ConvertTo-Json -Depth 3
@@ -179,7 +204,8 @@ try {
     }
 
     # Doctor is always read-only and is required before either enrollment mode.
-    $doctor = Invoke-Json $python @('-m', 'grim_dawn_sync', '--config', $configPath, '--json', 'doctor')
+    $setupStage = 'doctor'
+    $doctor = Invoke-Json $python @('-m', 'grim_dawn_sync', '--config', $configPath, '--json', 'doctor') 'doctor_command_failed'
     Assert-Doctor $doctor
     if (-not $ApplyEnroll) {
         Write-Output (Write-Sentinel 'setup_complete' 'doctor_passed')
@@ -187,14 +213,18 @@ try {
     }
 
     # enroll dry-run precedes the only save-writing operation in this handoff.
-    Invoke-Quiet $python @('-m', 'grim_dawn_sync', '--config', $configPath, '--json', 'enroll')
+    $setupStage = 'enroll_dry_run'
+    Invoke-Quiet $python @('-m', 'grim_dawn_sync', '--config', $configPath, '--json', 'enroll') 'enroll_dry_run_failed'
     Assert-ProcessesStopped
-    Invoke-Quiet $python @('-m', 'grim_dawn_sync', '--config', $configPath, '--json', 'enroll', '--apply')
+    $setupStage = 'enroll_apply'
+    Invoke-Quiet $python @('-m', 'grim_dawn_sync', '--config', $configPath, '--json', 'enroll', '--apply') 'enroll_apply_failed'
     Write-Output (Write-Sentinel 'enrolled' 'enroll_apply_passed')
     exit 0
 }
 catch {
-    $code = if ($_.Exception.Message -match '^[a-z0-9_]+$') { $_.Exception.Message } else { 'handoff_failed' }
+    # Do not surface exception text: paths, remotes, or tool diagnostics may be sensitive.
+    # An unexpected exception is still attributable to the last non-mutating/setup stage.
+    $code = if ($_.Exception.Message -match '^[a-z0-9_]+$') { $_.Exception.Message } else { $setupStage + '_failed' }
     Write-Output (Write-Sentinel 'blocked' $code)
     exit 1
 }
