@@ -39,14 +39,16 @@ def test_main_routes_commands_to_their_semantic_handlers(monkeypatch: pytest.Mon
     commands = [
         ["doctor"], ["status"], ["recover"], ["snapshot"], ["preserve", "--apply"],
         ["restore", "--commit", "c0ffee", "--apply"],
+        ["restore", "--commit", "c0ffee", "--drill", "--apply"],
         ["bootstrap", "--source-cloud", str(tmp_path / "cloud"), "--apply"],
     ]
     for command in commands:
         assert cli.main(["--config", str(config), "--json", *command]) == 0
         json.loads(capsys.readouterr().out)
-    assert [name for name, _, _ in calls] == ["doctor", "status", "recover", "snapshot", "preserve", "restore", "bootstrap"]
-    assert calls[-3][2] == {"apply": True}
-    assert calls[-2][2] == {"apply": True}
+    assert [name for name, _, _ in calls] == ["doctor", "status", "recover", "snapshot", "preserve", "restore", "restore", "bootstrap"]
+    assert calls[-4][2] == {"apply": True}
+    assert calls[-3][2] == {"apply": True, "drill": False}
+    assert calls[-2][2] == {"apply": True, "drill": True}
     assert calls[-1][2] == {"apply": True}
 
 

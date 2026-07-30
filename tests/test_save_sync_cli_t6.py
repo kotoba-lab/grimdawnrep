@@ -20,6 +20,9 @@ def test_parser_exposes_full_t6_command_contract() -> None:
     assert parser.parse_args(["launch"]).command == "launch"
     assert parser.parse_args(["restore", "--commit", "deadbeef"]).apply is False
     assert parser.parse_args(["restore", "--commit", "deadbeef", "--apply"]).apply is True
+    assert parser.parse_args(["restore", "--commit", "deadbeef", "--drill"]).drill is True
+    drilled = parser.parse_args(["restore", "--commit", "deadbeef", "--drill", "--apply"])
+    assert drilled.drill is True and drilled.apply is True
     assert parser.parse_args(["bootstrap", "--source-cloud", "cloud"]).apply is False
     assert parser.parse_args(["bootstrap", "--source-cloud", "cloud", "--apply"]).apply is True
     assert parser.parse_args(["enroll", "--apply"]).apply is True
@@ -74,6 +77,83 @@ def test_restore_dry_run_and_apply_only_delegate_apply_to_domain(monkeypatch: py
     assert cli.restore(config_path, "commit", apply=True)["dry_run"] is False
     assert calls == [True]
     assert not config.save_root.exists()
+
+
+def test_restore_drill_requires_apply_and_materializes_only_in_owned_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    config_path = tmp_path / "config.local.json"
+    config = SimpleNamespace(save_root=tmp_path / "live", vault_repo=tmp_path / "vault", machine_id="t6", stable_scan_retries=1, stable_window_seconds=0)
+    calls: list[str] = []
+
+    class Vault:
+        def preflight(self) -> None: calls.append("preflight")
+        def extract_save(self, _commit: str, destination: Path, **_kwargs: object) -> None:
+            calls.append("extract")
+            assert destination.parent == tmp_path / "restore-drills"
+            assert destination.name.startswith("restore-" + "a" * 16 + "-")
+            assert not destination.exists()
+            destination.mkdir()
+
+    monkeypatch.setattr(cli, "load_config", lambda _: config)
+    monkeypatch.setattr(cli, "_vault", lambda _: Vault())
+    monkeypatch.setattr(cli, "_inspect_restore", lambda *_: {"dry_run": True, "root_hash": "b" * 64, "file_count": 3, "total_bytes": 4})
+    inspected = cli.restore(config_path, "a" * 40, apply=False, drill=True)
+    assert inspected["dry_run"] is True and "materialized" not in inspected
+    assert calls == ["preflight"] and not (tmp_path / "restore-drills").exists()
+
+    result = cli.restore(config_path, "a" * 40, apply=True, drill=True)
+    assert result == {"schema_version": "1.0.0", "command": "restore", "commit": "a" * 40,
+                      "dry_run": False, "materialized": True, "root_hash": "b" * 64,
+                      "file_count": 3, "total_bytes": 4, "drill_id": result["drill_id"]}
+    assert result["drill_id"].startswith("restore-" + "a" * 16 + "-")
+    assert calls == ["preflight", "preflight", "extract"]
+    assert not config.save_root.exists() and not (tmp_path / "vault").exists()
+
+
+def test_restore_drill_rejects_unsafe_root_before_extract(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    config_path = tmp_path / "config.local.json"
+    drill_root = tmp_path / "restore-drills"; drill_root.mkdir()
+    config = SimpleNamespace(save_root=tmp_path / "live", vault_repo=tmp_path / "vault", machine_id="t6", stable_scan_retries=1, stable_window_seconds=0)
+    calls: list[str] = []; original_lstat = Path.lstat
+
+    def reparse_lstat(path: Path):
+        if path == drill_root:
+            return SimpleNamespace(st_mode=stat.S_IFDIR, st_file_attributes=0x400)
+        return original_lstat(path)
+
+    class Vault:
+        def preflight(self) -> None: calls.append("preflight")
+        def extract_save(self, *_args: object, **_kwargs: object) -> None: calls.append("extract")
+
+    monkeypatch.setattr(cli, "load_config", lambda _: config)
+    monkeypatch.setattr(cli, "_vault", lambda _: Vault())
+    monkeypatch.setattr(cli, "_inspect_restore", lambda *_: {"root_hash": "b" * 64, "file_count": 3, "total_bytes": 4})
+    monkeypatch.setattr(Path, "lstat", reparse_lstat)
+    with pytest.raises(SyncError) as caught:
+        cli.restore(config_path, "a" * 40, apply=True, drill=True)
+    assert caught.value.code == "unsafe_archive_path"
+    assert calls == ["preflight"] and not config.save_root.exists() and not (tmp_path / "vault").exists()
+
+
+def test_restore_drill_rejects_uuid_destination_collision_before_extract(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    config_path = tmp_path / "config.local.json"
+    config = SimpleNamespace(save_root=tmp_path / "live", vault_repo=tmp_path / "vault", machine_id="t6", stable_scan_retries=1, stable_window_seconds=0)
+    fixed = "f" * 32
+    collision = tmp_path / "restore-drills" / ("restore-" + "a" * 16 + "-" + fixed)
+    collision.mkdir(parents=True)
+    calls: list[str] = []
+
+    class Vault:
+        def preflight(self) -> None: calls.append("preflight")
+        def extract_save(self, *_args: object, **_kwargs: object) -> None: calls.append("extract")
+
+    monkeypatch.setattr(cli, "load_config", lambda _: config)
+    monkeypatch.setattr(cli, "_vault", lambda _: Vault())
+    monkeypatch.setattr(cli, "_inspect_restore", lambda *_: {"root_hash": "b" * 64, "file_count": 3, "total_bytes": 4})
+    monkeypatch.setattr(cli.uuid, "uuid4", lambda: SimpleNamespace(hex=fixed))
+    with pytest.raises(SyncError) as caught:
+        cli.restore(config_path, "a" * 40, apply=True, drill=True)
+    assert caught.value.code == "snapshot_name_collision"
+    assert calls == ["preflight"] and not config.save_root.exists() and not (tmp_path / "vault").exists()
 
 
 def test_restore_apply_prepares_its_owned_staging_parent(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

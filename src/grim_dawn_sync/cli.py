@@ -44,7 +44,9 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("status", help="report terminal-local readiness")
     subparsers.add_parser("recover", help="recover an interrupted session")
     restore = subparsers.add_parser("restore", help="restore a vault commit")
-    restore.add_argument("--commit", required=True); restore.add_argument("--apply", action="store_true")
+    restore.add_argument("--commit", required=True)
+    restore.add_argument("--apply", action="store_true")
+    restore.add_argument("--drill", action="store_true", help="with --apply, materialize into a tool-owned drill directory")
     subparsers.add_parser("snapshot", help="snapshot the current save")
     preserve = subparsers.add_parser("preserve", aliases=["archive-live"], help="make a verified local archive of the live save")
     preserve.add_argument("--apply", action="store_true", help="create the local archive")
@@ -226,9 +228,33 @@ def recover(config_path: Path, *, monitor: ProcessMonitor | None = None) -> dict
     return {"schema_version":"1.0.0", "command":"recover", "result":result}
 
 
-def restore(config_path: Path, commit: str, *, apply: bool) -> dict[str, Any]:
+def restore(config_path: Path, commit: str, *, apply: bool, drill: bool = False) -> dict[str, Any]:
     config = load_config(config_path); vault = _vault(config); vault.preflight()
     root = Path(config_path).parent
+    if drill and apply:
+        # This path does not scan processes, acquire locks, change state,
+        # alter live saves, update Git, or launch an executable.  extract_save
+        # validates ancestry, blobs, manifest, and player data before publish.
+        planned = _inspect_restore(vault, commit)
+        drill_root = root / "restore-drills"
+        _safe_archive_parent(drill_root)
+        drill_id = f"restore-{commit[:16]}-{uuid.uuid4().hex}"
+        destination = drill_root / drill_id
+        try:
+            destination.lstat()
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            raise SyncError("restore_drill_unavailable", "Restore drill destination could not be inspected.", 3) from error
+        else:
+            raise SyncError("snapshot_name_collision", "Restore drill destination already exists.", 3)
+        vault.extract_save(commit, destination, machine_id=config.machine_id,
+                           retries=config.stable_scan_retries,
+                           window_seconds=config.stable_window_seconds)
+        return {"schema_version": "1.0.0", "command": "restore", "commit": commit,
+                "dry_run": False, "materialized": True,
+                "root_hash": planned["root_hash"], "file_count": planned["file_count"],
+                "total_bytes": planned["total_bytes"], "drill_id": drill_id}
     if not apply:
         # Do not use extract_save here: extraction necessarily creates a
         # staging directory.  A default restore is an inspection only.
@@ -622,7 +648,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "doctor": payload = doctor(args.config)
         elif args.command == "status": payload = status(args.config)
         elif args.command == "recover": payload = recover(args.config)
-        elif args.command == "restore": payload = restore(args.config, args.commit, apply=args.apply)
+        elif args.command == "restore": payload = restore(args.config, args.commit, apply=args.apply, drill=args.drill)
         elif args.command == "snapshot": payload = snapshot(args.config)
         elif args.command in {"preserve", "archive-live"}: payload = preserve(args.config, apply=args.apply)
         elif args.command == "bootstrap": payload = bootstrap(args.config, args.source_cloud, apply=args.apply)
