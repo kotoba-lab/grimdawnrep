@@ -43,7 +43,7 @@ $allowedCodes = @(
     'preconditions_changed', 'launch_failed', 'launch_parse_failed',
     'launch_shape_invalid', 'post_status_failed', 'post_status_parse_failed',
     'post_status_shape_invalid', 'post_doctor_failed', 'post_doctor_parse_failed',
-    'post_doctor_shape_invalid', 'post_restore_failed', 'post_restore_parse_failed',
+    'post_doctor_shape_invalid', 'post_game_process_check_failed', 'post_game_still_running', 'post_restore_failed', 'post_restore_parse_failed',
     'post_restore_shape_invalid', 'postconditions_changed', 'unexpected_failed'
 )
 
@@ -61,17 +61,27 @@ function Get-StatusOrThrow([string]$Prefix) {
     return $value
 }
 
-function Get-DoctorOrThrow([string]$Prefix) {
+function Get-DoctorOrThrow([string]$Prefix, [bool]$AllowDPYesOnly) {
     $output = @(& $python -m grim_dawn_sync --config $config --json doctor 2>$null)
     $exitCode = $LASTEXITCODE; $raw = @($output) -join [Environment]::NewLine
     if ($exitCode -ne 0 -or -not $raw) { throw ($Prefix + '_doctor_failed') }
     try { $value = $raw | ConvertFrom-Json -ErrorAction Stop } catch { throw ($Prefix + '_doctor_parse_failed') }
     if ($value.schema_version -ne '1.0.0' -or $value.command -ne 'doctor' -or $value.read_only -ne $true -or
-        $value.machine_id -ne $machineId -or $value.checks.processes.status -ne 'clear' -or
-        $value.checks.processes.complete -ne $true -or $value.checks.save_root.manifest.root_hash -notmatch '^[0-9a-f]{64}$') {
+        $value.machine_id -ne $machineId -or $value.checks.processes.complete -ne $true -or
+        $value.checks.save_root.manifest.root_hash -notmatch '^[0-9a-f]{64}$') {
         throw ($Prefix + '_doctor_shape_invalid')
     }
+    if ($AllowDPYesOnly) {
+        if ($value.checks.processes.status -notin @('clear', 'running')) { throw ($Prefix + '_doctor_shape_invalid') }
+    }
+    elseif ($value.checks.processes.status -ne 'clear') { throw ($Prefix + '_doctor_shape_invalid') }
     return $value
+}
+
+function Assert-GrimDawnNotRunning([string]$Prefix) {
+    try { $game = @(Get-Process -Name 'Grim Dawn' -ErrorAction SilentlyContinue) }
+    catch { throw ($Prefix + '_game_process_check_failed') }
+    if ($game.Count -ne 0) { throw ($Prefix + '_game_still_running') }
 }
 
 function Get-RestoreOrThrow([string]$Prefix, [string]$Commit) {
@@ -107,7 +117,7 @@ try {
     if ($existingConfig.machine_id -ne $machineId) { throw 'config_check_failed' }
 
     $before = Get-StatusOrThrow 'pre'
-    $beforeDoctor = Get-DoctorOrThrow 'pre'
+    $beforeDoctor = Get-DoctorOrThrow 'pre' $false
     if ($before.processes.status -ne 'clear' -or $before.processes.complete -ne $true -or
         $before.active_lock -ne $null -or $before.recovery_phase -ne $null -or
         $before.readiness -ne 'blocked' -or $before.vault_relation -ne 'remote_changed_or_unknown' -or
@@ -124,8 +134,11 @@ try {
     if ($launch.result.commit -eq $beforeRemote) { throw 'launch_shape_invalid' }
 
     $after = Get-StatusOrThrow 'post'
-    $afterDoctor = Get-DoctorOrThrow 'post'
-    if ($after.processes.status -ne 'clear' -or $after.processes.complete -ne $true -or
+    # DPYes can outlive the game's process briefly.  Its post-exit presence is
+    # permitted only after a direct check proves Grim Dawn itself is absent.
+    $afterDoctor = Get-DoctorOrThrow 'post' $true
+    Assert-GrimDawnNotRunning 'post'
+    if ($after.processes.status -notin @('clear', 'running') -or $after.processes.complete -ne $true -or
         $after.active_lock -ne $null -or $after.recovery_phase -ne $null -or $after.readiness -ne 'ready' -or
         $after.vault_relation -ne 'equal' -or $after.remote_commit -ne $launch.result.commit -or
         $after.last_pushed_commit -ne $launch.result.commit -or $after.remote_commit -eq $beforeRemote) {

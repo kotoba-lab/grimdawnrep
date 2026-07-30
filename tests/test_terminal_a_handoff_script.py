@@ -13,6 +13,7 @@ TERMINAL_A_PRESERVE_DOC = (ROOT / "docs" / "operations" / "terminal-a-preserve-a
 TERMINAL_A_RECOVERY_DOC = (ROOT / "docs" / "operations" / "terminal-a-recover-wait-exit.md").read_text(encoding="utf-8")
 TERMINAL_A_AUTHORITATIVE_SNAPSHOT_DOC = (ROOT / "docs" / "operations" / "terminal-a-authoritative-snapshot.md").read_text(encoding="utf-8")
 TERMINAL_A_ROUNDTRIP_RETURN_DOC = (ROOT / "docs" / "operations" / "terminal-a-roundtrip-return.md").read_text(encoding="utf-8")
+TERMINAL_A_ROUNDTRIP_RETURN_VERIFY_DOC = (ROOT / "docs" / "operations" / "terminal-a-roundtrip-return-verify.md").read_text(encoding="utf-8")
 
 
 def test_terminal_a_handoff_requires_explicit_safe_inputs_and_uses_distinct_machine_id() -> None:
@@ -315,3 +316,17 @@ def test_terminal_a_roundtrip_return_runbook_requires_stale_unchanged_a_and_veri
         " push", "Stop-Process", "Remove-Item", "git -C $source reset", " clean",
     ):
         assert forbidden not in command
+
+
+def test_terminal_a_return_postflight_allows_dpyes_and_has_readonly_verify_runbook() -> None:
+    command = TERMINAL_A_ROUNDTRIP_RETURN_DOC.split("```powershell", 1)[1].split("```", 1)[0]
+    verify = TERMINAL_A_ROUNDTRIP_RETURN_VERIFY_DOC.split("```powershell", 1)[1].split("```", 1)[0]
+    assert "Get-DoctorOrThrow 'post' $true" in command
+    assert "Assert-GrimDawnNotRunning 'post'" in command
+    assert "Get-Process -Name 'Grim Dawn'" in command
+    assert "A_RETURN_VERIFY" in verify
+    assert "roundtrip_verified" in verify
+    assert "@('status')" in verify and "@('doctor')" in verify and "@('restore','--commit',$commit)" in verify
+    assert "Assert-LastLaunchComplete $commit" in verify
+    for forbidden in ("--json launch", "--json snapshot", "--json recover", "--apply", " push", "Stop-Process", "Remove-Item"):
+        assert forbidden not in verify
