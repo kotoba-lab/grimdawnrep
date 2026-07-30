@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import re
 import stat
@@ -45,6 +46,8 @@ def build_parser() -> argparse.ArgumentParser:
     restore = subparsers.add_parser("restore", help="restore a vault commit")
     restore.add_argument("--commit", required=True); restore.add_argument("--apply", action="store_true")
     subparsers.add_parser("snapshot", help="snapshot the current save")
+    preserve = subparsers.add_parser("preserve", aliases=["archive-live"], help="make a verified local archive of the live save")
+    preserve.add_argument("--apply", action="store_true", help="create the local archive")
     bootstrap = subparsers.add_parser("bootstrap", help="initialize from an explicit cloud source")
     bootstrap.add_argument("--source-cloud", type=Path, required=True); bootstrap.add_argument("--apply", action="store_true")
     enroll = subparsers.add_parser("enroll", aliases=["join"], help="adopt the current remote snapshot on a new terminal")
@@ -264,6 +267,68 @@ def snapshot(config_path: Path) -> dict[str, Any]:
     save_state(state_path, SyncState(last_applied_manifest_root_hash=manifest["root_hash"], session_id=lock.session.session_id, machine_id=lock.session.machine_id, base_commit=lock.session.base_commit, lock_oid=lock.oid, local_tag=lock.local_tag, phase="committed", local_commit=oid))
     pushed = vault.push(oid); release_lock(vault, lock, pushed, state_path=state_path, confirmed_root_hash=manifest["root_hash"])
     return {"schema_version":"1.0.0", "command":"snapshot", "commit":pushed, "root_hash": manifest["root_hash"]}
+
+
+def preserve(config_path: Path, *, apply: bool) -> dict[str, Any]:
+    """Preserve live saves locally without consulting sync, state, or vault data."""
+    config = load_config(config_path)
+    if apply:
+        # Do not even scan a live save while its writer is known to run.
+        _process_preflight(config)
+    manifest = stable_manifest(config.save_root, machine_id=config.machine_id,
+                               retries=config.stable_scan_retries,
+                               window_seconds=config.stable_window_seconds)
+    validation = validate_players(config.save_root, manifest)
+    if not validation.get("ok"):
+        raise SyncError(validation.get("classification", "save_invalid"),
+                        "Live save validation did not permit preservation.", 3)
+    summary = {
+        "schema_version": "1.0.0", "command": "preserve",
+        "file_count": manifest["file_count"],
+        "character_count": manifest["character_count"],
+    }
+    if not apply:
+        return {**summary, "dry_run": True, "verified": False}
+    archive_parent = Path(config_path).parent / "archives"
+    _safe_archive_parent(archive_parent)
+    archive_id = f"save-preserved-{manifest['root_hash'][:16]}-{uuid.uuid4().hex}"
+    destination = archive_parent / archive_id
+    # A finished-looking archive is never published until the second process
+    # check has passed.  An interrupted copy can only leave this clearly
+    # incomplete staging name behind for manual inspection/removal.
+    stage = archive_parent / f".preserve-incomplete-{uuid.uuid4().hex}"
+    _process_preflight(config)
+    _copy_verified(config.save_root, stage, manifest, config.machine_id,
+                   config.stable_scan_retries, config.stable_window_seconds,
+                   validate_players)
+    try:
+        copied_info = stage.lstat()
+    except OSError as error:
+        raise SyncError("archive_publish_failed", "Verified local archive could not be inspected.", 3) from error
+    copied_identity = (copied_info.st_dev, copied_info.st_ino)
+    try:
+        _process_preflight(config)
+    except SyncError as error:
+        # Keep an explicitly incomplete staging tree, but never advertise it
+        # as a preservable archive after a process-start race.
+        raise SyncError(error.code, error.message, error.exit_code) from error
+    try:
+        _safe_archive_parent(archive_parent)
+        if stage.parent != archive_parent or not re.fullmatch(r"\.preserve-incomplete-[0-9a-f]{32}", stage.name):
+            raise SyncError("unsafe_archive_path", "Incomplete archive staging is not safe to publish.", 3)
+        stage_info = stage.lstat()
+        if (stage.is_symlink() or bool(getattr(stage_info, "st_file_attributes", 0) & 0x400)
+                or not stat.S_ISDIR(stage_info.st_mode)
+                or (stage_info.st_dev, stage_info.st_ino) != copied_identity):
+            raise SyncError("unsafe_archive_path", "Incomplete archive staging is not a safe directory.", 3)
+        if destination.parent != archive_parent or destination.exists() or destination.is_symlink():
+            raise SyncError("snapshot_name_collision", "Archive destination already exists.", 3)
+        os.replace(stage, destination)
+    except SyncError:
+        raise
+    except OSError as error:
+        raise SyncError("archive_publish_failed", "Verified local archive could not be published.", 3) from error
+    return {**summary, "dry_run": False, "verified": True, "archive_id": archive_id}
 
 
 def bootstrap(config_path: Path, source: Path, *, apply: bool) -> dict[str, Any]:
@@ -555,6 +620,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "recover": payload = recover(args.config)
         elif args.command == "restore": payload = restore(args.config, args.commit, apply=args.apply)
         elif args.command == "snapshot": payload = snapshot(args.config)
+        elif args.command in {"preserve", "archive-live"}: payload = preserve(args.config, apply=args.apply)
         elif args.command == "bootstrap": payload = bootstrap(args.config, args.source_cloud, apply=args.apply)
         elif args.command in {"enroll", "join"}: payload = enroll(args.config, apply=args.apply)
         elif args.command == "launch":

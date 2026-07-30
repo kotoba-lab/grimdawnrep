@@ -20,6 +20,8 @@ def test_parser_requires_apply_and_explicit_restore_bootstrap_arguments() -> Non
     assert parser.parse_args(["restore", "--commit", "abc"]).apply is False
     assert parser.parse_args(["bootstrap", "--source-cloud", "cloud"]).apply is False
     assert parser.parse_args(["install-shortcut"]).apply is False
+    assert parser.parse_args(["preserve"]).apply is False
+    assert parser.parse_args(["archive-live", "--apply"]).command == "archive-live"
 
 
 def test_main_routes_commands_to_their_semantic_handlers(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
@@ -31,18 +33,19 @@ def test_main_routes_commands_to_their_semantic_handlers(monkeypatch: pytest.Mon
             return {"schema_version": "1.0.0", "command": name}
         return invoke
 
-    for name in ("doctor", "status", "recover", "restore", "snapshot", "bootstrap"):
+    for name in ("doctor", "status", "recover", "restore", "snapshot", "preserve", "bootstrap"):
         monkeypatch.setattr(cli, name, handler(name))
     config = tmp_path / "config.local.json"
     commands = [
-        ["doctor"], ["status"], ["recover"], ["snapshot"],
+        ["doctor"], ["status"], ["recover"], ["snapshot"], ["preserve", "--apply"],
         ["restore", "--commit", "c0ffee", "--apply"],
         ["bootstrap", "--source-cloud", str(tmp_path / "cloud"), "--apply"],
     ]
     for command in commands:
         assert cli.main(["--config", str(config), "--json", *command]) == 0
         json.loads(capsys.readouterr().out)
-    assert [name for name, _, _ in calls] == ["doctor", "status", "recover", "snapshot", "restore", "bootstrap"]
+    assert [name for name, _, _ in calls] == ["doctor", "status", "recover", "snapshot", "preserve", "restore", "bootstrap"]
+    assert calls[-3][2] == {"apply": True}
     assert calls[-2][2] == {"apply": True}
     assert calls[-1][2] == {"apply": True}
 
@@ -72,6 +75,136 @@ def test_restore_and_bootstrap_dry_runs_do_not_write_live_save(monkeypatch: pyte
     assert restored == [False]
     assert not config.save_root.exists()
     assert not (tmp_path / "archives").exists()
+
+
+def test_preserve_dry_run_only_scans_and_validates(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    config = SimpleNamespace(save_root=tmp_path / "live", machine_id="test", stable_scan_retries=1, stable_window_seconds=0)
+    manifest = {"root_hash": "a" * 64, "file_count": 2, "character_count": 1}
+    monkeypatch.setattr(cli, "load_config", lambda _: config)
+    monkeypatch.setattr(cli, "stable_manifest", lambda *_a, **_k: manifest)
+    monkeypatch.setattr(cli, "validate_players", lambda *_a: {"ok": True})
+    monkeypatch.setattr(cli, "_process_preflight", lambda *_a: pytest.fail("dry run must not scan processes"))
+    monkeypatch.setattr(cli, "_safe_archive_parent", lambda *_a: pytest.fail("dry run must not create archives"))
+    monkeypatch.setattr(cli, "_vault", lambda *_a: pytest.fail("preserve must not use vault"))
+    assert cli.preserve(tmp_path / "config.local.json", apply=False) == {
+        "schema_version": "1.0.0", "command": "preserve", "file_count": 2,
+        "character_count": 1, "dry_run": True, "verified": False,
+    }
+    assert not (tmp_path / "archives").exists()
+
+
+def test_preserve_apply_creates_verified_local_archive_without_sync_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    config = SimpleNamespace(save_root=tmp_path / "live", machine_id="test", stable_scan_retries=1, stable_window_seconds=0)
+    manifest = {"root_hash": "b" * 64, "file_count": 1, "character_count": 1}
+    copied: list[Path] = []
+    monkeypatch.setattr(cli, "load_config", lambda _: config)
+    monkeypatch.setattr(cli, "stable_manifest", lambda *_a, **_k: manifest)
+    monkeypatch.setattr(cli, "validate_players", lambda *_a: {"ok": True})
+    monkeypatch.setattr(cli, "_process_preflight", lambda *_a: {"status": "stopped"})
+    monkeypatch.setattr(cli, "_safe_archive_parent", lambda path: path.mkdir(exist_ok=True))
+    def copy(_source: Path, destination: Path, *_args: object) -> None:
+        copied.append(destination); destination.mkdir()
+    monkeypatch.setattr(cli, "_copy_verified", copy)
+    monkeypatch.setattr(cli, "_vault", lambda *_a: pytest.fail("preserve must not use vault"))
+    monkeypatch.setattr(cli, "load_state", lambda *_a: pytest.fail("preserve must not load state"))
+    monkeypatch.setattr(cli, "save_state", lambda *_a: pytest.fail("preserve must not save state"))
+    result = cli.preserve(tmp_path / "config.local.json", apply=True)
+    assert result["verified"] is True and result["dry_run"] is False
+    assert copied[0].name.startswith(".preserve-incomplete-")
+    assert result["archive_id"] != copied[0].name
+    assert (tmp_path / "archives" / result["archive_id"]).is_dir()
+    assert copied[0].parent == tmp_path / "archives"
+
+
+def test_preserve_rejects_running_process_and_invalid_save(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    config = SimpleNamespace(save_root=tmp_path / "live", machine_id="test", stable_scan_retries=1, stable_window_seconds=0)
+    manifest = {"root_hash": "c" * 64, "file_count": 1, "character_count": 1}
+    monkeypatch.setattr(cli, "load_config", lambda _: config)
+    monkeypatch.setattr(cli, "stable_manifest", lambda *_a, **_k: manifest)
+    monkeypatch.setattr(cli, "validate_players", lambda *_a: {"ok": False, "classification": "invalid_save"})
+    monkeypatch.setattr(cli, "_process_preflight", lambda *_a: None)
+    with pytest.raises(SyncError) as error: cli.preserve(tmp_path / "config", apply=True)
+    assert error.value.code == "invalid_save"
+    monkeypatch.setattr(cli, "validate_players", lambda *_a: {"ok": True})
+    monkeypatch.setattr(cli, "_process_preflight", lambda *_a: (_ for _ in ()).throw(SyncError("game_already_running", "running", 5)))
+    with pytest.raises(SyncError) as error: cli.preserve(tmp_path / "config", apply=True)
+    assert error.value.code == "game_already_running"
+
+
+def test_preserve_retains_only_incomplete_stage_when_source_changes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    config = SimpleNamespace(save_root=tmp_path / "live", machine_id="test", stable_scan_retries=1, stable_window_seconds=0)
+    manifest = {"root_hash": "d" * 64, "file_count": 1, "character_count": 1}
+    monkeypatch.setattr(cli, "load_config", lambda _: config); monkeypatch.setattr(cli, "stable_manifest", lambda *_a, **_k: manifest)
+    monkeypatch.setattr(cli, "validate_players", lambda *_a: {"ok": True}); monkeypatch.setattr(cli, "_process_preflight", lambda *_a: None)
+    monkeypatch.setattr(cli, "_safe_archive_parent", lambda path: path.mkdir(exist_ok=True))
+    def changed(_source: Path, destination: Path, *_args: object) -> None:
+        destination.mkdir(); (destination / "partial").write_text("x")
+        raise SyncError("source_changed", "changed", 3)
+    monkeypatch.setattr(cli, "_copy_verified", changed)
+    with pytest.raises(SyncError) as error: cli.preserve(tmp_path / "config", apply=True)
+    assert error.value.code == "source_changed"
+    children = list((tmp_path / "archives").iterdir())
+    assert len(children) == 1 and children[0].name.startswith(".preserve-incomplete-")
+
+
+def test_preserve_process_race_keeps_only_incomplete_stage(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    config = SimpleNamespace(save_root=tmp_path / "live", machine_id="test", stable_scan_retries=1, stable_window_seconds=0)
+    manifest = {"root_hash": "e" * 64, "file_count": 1, "character_count": 1}
+    monkeypatch.setattr(cli, "load_config", lambda _: config); monkeypatch.setattr(cli, "stable_manifest", lambda *_a, **_k: manifest)
+    monkeypatch.setattr(cli, "validate_players", lambda *_a: {"ok": True})
+    calls = 0
+    def preflight(*_args: object) -> None:
+        nonlocal calls; calls += 1
+        if calls == 3: raise SyncError("game_already_running", "running", 5)
+    monkeypatch.setattr(cli, "_process_preflight", preflight); monkeypatch.setattr(cli, "_safe_archive_parent", lambda path: path.mkdir())
+    monkeypatch.setattr(cli, "_copy_verified", lambda _source, destination, *_args: destination.mkdir())
+    with pytest.raises(SyncError) as error: cli.preserve(tmp_path / "config", apply=True)
+    assert error.value.code == "game_already_running" and error.value.details == {}
+    children = list((tmp_path / "archives").iterdir())
+    assert len(children) == 1 and children[0].name.startswith(".preserve-incomplete-")
+
+
+def test_preserve_blocks_unsafe_archive_parent_before_copy(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    config = SimpleNamespace(save_root=tmp_path / "live", machine_id="test", stable_scan_retries=1, stable_window_seconds=0)
+    manifest = {"root_hash": "f" * 64, "file_count": 1, "character_count": 1}
+    monkeypatch.setattr(cli, "load_config", lambda _: config); monkeypatch.setattr(cli, "stable_manifest", lambda *_a, **_k: manifest)
+    monkeypatch.setattr(cli, "validate_players", lambda *_a: {"ok": True}); monkeypatch.setattr(cli, "_process_preflight", lambda *_a: None)
+    monkeypatch.setattr(cli, "_safe_archive_parent", lambda *_a: (_ for _ in ()).throw(SyncError("unsafe_archive_path", "link", 6)))
+    monkeypatch.setattr(cli, "_copy_verified", lambda *_a: pytest.fail("unsafe archive parent must block copy"))
+    with pytest.raises(SyncError) as error: cli.preserve(tmp_path / "config", apply=True)
+    assert error.value.code == "unsafe_archive_path"
+
+
+def test_preserve_refuses_replaced_stage_before_publish(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    config = SimpleNamespace(save_root=tmp_path / "live", machine_id="test", stable_scan_retries=1, stable_window_seconds=0)
+    manifest = {"root_hash": "a" * 64, "file_count": 1, "character_count": 1}; stage: list[Path] = []
+    monkeypatch.setattr(cli, "load_config", lambda _: config); monkeypatch.setattr(cli, "stable_manifest", lambda *_a, **_k: manifest)
+    monkeypatch.setattr(cli, "validate_players", lambda *_a: {"ok": True}); monkeypatch.setattr(cli, "_safe_archive_parent", lambda path: path.mkdir(exist_ok=True))
+    monkeypatch.setattr(cli, "_copy_verified", lambda _source, destination, *_args: (stage.append(destination), destination.mkdir()))
+    calls = 0
+    def preflight(*_args: object) -> None:
+        nonlocal calls; calls += 1
+        if calls == 3:
+            stage[0].rmdir(); stage[0].mkdir()
+    monkeypatch.setattr(cli, "_process_preflight", preflight)
+    with pytest.raises(SyncError) as error: cli.preserve(tmp_path / "config", apply=True)
+    assert error.value.code == "unsafe_archive_path"
+    assert not list((tmp_path / "archives").glob("save-preserved-*"))
+
+
+def test_preserve_revalidates_archive_parent_before_publish(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    config = SimpleNamespace(save_root=tmp_path / "live", machine_id="test", stable_scan_retries=1, stable_window_seconds=0)
+    manifest = {"root_hash": "b" * 64, "file_count": 1, "character_count": 1}; calls = 0
+    monkeypatch.setattr(cli, "load_config", lambda _: config); monkeypatch.setattr(cli, "stable_manifest", lambda *_a, **_k: manifest)
+    monkeypatch.setattr(cli, "validate_players", lambda *_a: {"ok": True}); monkeypatch.setattr(cli, "_process_preflight", lambda *_a: None)
+    def parent(path: Path) -> None:
+        nonlocal calls; calls += 1
+        if calls == 2: raise SyncError("unsafe_archive_path", "swapped", 6)
+        path.mkdir(exist_ok=True)
+    monkeypatch.setattr(cli, "_safe_archive_parent", parent)
+    monkeypatch.setattr(cli, "_copy_verified", lambda _source, destination, *_args: destination.mkdir())
+    with pytest.raises(SyncError) as error: cli.preserve(tmp_path / "config", apply=True)
+    assert error.value.code == "unsafe_archive_path"
 
 
 def test_shortcut_refuses_same_destination_and_legacy_can_coexist(tmp_path: Path) -> None:

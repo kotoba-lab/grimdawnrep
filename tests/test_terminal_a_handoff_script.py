@@ -9,6 +9,7 @@ DOC = (ROOT / "docs" / "operations" / "terminal-a-handoff.md").read_text(encodin
 AGENT_ENROLL_DOC = (ROOT / "docs" / "operations" / "terminal-a-agent-enroll.md").read_text(encoding="utf-8")
 ROUNDTRIP_LEG1_DOC = (ROOT / "docs" / "operations" / "terminal-a-roundtrip-leg1.md").read_text(encoding="utf-8")
 ROUNDTRIP_DIAGNOSE_DOC = (ROOT / "docs" / "operations" / "terminal-a-roundtrip-diagnose.md").read_text(encoding="utf-8")
+TERMINAL_A_PRESERVE_DOC = (ROOT / "docs" / "operations" / "terminal-a-preserve-authoritative.md").read_text(encoding="utf-8")
 
 
 def test_terminal_a_handoff_requires_explicit_safe_inputs_and_uses_distinct_machine_id() -> None:
@@ -194,4 +195,34 @@ def test_terminal_a_roundtrip_diagnosis_parses_known_schema_and_allowlists_outpu
     assert "[System.IO.Path]::GetDirectoryName($config)" in command
     assert "Split-Path -LiteralPath $config -Parent" not in command
     for forbidden in ("remote_commit", "last_pushed_commit", "safe_oid", "safe_root_hash", "session_id", "archive_id"):
+        assert forbidden not in command
+
+
+def test_terminal_a_preserve_authoritative_runbook_is_ps51_sanitized_and_state_preserving() -> None:
+    command = TERMINAL_A_PRESERVE_DOC.split("```powershell", 1)[1].split("```", 1)[0]
+
+    assert "Windows PowerShell 5.1" in TERMINAL_A_PRESERVE_DOC
+    assert "git -C $source pull --ff-only" in command
+    assert "--json', 'preserve'" in command
+    assert "'--apply'" in command
+    assert "TERMINAL_A_PRESERVE" in command
+    assert "live_archive_verified" in command
+    assert "ConvertFrom-Json -ErrorAction Stop" in command
+    assert "ConvertTo-Json -Compress" in command
+    assert "$before.processes.status -ne 'clear'" in command
+    assert "$before.processes.complete -ne $true" in command
+    assert "-not $beforeLockPresent -or -not $beforeRecoveryRequired" in command
+    assert "$afterLockPresent -ne $beforeLockPresent" in command
+    assert "$afterRecoveryRequired -ne $beforeRecoveryRequired" in command
+    assert "$afterRecoveryPhasePresent -ne $beforeRecoveryPhasePresent" in command
+    assert "^save-preserved-[0-9a-f]{16}-[0-9a-f]{32}$" in command
+    assert "archive_id =" not in command
+    assert "root_hash" not in command
+    assert "file_count" not in command
+    assert "character_count" not in command
+    assert "vaultRemoteUrl" not in command
+    for forbidden in (
+        "--json launch", "--json recover", "--json snapshot", "--json restore",
+        "--json bootstrap", " push", "Stop-Process", "Remove-Item",
+    ):
         assert forbidden not in command
