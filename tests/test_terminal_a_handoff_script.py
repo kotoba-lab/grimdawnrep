@@ -11,6 +11,7 @@ ROUNDTRIP_LEG1_DOC = (ROOT / "docs" / "operations" / "terminal-a-roundtrip-leg1.
 ROUNDTRIP_DIAGNOSE_DOC = (ROOT / "docs" / "operations" / "terminal-a-roundtrip-diagnose.md").read_text(encoding="utf-8")
 TERMINAL_A_PRESERVE_DOC = (ROOT / "docs" / "operations" / "terminal-a-preserve-authoritative.md").read_text(encoding="utf-8")
 TERMINAL_A_RECOVERY_DOC = (ROOT / "docs" / "operations" / "terminal-a-recover-wait-exit.md").read_text(encoding="utf-8")
+TERMINAL_A_AUTHORITATIVE_SNAPSHOT_DOC = (ROOT / "docs" / "operations" / "terminal-a-authoritative-snapshot.md").read_text(encoding="utf-8")
 
 
 def test_terminal_a_handoff_requires_explicit_safe_inputs_and_uses_distinct_machine_id() -> None:
@@ -250,5 +251,37 @@ def test_terminal_a_wait_exit_recovery_runbook_is_single_use_and_preserves_live_
     for forbidden in (
         "--json launch", "--json snapshot", "--json restore", "--json bootstrap",
         " push", "Stop-Process", "Remove-Item", "git -C $source reset",
+    ):
+        assert forbidden not in command
+
+
+def test_terminal_a_authoritative_snapshot_runbook_proves_and_publishes_only_newer_live() -> None:
+    command = TERMINAL_A_AUTHORITATIVE_SNAPSHOT_DOC.split("```powershell", 1)[1].split("```", 1)[0]
+
+    assert "Windows PowerShell 5.1" in TERMINAL_A_AUTHORITATIVE_SNAPSHOT_DOC
+    assert "git -C $source pull --ff-only" in command
+    assert "TERMINAL_A_AUTHORITATIVE" in command
+    assert "snapshot_pushed_live_preserved" in command
+    assert command.count("--json snapshot") == 1
+    assert command.count("--json restore") == 1
+    assert "Get-RestoreOrThrow 'pre' $beforeRemote" in command
+    assert "Get-RestoreOrThrow 'post' $snapshot.commit" in command
+    assert "function Get-DoctorOrThrow" in command
+    assert "function Get-RestoreOrThrow" in command
+    assert "$before.active_lock -ne $null" in command
+    assert "$before.recovery_phase -ne $null" in command
+    assert "$before.readiness -ne 'ready'" in command
+    assert "$before.vault_relation -ne 'equal'" in command
+    assert "$beforeRestore.root_hash -eq $beforeLiveRoot" in command
+    assert "$snapshot.root_hash -ne $beforeLiveRoot" in command
+    assert "$snapshot.commit -eq $beforeRemote" in command
+    assert "$after.remote_commit -ne $snapshot.commit" in command
+    assert "$after.last_pushed_commit -ne $snapshot.commit" in command
+    assert "$afterDoctor.checks.save_root.manifest.root_hash -ne $beforeLiveRoot" in command
+    assert "$afterRestore.root_hash -ne $beforeLiveRoot" in command
+    assert "ConvertTo-Json -Compress" in command
+    for forbidden in (
+        "--json launch", "--json recover", "--json bootstrap", "--json enroll",
+        "--apply", " push", "Stop-Process", "Remove-Item", "git -C $source reset", " clean",
     ):
         assert forbidden not in command
