@@ -117,3 +117,31 @@ def test_windows_adapter_failure_never_writes_shortcut(monkeypatch: pytest.Monke
     with pytest.raises(SyncError, match="unavailable"):
         ShortcutAdapter().create(tmp_path / SHORTCUT_NAME, str(Path(sys.executable)), "-c \"pass\"", str(tmp_path))
     assert not (tmp_path / SHORTCUT_NAME).exists()
+
+
+def test_windows_adapter_uses_lnk_stage_and_captures_undecoded_bytes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    import grim_dawn_sync.shortcut as shortcut
+
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def run(command: list[str], **kwargs: object):
+        calls.append((command, kwargs))
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(shortcut.subprocess, "run", run)
+    ShortcutAdapter().create(tmp_path / SHORTCUT_NAME, str(Path(sys.executable)), '-c "pass"', str(tmp_path))
+    command, kwargs = calls[0]
+    script = command[-1]
+    assert "NewGuid().ToString('N')+'.lnk'" in script
+    assert kwargs["capture_output"] is True
+    assert "text" not in kwargs and "encoding" not in kwargs
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="requires Windows WScript.Shell")
+def test_windows_adapter_creates_valid_shortcut_via_com(tmp_path: Path) -> None:
+    destination = tmp_path / SHORTCUT_NAME
+    ShortcutAdapter().create(destination, str(Path(sys.executable)), '-c "pass"', str(tmp_path))
+    assert destination.is_file()
+    assert not list(tmp_path.glob(f"{SHORTCUT_NAME}.new-*"))

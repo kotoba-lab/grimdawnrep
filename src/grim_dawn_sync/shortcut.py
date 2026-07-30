@@ -87,7 +87,9 @@ class ShortcutAdapter:
                 "$ErrorActionPreference='Stop'; "
                 f"$p=[IO.Path]::GetFullPath('{str(destination).replace("'", "''")}'); "
                 "if (Get-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue) { exit 17 }; "
-                "$tmp=$p+'.new-'+[guid]::NewGuid().ToString('N'); "
+                # WScript.Shell rejects temporary names whose final extension
+                # is not .lnk, even when the eventual destination is a .lnk.
+                "$tmp=$p+'.new-'+[guid]::NewGuid().ToString('N')+'.lnk'; "
                 "try { $s=New-Object -ComObject WScript.Shell; $l=$s.CreateShortcut($tmp); "
                 f"$l.TargetPath='{target.replace("'", "''")}'; $l.Arguments='{arguments.replace("'", "''")}'; "
                 f"$l.WorkingDirectory='{working_directory.replace("'", "''")}'; $l.Save(); "
@@ -95,7 +97,10 @@ class ShortcutAdapter:
             )
             result = subprocess.run(
                 ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
-                check=False, capture_output=True, text=True, timeout=20,
+                # The captured streams are intentionally bytes.  Windows
+                # PowerShell can emit UTF-8 diagnostics while Python's locale
+                # decoder is cp932, and the diagnostics are not exposed.
+                check=False, capture_output=True, timeout=20,
             )
             if result.returncode == 17:
                 raise SyncError("shortcut_exists", "Save Sync shortcut already exists; it was not replaced.", EXIT_CONFIGURATION)
