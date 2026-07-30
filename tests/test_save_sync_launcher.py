@@ -16,8 +16,11 @@ def config(tmp_path: Path, *, timeout: int = 3):
 
 
 class FakeMonitor:
-    def __init__(self, scans: list[ProcessScan]): self.scans = iter(scans)
+    def __init__(self, scans: list[ProcessScan]):
+        self.scans = iter(scans)
+        self.calls = 0
     def scan(self) -> ProcessScan:
+        self.calls += 1
         try: return next(self.scans)
         except StopIteration: return ProcessScan(())
 
@@ -125,6 +128,72 @@ def test_unknown_later_game_identity_fails_closed(tmp_path: Path) -> None:
     with pytest.raises(SyncError) as raised:
         subject.run()
     assert raised.value.code == "game_identity_unknown"
+
+
+@pytest.mark.parametrize(
+    "transient_unknown",
+    [
+        lambda root: ProcessInfo(10, "Grim Dawn.exe", root / "x64" / "Grim Dawn.exe", None),
+        lambda root: ProcessInfo(10, "Grim Dawn.exe", None, 100),
+    ],
+)
+def test_watched_game_identity_unknown_during_exit_is_repolled(tmp_path: Path, transient_unknown) -> None:
+    root = tmp_path / "game"
+    first = game(root, 10, 100)
+    # Windows can enumerate a process in its final moments after access to
+    # its image path and creation time has gone away.  The PID was already
+    # safely identified, so it must remain watched until it disappears.
+    subject, _, _ = launcher(
+        tmp_path,
+        [
+            ProcessScan(()),
+            ProcessScan((first,)),
+            ProcessScan((transient_unknown(root),)),
+            ProcessScan(()),
+        ],
+    )
+    assert subject.run().game_pids == (10,)
+    # Includes the post-race empty scan.  Returning on the unknown scan would
+    # consume only the initial, start, and unknown scans.
+    assert subject.monitor.calls == 4
+
+
+def test_watched_unknown_identity_keeps_waiting_for_later_game(tmp_path: Path) -> None:
+    root = tmp_path / "game"
+    first = game(root, 10, 100)
+    later = game(root, 11, 101)
+    transient_unknown = ProcessInfo(10, "Grim Dawn.exe", None, None)
+    subject, _, _ = launcher(
+        tmp_path,
+        [
+            ProcessScan(()),
+            ProcessScan((first,)),
+            ProcessScan((transient_unknown, later)),
+            ProcessScan((transient_unknown,)),
+            ProcessScan(()),
+        ],
+    )
+    assert subject.run().game_pids == (10, 11)
+    assert subject.monitor.calls == 5
+
+
+def test_watched_unknown_identity_allows_same_pid_reuse_when_verified(tmp_path: Path) -> None:
+    root = tmp_path / "game"
+    first = game(root, 10, 100)
+    replacement = game(root, 10, 101)
+    transient_unknown = ProcessInfo(10, "Grim Dawn.exe", None, None)
+    subject, _, _ = launcher(
+        tmp_path,
+        [
+            ProcessScan(()),
+            ProcessScan((first,)),
+            ProcessScan((transient_unknown,)),
+            ProcessScan((replacement,)),
+            ProcessScan(()),
+        ],
+    )
+    assert subject.run().game_pids == (10,)
+    assert subject.monitor.calls == 5
 
 
 def test_incomplete_later_process_scan_fails_closed(tmp_path: Path) -> None:

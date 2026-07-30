@@ -97,6 +97,17 @@ class DPYesLauncher:
                 if item.name.casefold() not in configured:
                     continue
                 if item.executable_path is None or item.creation_marker is None:
+                    # Toolhelp can still enumerate a process while opening it
+                    # for its image path/creation time races with final exit.
+                    # A PID that was already safely identified remains active
+                    # until it disappears from a complete scan.  An unknown
+                    # PID has no such provenance and must still fail closed.
+                    known = watched.get(item.pid)
+                    if known is not None and (
+                        item.creation_marker is None or item.creation_marker == known
+                    ):
+                        current.add((item.pid, known))
+                        continue
                     raise self._error("game_identity_unknown", "A configured game process could not be identified safely.")
                 if not self._under(item.executable_path, self.config.game_install):
                     continue
