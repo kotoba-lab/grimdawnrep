@@ -12,6 +12,7 @@ ROUNDTRIP_DIAGNOSE_DOC = (ROOT / "docs" / "operations" / "terminal-a-roundtrip-d
 TERMINAL_A_PRESERVE_DOC = (ROOT / "docs" / "operations" / "terminal-a-preserve-authoritative.md").read_text(encoding="utf-8")
 TERMINAL_A_RECOVERY_DOC = (ROOT / "docs" / "operations" / "terminal-a-recover-wait-exit.md").read_text(encoding="utf-8")
 TERMINAL_A_AUTHORITATIVE_SNAPSHOT_DOC = (ROOT / "docs" / "operations" / "terminal-a-authoritative-snapshot.md").read_text(encoding="utf-8")
+TERMINAL_A_ROUNDTRIP_RETURN_DOC = (ROOT / "docs" / "operations" / "terminal-a-roundtrip-return.md").read_text(encoding="utf-8")
 
 
 def test_terminal_a_handoff_requires_explicit_safe_inputs_and_uses_distinct_machine_id() -> None:
@@ -283,5 +284,34 @@ def test_terminal_a_authoritative_snapshot_runbook_proves_and_publishes_only_new
     for forbidden in (
         "--json launch", "--json recover", "--json bootstrap", "--json enroll",
         "--apply", " push", "Stop-Process", "Remove-Item", "git -C $source reset", " clean",
+    ):
+        assert forbidden not in command
+
+
+def test_terminal_a_roundtrip_return_runbook_requires_stale_unchanged_a_and_verifies_b_return() -> None:
+    command = TERMINAL_A_ROUNDTRIP_RETURN_DOC.split("```powershell", 1)[1].split("```", 1)[0]
+
+    assert "Windows PowerShell 5.1" in TERMINAL_A_ROUNDTRIP_RETURN_DOC
+    assert "git -C $source pull --ff-only" in command
+    assert "TERMINAL_A_ROUNDTRIP" in command
+    assert "A_RETURN" in command
+    assert "roundtrip_complete" in command
+    assert command.count("--json launch") == 1
+    assert command.count("--json restore") == 1
+    assert "Get-RestoreOrThrow 'pre' $oldBaseline" in command
+    assert "Get-RestoreOrThrow 'post' $launch.result.commit" in command
+    assert "$before.readiness -ne 'blocked'" in command
+    assert "$before.vault_relation -ne 'remote_changed_or_unknown'" in command
+    assert "$before.remote_commit -eq $before.last_pushed_commit" in command
+    assert "$oldRestore.root_hash -ne $beforeLiveRoot" in command
+    assert "$launch.result.commit -eq $beforeRemote" in command
+    assert "$after.remote_commit -eq $beforeRemote" in command
+    assert "$after.remote_commit -ne $launch.result.commit" in command
+    assert "$after.last_pushed_commit -ne $launch.result.commit" in command
+    assert "$newRestore.root_hash -ne $afterLiveRoot" in command
+    assert "ConvertTo-Json -Compress" in command
+    for forbidden in (
+        "--json recover", "--json snapshot", "--apply", "--json bootstrap", "--json enroll",
+        " push", "Stop-Process", "Remove-Item", "git -C $source reset", " clean",
     ):
         assert forbidden not in command
