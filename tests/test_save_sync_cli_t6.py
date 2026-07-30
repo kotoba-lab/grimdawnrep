@@ -353,12 +353,12 @@ def test_bootstrap_does_not_persist_baseline_when_push_fails(monkeypatch: pytest
 
 def test_launch_and_shortcut_apply_are_explicit_and_dry_run_does_nothing(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
     config_path = tmp_path / "config.local.json"; calls: list[object] = []
-    monkeypatch.setattr(cli, "install_shortcut", lambda desktop: calls.append(desktop))
+    monkeypatch.setattr(cli, "install_shortcut", lambda desktop, *, config_path: calls.append((desktop, config_path)))
     monkeypatch.setattr(cli.Path, "home", classmethod(lambda cls: tmp_path))
     assert cli.main(["--json", "install-shortcut"]) == 0
     assert json.loads(capsys.readouterr().out)["dry_run"] is True and calls == []
     assert cli.main(["--json", "install-shortcut", "--apply"]) == 0
-    assert calls == [tmp_path / "Desktop"]
+    assert calls == [(tmp_path / "Desktop", cli.default_config_path())]
     capsys.readouterr()
 
     config = object()

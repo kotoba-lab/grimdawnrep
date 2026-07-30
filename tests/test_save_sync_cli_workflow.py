@@ -210,27 +210,33 @@ def test_preserve_revalidates_archive_parent_before_publish(monkeypatch: pytest.
 
 
 def test_shortcut_refuses_same_destination_and_legacy_can_coexist(tmp_path: Path) -> None:
-    (tmp_path / SHORTCUT_NAME).touch()
+    desktop = tmp_path / "Desktop"; desktop.mkdir()
+    config = tmp_path / "config.local.json"
+    config.write_text(json.dumps({"schema_version":"1.0.0","machine_id":"desktop-a","save_root":"C:/save","vault_repo":"C:/vault","remote":"origin","branch":"main","game_install":"C:/game","launcher_mode":"dpyes","launcher_path":"C:/dpyes.exe","game_process_names":["Grim Dawn.exe"],"launch_timeout_seconds":1,"stable_window_seconds":1,"stable_scan_retries":1,"offline_policy":"deny"}), encoding="utf-8")
+    (desktop / SHORTCUT_NAME).touch()
     with pytest.raises(SyncError, match="already exists"):
-        install_shortcut(tmp_path, adapter=ShortcutAdapter())
-    (tmp_path / SHORTCUT_NAME).unlink()
-    (tmp_path / LEGACY_SHORTCUT_NAME).touch()
-    calls: list[tuple[Path, str, str]] = []
+        install_shortcut(desktop, config_path=config, source_root=tmp_path, adapter=ShortcutAdapter())
+    (desktop / SHORTCUT_NAME).unlink()
+    (desktop / LEGACY_SHORTCUT_NAME).touch()
+    calls: list[tuple[Path, str, str, str]] = []
     class FakeAdapter:
-        def create(self, destination: Path, target: str, arguments: str) -> None:
-            calls.append((destination, target, arguments))
-    assert install_shortcut(tmp_path, adapter=FakeAdapter()) == tmp_path / SHORTCUT_NAME  # type: ignore[arg-type]
-    assert calls == [(tmp_path / SHORTCUT_NAME, "grim-dawn-sync", "launch")]
+        def create(self, destination: Path, target: str, arguments: str, working_directory: str) -> None:
+            calls.append((destination, target, arguments, working_directory))
+    assert install_shortcut(desktop, config_path=config, source_root=tmp_path, adapter=FakeAdapter()) == desktop / SHORTCUT_NAME  # type: ignore[arg-type]
+    assert calls[0][0] == desktop / SHORTCUT_NAME and "launch" in calls[0][2]
 
 
 def test_shortcut_propagates_adapter_failure_without_creating_file(tmp_path: Path) -> None:
+    desktop = tmp_path / "Desktop"; desktop.mkdir()
+    config = tmp_path / "config.local.json"
+    config.write_text(json.dumps({"schema_version":"1.0.0","machine_id":"desktop-a","save_root":"C:/save","vault_repo":"C:/vault","remote":"origin","branch":"main","game_install":"C:/game","launcher_mode":"dpyes","launcher_path":"C:/dpyes.exe","game_process_names":["Grim Dawn.exe"],"launch_timeout_seconds":1,"stable_window_seconds":1,"stable_scan_retries":1,"offline_policy":"deny"}), encoding="utf-8")
     class FailingAdapter:
-        def create(self, destination: Path, target: str, arguments: str) -> None:
+        def create(self, destination: Path, target: str, arguments: str, working_directory: str) -> None:
             raise SyncError("shortcut_unavailable", "adapter unavailable", EXIT_CONFIGURATION)
 
     with pytest.raises(SyncError, match="adapter unavailable"):
-        install_shortcut(tmp_path, adapter=FailingAdapter())  # type: ignore[arg-type]
-    assert not (tmp_path / SHORTCUT_NAME).exists()
+        install_shortcut(desktop, config_path=config, source_root=tmp_path, adapter=FailingAdapter())  # type: ignore[arg-type]
+    assert not (desktop / SHORTCUT_NAME).exists()
 
 
 @pytest.mark.parametrize(

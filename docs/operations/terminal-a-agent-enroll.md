@@ -1,5 +1,10 @@
 # Terminal A: agent-run enrollment
 
+After the enrollment sentinel succeeds, use
+[install-save-sync-shortcut.md](install-save-sync-shortcut.md) to create and
+COM-verify the separate Save Sync shortcut. The installation is create-only;
+leave any existing current or legacy shortcut untouched.
+
 This runbook is for an agent working directly on Terminal A. The prerequisite setup and doctor check have already passed for machine ID `desktop-a`. The only intended state-changing action is enrollment: adopt the verified remote snapshot. Enrollment never overwrites a different existing live save; a mismatch remains blocked.
 
 The agent must not print or relay command output, paths, remote values, save names, hashes, or diagnostics. Its final report is exactly one `TERMINAL_A_HANDOFF` JSON sentinel.

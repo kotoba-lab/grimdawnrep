@@ -661,7 +661,7 @@ def main(argv: list[str] | None = None) -> int:
             if not args.apply: payload = {"schema_version": "1.0.0", "command": "install-shortcut", "dry_run": True}
             else:
                 desktop = Path.home() / "Desktop"
-                install_shortcut(desktop)
+                install_shortcut(desktop, config_path=args.config)
                 payload = {"schema_version": "1.0.0", "command": "install-shortcut", "created": True}
         exit_code = EXIT_OK
     except SyncError as error:
