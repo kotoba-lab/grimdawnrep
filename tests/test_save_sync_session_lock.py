@@ -119,6 +119,26 @@ def _commit_session_snapshot(
     return _git(vault.repo, "rev-parse", "HEAD"), root_hash
 
 
+def _abandoned_lock_at_verified_base(tmp_path: Path) -> tuple[GitVault, Path, Lock, str]:
+    """Create the exact pre-snapshot recovery state with a valid base."""
+    vault, _ = _vaults(tmp_path)
+    _git(vault.repo, "rm", "README")
+    _git(vault.repo, "commit", "-m", "remove unmanaged seed")
+    _git(vault.repo, "push", "origin", "HEAD:refs/heads/main")
+    source = tmp_path / "live" / "main" / "a"
+    source.mkdir(parents=True)
+    (source / "profile.dat").write_bytes(b"valid-base")
+    seeded = vault.snapshot(
+        source.parents[1], machine_id="machine-a", session_id="seed",
+        validator=lambda *_args: {"ok": True},
+    )
+    assert vault.push(seeded) == seeded
+    base = vault.remote_oid()
+    assert base
+    state_path = tmp_path / "state.json"
+    return vault, state_path, acquire_lock(vault, "machine-a", base, state_path=state_path), base
+
+
 def _forged_lock_tag(
     vault: GitVault,
     tmp_path: Path,
@@ -438,6 +458,130 @@ def test_recovery_adopts_verified_snapshot_head_then_pushes_and_releases(tmp_pat
         last_applied_manifest_root_hash=root_hash,
         machine_id="machine-a",
     )
+
+
+def test_recovery_releases_exact_abandoned_lock_without_changing_main_or_live(
+    tmp_path: Path,
+) -> None:
+    vault, state_path, lock, base = _abandoned_lock_at_verified_base(tmp_path)
+    source = tmp_path / "live" / "main" / "a"
+    # Live data may have advanced after the failed launch.  Recovery verifies
+    # the base snapshot and records it as the last-applied baseline, rather
+    # than claiming the current live tree is equal to it.
+    original = SyncState(
+        last_applied_remote_commit="a" * 40,
+        last_applied_manifest_root_hash="b" * 64,
+        session_id=lock.session.session_id,
+        machine_id="machine-a",
+        base_commit=base,
+        lock_oid=lock.oid,
+        local_tag=lock.local_tag,
+        phase="lock_held",
+    )
+    save_state(state_path, original)
+    before_main = vault.remote_oid()
+    before_head = _git(vault.repo, "rev-parse", "HEAD")
+    before_live = (source / "profile.dat").read_bytes()
+
+    assert recover_session(vault, original, "machine-a", state_path=state_path) == "abandoned_lock_released"
+
+    assert vault.remote_oid() == before_main == base
+    assert _git(vault.repo, "rev-parse", "HEAD") == before_head == base
+    assert (source / "profile.dat").read_bytes() == before_live
+    assert inspect_remote_lock_readonly(vault) is None
+    assert load_state(state_path) == SyncState(
+        last_applied_remote_commit=base,
+        last_applied_manifest_root_hash=vault.validate_commit_snapshot(base)["root_hash"],
+        machine_id="machine-a",
+    )
+
+
+def test_recovery_refuses_abandoned_lock_when_clean_head_has_remote_advance(
+    tmp_path: Path,
+) -> None:
+    vault, other = _vaults(tmp_path)
+    base = vault.remote_oid()
+    assert base
+    state_path = tmp_path / "state.json"
+    lock = acquire_lock(vault, "machine-a", base, state_path=state_path)
+    (other.repo / "remote-advance").write_text("x", encoding="utf-8")
+    _git(other.repo, "add", "remote-advance")
+    _git(other.repo, "commit", "-m", "advance")
+    _git(other.repo, "push", "origin", "HEAD:refs/heads/main")
+    before = state_path.read_bytes()
+
+    with pytest.raises(SyncError) as caught:
+        recover_session(vault, load_state(state_path), "machine-a", state_path=state_path)
+
+    assert caught.value.code == "recovery_abandon_unproven"
+    assert vault.remote_oid() != base
+    assert _git(vault.repo, "rev-parse", "HEAD") == base
+    assert inspect_remote_lock_readonly(vault).oid == lock.oid  # type: ignore[union-attr]
+    assert state_path.read_bytes() == before
+
+
+@pytest.mark.parametrize("mutation", ["dirty", "detached", "wrong_branch"])
+def test_recovery_refuses_abandoned_lock_without_exact_clean_attached_base(
+    tmp_path: Path, mutation: str,
+) -> None:
+    vault, state_path, lock, base = _abandoned_lock_at_verified_base(tmp_path)
+    if mutation == "dirty":
+        (vault.repo / "untracked").write_text("x", encoding="utf-8")
+    elif mutation == "detached":
+        _git(vault.repo, "checkout", "--detach")
+    else:
+        _git(vault.repo, "checkout", "-b", "other")
+    before = state_path.read_bytes()
+
+    with pytest.raises(SyncError) as caught:
+        recover_session(vault, load_state(state_path), "machine-a", state_path=state_path)
+
+    assert caught.value.code == "recovery_abandon_unproven"
+    assert vault.remote_oid() == base
+    assert inspect_remote_lock_readonly(vault).oid == lock.oid  # type: ignore[union-attr]
+    assert state_path.read_bytes() == before
+
+
+def test_recovery_refuses_abandoned_lock_with_invalid_base_snapshot_without_mutation(tmp_path: Path) -> None:
+    vault, _ = _vaults(tmp_path)
+    base = vault.remote_oid()
+    assert base
+    state_path = tmp_path / "state.json"
+    lock = acquire_lock(vault, "machine-a", base, state_path=state_path)
+    before = state_path.read_bytes()
+
+    with pytest.raises(SyncError) as caught:
+        recover_session(vault, load_state(state_path), "machine-a", state_path=state_path)
+
+    assert caught.value.code == "recovery_abandon_unproven"
+    assert vault.remote_oid() == base
+    assert inspect_remote_lock_readonly(vault).oid == lock.oid  # type: ignore[union-attr]
+    assert state_path.read_bytes() == before
+
+
+def test_abandoned_lock_release_delete_failure_resumes_without_changing_main(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vault, state_path, lock, base = _abandoned_lock_at_verified_base(tmp_path)
+    original = vault.runner.run
+
+    def fail_delete(*args, **kwargs):
+        if args and args[0] == "push" and len(args) > 1 and str(args[1]).startswith("--force-with-lease="):
+            return GitResult(tuple(args), "", "injected delete failure", 1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(vault.runner, "run", fail_delete)
+    with pytest.raises(SyncError) as caught:
+        recover_session(vault, load_state(state_path), "machine-a", state_path=state_path)
+    assert caught.value.code == "release_incomplete"
+    assert load_state(state_path).phase == "release_pending"
+    assert inspect_remote_lock_readonly(vault).oid == lock.oid  # type: ignore[union-attr]
+    assert vault.remote_oid() == base
+
+    monkeypatch.setattr(vault.runner, "run", original)
+    assert recover_session(vault, load_state(state_path), "machine-a", state_path=state_path) == "released"
+    assert vault.remote_oid() == base
+    assert inspect_remote_lock_readonly(vault) is None
 
 
 def test_recovery_adopts_snapshot_when_remote_already_has_exact_head(tmp_path: Path) -> None:

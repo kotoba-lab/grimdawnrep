@@ -10,6 +10,7 @@ AGENT_ENROLL_DOC = (ROOT / "docs" / "operations" / "terminal-a-agent-enroll.md")
 ROUNDTRIP_LEG1_DOC = (ROOT / "docs" / "operations" / "terminal-a-roundtrip-leg1.md").read_text(encoding="utf-8")
 ROUNDTRIP_DIAGNOSE_DOC = (ROOT / "docs" / "operations" / "terminal-a-roundtrip-diagnose.md").read_text(encoding="utf-8")
 TERMINAL_A_PRESERVE_DOC = (ROOT / "docs" / "operations" / "terminal-a-preserve-authoritative.md").read_text(encoding="utf-8")
+TERMINAL_A_RECOVERY_DOC = (ROOT / "docs" / "operations" / "terminal-a-recover-wait-exit.md").read_text(encoding="utf-8")
 
 
 def test_terminal_a_handoff_requires_explicit_safe_inputs_and_uses_distinct_machine_id() -> None:
@@ -224,5 +225,30 @@ def test_terminal_a_preserve_authoritative_runbook_is_ps51_sanitized_and_state_p
     for forbidden in (
         "--json launch", "--json recover", "--json snapshot", "--json restore",
         "--json bootstrap", " push", "Stop-Process", "Remove-Item",
+    ):
+        assert forbidden not in command
+
+
+def test_terminal_a_wait_exit_recovery_runbook_is_single_use_and_preserves_live_and_main() -> None:
+    command = TERMINAL_A_RECOVERY_DOC.split("```powershell", 1)[1].split("```", 1)[0]
+
+    assert "Windows PowerShell 5.1" in TERMINAL_A_RECOVERY_DOC
+    assert "git -C $source pull --ff-only" in command
+    assert "TERMINAL_A_RECOVERY" in command
+    assert "lock_released_live_untouched" in command
+    assert "--json recover" in command
+    assert command.count("--json recover") == 1
+    assert "$recovery.result -ne 'abandoned_lock_released'" in command
+    assert "$before.recovery_phase -ne 'lock_held'" in command
+    assert "$before.active_lock.machine_id -ne $machineId" in command
+    assert "$after.active_lock -ne $null" in command
+    assert "$after.recovery_phase -ne $null" in command
+    assert "$after.remote_commit -ne $beforeRemote" in command
+    assert "$afterDoctor.checks.save_root.manifest.root_hash -ne $beforeLiveRoot" in command
+    assert "$after.last_pushed_commit -ne $beforeRemote" in command
+    assert "ConvertTo-Json -Compress" in command
+    for forbidden in (
+        "--json launch", "--json snapshot", "--json restore", "--json bootstrap",
+        " push", "Stop-Process", "Remove-Item", "git -C $source reset",
     ):
         assert forbidden not in command

@@ -215,8 +215,12 @@ def status(config_path: Path, *, monitor: ProcessMonitor | None = None) -> dict[
             "vault_usage": _tree_usage(Path(config.vault_repo) / "save")}
 
 
-def recover(config_path: Path) -> dict[str, Any]:
-    config = load_config(config_path); vault = _vault(config); vault.preflight()
+def recover(config_path: Path, *, monitor: ProcessMonitor | None = None) -> dict[str, Any]:
+    config = load_config(config_path)
+    # Recovery can delete a remote session lock; require the same complete,
+    # stopped process view as every other mutating save operation.
+    _process_preflight(config, monitor)
+    vault = _vault(config); vault.preflight()
     state = load_state(_state_path(config_path))
     result = recover_session(vault, state, config.machine_id, state_path=_state_path(config_path))
     return {"schema_version":"1.0.0", "command":"recover", "result":result}

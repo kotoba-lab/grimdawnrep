@@ -415,6 +415,58 @@ def _adopt_verified_snapshot_head(
     return adopted
 
 
+def _release_abandoned_lock_held_session(
+    vault: GitVault,
+    state: SyncState,
+    lock: Lock,
+    remote_main: str | None,
+    *,
+    state_path: Path,
+) -> str:
+    """Release a lock acquired before any snapshot transaction began.
+
+    This is deliberately narrower than ordinary recovery.  It verifies the
+    remote base snapshot before using it as the applied baseline: a live save
+    may have changed after a launcher failure, but the verified base remains
+    the correct *last applied* point for a later three-way reconciliation.
+    """
+    if (
+        state.phase != "lock_held"
+        or state.local_commit is not None
+        or state.pushed_commit is not None
+        or remote_main != state.base_commit
+    ):
+        _fail("recovery_abandon_unproven", "The abandoned lock has commit activity or a changed remote.")
+    status = vault.runner.run("status", "--porcelain=v1", "--untracked-files=all", check=False)
+    branch = vault.runner.run("symbolic-ref", "--quiet", "HEAD", check=False)
+    head = vault.runner.run("rev-parse", "--verify", "--quiet", "HEAD", check=False).stdout.strip()
+    if (
+        status.returncode
+        or status.stdout
+        or branch.returncode
+        or branch.stdout.strip() != f"refs/heads/{vault.branch}"
+        or head != state.base_commit
+    ):
+        _fail("recovery_abandon_unproven", "The local vault is not exactly at the lock base.")
+
+    try:
+        manifest = vault.validate_commit_snapshot(state.base_commit)
+    except SyncError as error:
+        raise SyncError(
+            "recovery_abandon_unproven",
+            "The lock base is not a valid remote snapshot.",
+            EXIT_CONFLICT,
+        ) from error
+    release_lock(
+        vault,
+        lock,
+        state.base_commit,
+        state_path=state_path,
+        confirmed_root_hash=manifest["root_hash"],
+    )
+    return "abandoned_lock_released"
+
+
 def recover_session(vault: GitVault, state: SyncState, machine_id: str, *, state_path: Path | None = None) -> str:
     """Recover only an exactly matching local session; otherwise make no change."""
     if state_path is None: _fail("state_required", "Recovery requires terminal-local state.", EXIT_RECOVERY_REQUIRED)
@@ -444,6 +496,15 @@ def recover_session(vault: GitVault, state: SyncState, machine_id: str, *, state
     lock = inspect_remote_lock_readonly(vault)
     if lock is None or remote != state.lock_oid or lock.session != local_session: _fail("recovery_lock_mismatch", "Remote lock belongs to another session.")
     if state.phase == "lock_held" and state.local_commit is None:
+        # A clean vault still at the base proves that no snapshot commit was
+        # started.  This is the only case in which a failed launch may abandon
+        # its lock without changing main or adopting a commit.
+        head = vault.runner.run("rev-parse", "--verify", "--quiet", "HEAD", check=False).stdout.strip()
+        if head == state.base_commit:
+            return _release_abandoned_lock_held_session(
+                vault, state, Lock(lock.session, remote, state.local_tag), main,
+                state_path=state_path,
+            )
         state = _adopt_verified_snapshot_head(vault, state, main, state_path=state_path)
     if state.local_commit and not state.pushed_commit:
         if main == state.base_commit:

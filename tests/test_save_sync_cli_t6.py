@@ -316,6 +316,41 @@ class _Monitor:
     def scan(self) -> ProcessScan: return self.scan_value
 
 
+@pytest.mark.parametrize(
+    "scan,code",
+    [
+        (ProcessScan((), complete=False), "process_scan_incomplete"),
+        (ProcessScan((ProcessInfo(1, "Grim Dawn.exe", None, None),)), "game_already_running"),
+    ],
+)
+def test_recover_refuses_incomplete_or_active_process_view_before_vault_or_session(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, scan: ProcessScan, code: str,
+) -> None:
+    config = SimpleNamespace(machine_id="t6", game_process_names=("Grim Dawn.exe",))
+    calls: list[str] = []
+    monkeypatch.setattr(cli, "load_config", lambda _: config)
+    monkeypatch.setattr(cli, "_vault", lambda _: calls.append("vault") or pytest.fail("must not create vault"))
+    monkeypatch.setattr(cli, "recover_session", lambda *_a, **_k: calls.append("recover"))
+    with pytest.raises(SyncError) as caught:
+        cli.recover(tmp_path / "config.local.json", monitor=_Monitor(scan))
+    assert caught.value.code == code
+    assert calls == []
+
+
+def test_recover_calls_session_only_after_clear_complete_process_view(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    config = SimpleNamespace(machine_id="t6", game_process_names=("Grim Dawn.exe",))
+    calls: list[str] = []
+    vault = SimpleNamespace(preflight=lambda: calls.append("preflight"))
+    monkeypatch.setattr(cli, "load_config", lambda _: config)
+    monkeypatch.setattr(cli, "_vault", lambda _: vault)
+    monkeypatch.setattr(cli, "load_state", lambda _: "state")
+    monkeypatch.setattr(cli, "recover_session", lambda *_a, **_k: calls.append("recover") or "released")
+    assert cli.recover(tmp_path / "config.local.json", monitor=_Monitor(ProcessScan(())))["result"] == "released"
+    assert calls == ["preflight", "recover"]
+
+
 @pytest.mark.parametrize("scan", [
     ProcessScan((), complete=False),
     ProcessScan((ProcessInfo(1, "Grim Dawn.exe", None, None),)),
