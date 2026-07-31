@@ -21,7 +21,7 @@ from grim_dawn_sync.manifest import _reject_unsafe, build_manifest, stable_manif
 from grim_dawn_sync.session_lock import acquire_lock, release_lock
 from grim_dawn_sync.snapshot import _copy_verified, _manifest, apply_restore, archive_before_restore, plan_restore
 from grim_dawn_sync.state import SyncState, load_state, save_state
-from grim_dawn_sync.validation import validate_players
+from grim_dawn_sync.validation import destructive_change, validate_players
 
 
 class WorkflowState(str, Enum):
@@ -115,8 +115,18 @@ class DomainAdapters:
     def validate(self, manifest: dict, baseline: dict | None = None) -> dict:
         result=validate_players(self.config.save_root,manifest)
         if not result.get("ok"): raise SyncError(result.get("classification","save_invalid"),"Save validation did not permit snapshot.",EXIT_VALIDATION)
-        if baseline and (manifest["character_count"] < baseline["character_count"] or manifest["file_count"] < baseline["file_count"] or manifest["total_bytes"] < baseline["total_bytes"]):
-            self.quarantine(manifest); raise SyncError("destructive_change","Save became smaller than its launch baseline; it was quarantined.",EXIT_VALIDATION)
+        # Grim Dawn can legitimately rewrite the same save files to a slightly
+        # smaller encoding.  Keep blocking structural loss, but do not treat a
+        # total-byte decrease by itself as proof that save data was deleted.
+        if baseline:
+            change = destructive_change(baseline, manifest)
+            structural_loss = {
+                "character_count_decreased",
+                "player_gdc_missing",
+                "files_removed",
+            }
+            if structural_loss.intersection(change["reasons"]):
+                self.quarantine(manifest); raise SyncError("destructive_change","Save lost characters or files from its launch baseline; it was quarantined.",EXIT_VALIDATION)
         return manifest
     def _unique_destination(self, category: str, manifest: dict) -> Path:
         # mkdir("x") is performed by _copy_verified; UUID avoids every prior run.

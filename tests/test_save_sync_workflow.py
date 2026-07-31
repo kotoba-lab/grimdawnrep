@@ -118,6 +118,50 @@ def test_domain_snapshot_binds_the_exact_validated_manifest(tmp_path: Path) -> N
     assert captured["expected_manifest"] is manifest
 
 
+def test_domain_validate_allows_only_total_bytes_to_decrease(tmp_path: Path) -> None:
+    subject = DomainAdapters(config(tmp_path), tmp_path / "local")
+    baseline = {
+        "files": [{"path": "world/data", "size": 10, "sha256": "a" * 64}],
+        "character_count": 0,
+        "file_count": 1,
+        "total_bytes": 10,
+    }
+    current = {
+        "files": [{"path": "world/data", "size": 9, "sha256": "b" * 64}],
+        "character_count": 0,
+        "file_count": 1,
+        "total_bytes": 9,
+    }
+
+    assert subject.validate(current, baseline) is current
+
+
+def test_domain_validate_blocks_removed_file_even_when_count_is_unchanged(
+    tmp_path: Path,
+) -> None:
+    subject = DomainAdapters(config(tmp_path), tmp_path / "local")
+    baseline = {
+        "files": [{"path": "world/old", "size": 5, "sha256": "a" * 64}],
+        "character_count": 0,
+        "file_count": 1,
+        "total_bytes": 5,
+    }
+    current = {
+        "files": [{"path": "world/new", "size": 5, "sha256": "b" * 64}],
+        "character_count": 0,
+        "file_count": 1,
+        "total_bytes": 5,
+    }
+    quarantined: list[dict] = []
+    subject.quarantine = quarantined.append
+
+    with pytest.raises(SyncError) as caught:
+        subject.validate(current, baseline)
+
+    assert caught.value.code == "destructive_change"
+    assert quarantined == [current]
+
+
 def test_destination_root_rejects_mocked_reparse_ancestor_before_mkdir(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
