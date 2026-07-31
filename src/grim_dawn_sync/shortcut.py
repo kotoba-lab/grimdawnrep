@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+from dataclasses import dataclass
 from pathlib import Path
 import stat
 import subprocess
@@ -12,6 +13,7 @@ from grim_dawn_sync.errors import EXIT_CONFIGURATION, SyncError
 
 
 SHORTCUT_NAME = "Grim Dawn (DPYes + Save Sync).lnk"
+SELECTION_SHORTCUT_NAME = "Grim Dawn (DPYes + Save Selection).lnk"
 LEGACY_SHORTCUT_NAME = "Grim Dawn (DPYes).lnk"
 _REPARSE_POINT = 0x400
 
@@ -79,6 +81,28 @@ def _launch_arguments(source_root: Path, config_path: Path) -> str:
 
 
 class ShortcutAdapter:
+    def inspect(self, source: Path) -> "ShortcutShape":
+        escaped_source = str(source).replace("'", "''")
+        script = (
+            "$ErrorActionPreference='Stop';$s=New-Object -ComObject WScript.Shell;"
+            f"$l=$s.CreateShortcut('{escaped_source}');"
+            "$e=[Text.Encoding]::UTF8;$b={param($v)[Convert]::ToBase64String($e.GetBytes([string]$v))};"
+            "Write-Output ((& $b $l.TargetPath)+'|'+(& $b $l.Arguments)+'|'+(& $b $l.WorkingDirectory))"
+        )
+        try:
+            result = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+                                    check=False, capture_output=True, timeout=20)
+            raw = result.stdout.decode("ascii").strip().splitlines()
+            if result.returncode or len(raw) != 1:
+                raise ValueError
+            fields = raw[0].split("|")
+            if len(fields) != 3:
+                raise ValueError
+            values = [base64.b64decode(value, validate=True).decode("utf-8") for value in fields]
+            return ShortcutShape(*values)
+        except (OSError, subprocess.SubprocessError, ValueError, UnicodeError) as error:
+            raise SyncError("shortcut_unavailable", "Windows shortcut could not be inspected safely.", EXIT_CONFIGURATION) from error
+
     def create(self, destination: Path, target: str, arguments: str, working_directory: str) -> None:
         _assert_destination_absent(destination)
         try:
@@ -110,6 +134,26 @@ class ShortcutAdapter:
             raise SyncError("shortcut_unavailable", "Windows shortcut support is unavailable.", EXIT_CONFIGURATION) from error
 
 
+@dataclass(frozen=True)
+class ShortcutShape:
+    target: str
+    arguments: str
+    working_directory: str
+
+
+def inspect_shortcut(path: Path, *, adapter: ShortcutAdapter | None = None) -> ShortcutShape:
+    safe = _safe_existing(path, directory=False, label="shortcut")
+    return (adapter or ShortcutAdapter()).inspect(safe)
+
+
+def shortcut_matches(shape: ShortcutShape, *, target: Path, source_root: Path, config_path: Path) -> bool:
+    return (
+        Path(shape.target).absolute() == Path(target).absolute()
+        and Path(shape.working_directory).absolute() == Path(source_root).absolute()
+        and shape.arguments == _launch_arguments(source_root, config_path)
+    )
+
+
 def install_shortcut(
     desktop: Path,
     *,
@@ -133,3 +177,30 @@ def install_shortcut(
     _assert_destination_absent(destination)
     (adapter or ShortcutAdapter()).create(destination, str(safe_target), _launch_arguments(safe_root, safe_config), str(safe_root))
     return destination
+
+
+def migrate_shortcut(
+    desktop: Path, *, config_path: Path, source_root: Path | None = None,
+    adapter: ShortcutAdapter | None = None, executable: str | None = None,
+) -> tuple[Path, bool | None]:
+    """Create a new selection shortcut atomically while retaining the old one."""
+    actual = adapter or ShortcutAdapter()
+    safe_desktop = _safe_existing(Path(desktop), directory=True, label="desktop")
+    safe_config = _safe_existing(Path(config_path), directory=False, label="configuration")
+    load_config(safe_config)
+    root = Path(source_root) if source_root is not None else Path(__file__).resolve().parents[1]
+    safe_root = _safe_existing(root, directory=True, label="source root")
+    target = _safe_existing(Path(executable) if executable is not None else Path(sys.executable), directory=False, label="Python executable")
+    old = safe_desktop / SHORTCUT_NAME
+    old_current: bool | None = None
+    try:
+        old.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        old_current = shortcut_matches(inspect_shortcut(old, adapter=actual), target=target,
+                                       source_root=safe_root, config_path=safe_config)
+    destination = safe_desktop / SELECTION_SHORTCUT_NAME
+    _assert_destination_absent(destination)
+    actual.create(destination, str(target), _launch_arguments(safe_root, safe_config), str(safe_root))
+    return destination, old_current

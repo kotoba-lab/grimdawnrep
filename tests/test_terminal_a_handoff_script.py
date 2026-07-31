@@ -115,7 +115,9 @@ def test_terminal_a_roundtrip_leg1_runbook_is_a_sanitized_ps51_launch_boundary()
     assert "Windows PowerShell 5.1" in ROUNDTRIP_LEG1_DOC
     assert "git -C $source pull --ff-only" in ROUNDTRIP_LEG1_DOC
     assert "python -m grim_dawn_sync" in ROUNDTRIP_LEG1_DOC
-    assert "--json launch" in ROUNDTRIP_LEG1_DOC
+    assert "--config $config launch" in ROUNDTRIP_LEG1_DOC
+    assert "--json launch" not in ROUNDTRIP_LEG1_DOC
+    assert "Sync destination latest" in ROUNDTRIP_LEG1_DOC
     assert "TERMINAL_A_ROUNDTRIP" in ROUNDTRIP_LEG1_DOC
     assert "launch_complete" in ROUNDTRIP_LEG1_DOC
     assert "Report exactly one JSON line" in ROUNDTRIP_LEG1_DOC
@@ -133,9 +135,8 @@ def test_terminal_a_roundtrip_leg1_runbook_validates_both_status_boundaries_with
     assert "^[0-9a-f]{40}(?:[0-9a-f]{24})?$" in ROUNDTRIP_LEG1_DOC
     assert "*> $null" in command
     assert "@($output) -join [Environment]::NewLine" in command
-    assert "@($launchOutput) -join [Environment]::NewLine" in command
     assert "$status.schema_version -ne '1.0.0' -or $status.command -ne 'status'" in command
-    assert "$launch.schema_version -ne '1.0.0' -or $launch.command -ne 'launch'" in command
+    assert "$after.last_pushed_commit -ne $after.remote_commit" in command
     assert "Where-Object" not in command
     for forbidden in (" recover", " bootstrap", " snapshot", " restore", " reset", " rebase", " force", "Stop-Process"):
         assert forbidden not in command
@@ -156,7 +157,7 @@ def test_terminal_a_roundtrip_leg1_accepts_only_the_expected_stale_a_boundary() 
     assert "$before.last_pushed_commit -match '^[0-9a-f]{40}(?:[0-9a-f]{24})?$'" in ROUNDTRIP_LEG1_DOC
     assert "$before.last_pushed_commit -eq $before.remote_commit" in ROUNDTRIP_LEG1_DOC
     assert "preflight_remote_state_inconsistent" in ROUNDTRIP_LEG1_DOC
-    assert "launch workflow itself performs the authoritative fetch and reconciliation" in ROUNDTRIP_LEG1_DOC
+    assert "A differing save is never auto-approved by JSON automation" in ROUNDTRIP_LEG1_DOC
 
 
 def test_terminal_a_roundtrip_leg1_requires_known_b_save_property_before_a_change() -> None:
@@ -297,18 +298,18 @@ def test_terminal_a_roundtrip_return_runbook_requires_stale_unchanged_a_and_veri
     assert "TERMINAL_A_ROUNDTRIP" in command
     assert "A_RETURN" in command
     assert "roundtrip_complete" in command
-    assert command.count("--json launch") == 1
+    assert command.count("--config $config launch") == 1
+    assert "--json launch" not in command
+    assert "Sync destination latest" in TERMINAL_A_ROUNDTRIP_RETURN_DOC
     assert command.count("--json restore") == 1
     assert "Get-RestoreOrThrow 'pre' $oldBaseline" in command
-    assert "Get-RestoreOrThrow 'post' $launch.result.commit" in command
+    assert "Get-RestoreOrThrow 'post' $after.remote_commit" in command
     assert "$before.readiness -ne 'blocked'" in command
     assert "$before.vault_relation -ne 'remote_changed_or_unknown'" in command
     assert "$before.remote_commit -eq $before.last_pushed_commit" in command
     assert "$oldRestore.root_hash -ne $beforeLiveRoot" in command
-    assert "$launch.result.commit -eq $beforeRemote" in command
     assert "$after.remote_commit -eq $beforeRemote" in command
-    assert "$after.remote_commit -ne $launch.result.commit" in command
-    assert "$after.last_pushed_commit -ne $launch.result.commit" in command
+    assert "$after.last_pushed_commit -ne $after.remote_commit" in command
     assert "$newRestore.root_hash -ne $afterLiveRoot" in command
     assert "ConvertTo-Json -Compress" in command
     for forbidden in (

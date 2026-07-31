@@ -8,8 +8,9 @@ publish the normal post-exit result.
 
 ## Required user coordination
 
-Tell the user that the block opens DPYes/Grim Dawn once.  When it opens, check
-that the expected current save is present, then exit both applications
+Tell the user that the block first opens the save-selection window. Select
+**Sync destination latest**, choose **Launch with this data**, and do not choose
+a history or bookmark version. When DPYes/Grim Dawn opens, check that the expected current save is present, then exit both applications
 normally.  No additional play or deliberate save change is needed.  Do not
 start another game instance.  The command waits for the normal exit and save
 stabilization before it returns.
@@ -40,8 +41,8 @@ $allowedCodes = @(
     'pre_status_failed', 'pre_status_parse_failed', 'pre_status_shape_invalid',
     'pre_doctor_failed', 'pre_doctor_parse_failed', 'pre_doctor_shape_invalid',
     'pre_restore_failed', 'pre_restore_parse_failed', 'pre_restore_shape_invalid',
-    'preconditions_changed', 'launch_failed', 'launch_parse_failed',
-    'launch_shape_invalid', 'post_status_failed', 'post_status_parse_failed',
+    'preconditions_changed', 'launch_failed',
+    'post_status_failed', 'post_status_parse_failed',
     'post_status_shape_invalid', 'post_doctor_failed', 'post_doctor_parse_failed',
     'post_doctor_shape_invalid', 'post_game_process_check_failed', 'post_game_still_running', 'post_restore_failed', 'post_restore_parse_failed',
     'post_restore_shape_invalid', 'postconditions_changed', 'unexpected_failed'
@@ -95,18 +96,15 @@ function Get-RestoreOrThrow([string]$Prefix, [string]$Commit) {
 }
 
 function Invoke-LaunchOnceOrThrow {
-    $output = @(& $python -m grim_dawn_sync --config $config --json launch 2>$null)
-    $exitCode = $LASTEXITCODE; $raw = @($output) -join [Environment]::NewLine
-    if ($exitCode -ne 0 -or -not $raw) { throw 'launch_failed' }
-    try { $value = $raw | ConvertFrom-Json -ErrorAction Stop } catch { throw 'launch_parse_failed' }
-    if ($value.schema_version -ne '1.0.0' -or $value.command -ne 'launch' -or $value.result.state -ne 'COMPLETE' -or
-        $value.result.commit -notmatch '^[0-9a-f]{40}(?:[0-9a-f]{24})?$') { throw 'launch_shape_invalid' }
-    return $value
+    $output = @(& $python -m grim_dawn_sync --config $config launch 2>$null)
+    if ($LASTEXITCODE -ne 0) { throw 'launch_failed' }
 }
 
 $resultStatus = 'blocked'; $resultCode = 'unexpected_failed'
 try {
     if (-not (Test-Path -LiteralPath $source -PathType Container)) { throw 'source_update_failed' }
+    $checkout = (& git -C $source rev-parse --show-toplevel 2>$null).Trim()
+    if ($LASTEXITCODE -ne 0 -or [IO.Path]::GetFullPath($checkout) -ne [IO.Path]::GetFullPath($source)) { throw 'source_update_failed' }
     & git -C $source pull --ff-only *> $null
     if ($LASTEXITCODE -ne 0) { throw 'source_update_failed' }
     if (-not (Test-Path -LiteralPath $python -PathType Leaf) -or -not (Test-Path -LiteralPath $config -PathType Leaf)) {
@@ -130,8 +128,7 @@ try {
     $oldRestore = Get-RestoreOrThrow 'pre' $oldBaseline
     if ($oldRestore.root_hash -ne $beforeLiveRoot) { throw 'preconditions_changed' }
 
-    $launch = Invoke-LaunchOnceOrThrow
-    if ($launch.result.commit -eq $beforeRemote) { throw 'launch_shape_invalid' }
+    Invoke-LaunchOnceOrThrow
 
     $after = Get-StatusOrThrow 'post'
     # DPYes can outlive the game's process briefly.  Its post-exit presence is
@@ -140,12 +137,12 @@ try {
     Assert-GrimDawnNotRunning 'post'
     if ($after.processes.status -notin @('clear', 'running') -or $after.processes.complete -ne $true -or
         $after.active_lock -ne $null -or $after.recovery_phase -ne $null -or $after.readiness -ne 'ready' -or
-        $after.vault_relation -ne 'equal' -or $after.remote_commit -ne $launch.result.commit -or
-        $after.last_pushed_commit -ne $launch.result.commit -or $after.remote_commit -eq $beforeRemote) {
+        $after.vault_relation -ne 'equal' -or $after.last_pushed_commit -ne $after.remote_commit -or
+        $after.remote_commit -eq $beforeRemote) {
         throw 'postconditions_changed'
     }
     $afterLiveRoot = [string]$afterDoctor.checks.save_root.manifest.root_hash
-    $newRestore = Get-RestoreOrThrow 'post' $launch.result.commit
+    $newRestore = Get-RestoreOrThrow 'post' $after.remote_commit
     if ($newRestore.root_hash -ne $afterLiveRoot) { throw 'postconditions_changed' }
 
     $resultStatus = 'complete'; $resultCode = 'roundtrip_complete'

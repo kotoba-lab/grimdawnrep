@@ -18,6 +18,10 @@ def test_parser_exposes_full_t6_command_contract() -> None:
     assert parser.parse_args(["recover"]).command == "recover"
     assert parser.parse_args(["snapshot"]).command == "snapshot"
     assert parser.parse_args(["launch"]).command == "launch"
+    launch = parser.parse_args(["launch", "--select", "auto-safe"])
+    assert launch.select == "auto-safe" and launch.catalog_token is None
+    assert parser.parse_args(["launch", "--select", "x", "--confirm"]).confirm is True
+    assert parser.parse_args(["promote", "--apply"]).apply is True
     assert parser.parse_args(["restore", "--commit", "deadbeef"]).apply is False
     assert parser.parse_args(["restore", "--commit", "deadbeef", "--apply"]).apply is True
     assert parser.parse_args(["restore", "--commit", "deadbeef", "--drill"]).drill is True
@@ -361,15 +365,12 @@ def test_launch_and_shortcut_apply_are_explicit_and_dry_run_does_nothing(monkeyp
     assert calls == [(tmp_path / "Desktop", cli.default_config_path())]
     capsys.readouterr()
 
-    config = object()
-    monkeypatch.setattr(cli, "load_config", lambda _: config)
-    class FakeLaunch:
-        def __init__(self, got_config: object, root: Path) -> None: calls.extend([got_config, root])
-        def run(self) -> dict[str, str]: return {"phase": "complete"}
-    monkeypatch.setattr(cli, "LaunchWorkflow", FakeLaunch)
+    monkeypatch.setattr(cli, "launch", lambda path, **kwargs: calls.append((path, kwargs)) or {
+        "schema_version": "1.0.0", "command": "launch", "result": {"phase": "complete"},
+    })
     assert cli.main(["--config", str(config_path), "--json", "launch"]) == 0
     assert json.loads(capsys.readouterr().out)["result"] == {"phase": "complete"}
-    assert calls[-2:] == [config, tmp_path]
+    assert calls[-1] == (config_path, {"as_json": True, "selected": None, "catalog_token": None, "confirmed": False})
 
 
 @pytest.mark.parametrize(("error", "expected"), [
@@ -420,15 +421,21 @@ def test_recover_refuses_incomplete_or_active_process_view_before_vault_or_sessi
 def test_recover_calls_session_only_after_clear_complete_process_view(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
-    config = SimpleNamespace(machine_id="t6", game_process_names=("Grim Dawn.exe",))
+    config = SimpleNamespace(machine_id="t6", game_process_names=("Grim Dawn.exe",), remote="origin")
+    config.public_dict = lambda: {"machine_id": "t6", "remote": "origin"}
     calls: list[str] = []
-    vault = SimpleNamespace(preflight=lambda: calls.append("preflight"))
+    vault = SimpleNamespace(
+        preflight=lambda: calls.append("preflight"),
+        bind_remote_identity=lambda identity: calls.append(f"bind:{identity[0]}"),
+        assert_remote_identity=lambda: calls.append("identity"),
+    )
     monkeypatch.setattr(cli, "load_config", lambda _: config)
     monkeypatch.setattr(cli, "_vault", lambda _: vault)
+    monkeypatch.setattr(cli, "read_remote_identity", lambda _vault, _remote: ("test://vault", "test://vault"))
     monkeypatch.setattr(cli, "load_state", lambda _: "state")
     monkeypatch.setattr(cli, "recover_session", lambda *_a, **_k: calls.append("recover") or "released")
     assert cli.recover(tmp_path / "config.local.json", monitor=_Monitor(ProcessScan(())))["result"] == "released"
-    assert calls == ["preflight", "recover"]
+    assert calls == ["preflight", "bind:test://vault", "identity", "recover"]
 
 
 @pytest.mark.parametrize("scan", [

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -18,7 +19,7 @@ from grim_dawn_sync.errors import EXIT_OK, SyncError
 from grim_dawn_sync.manifest import stable_manifest
 from grim_dawn_sync.discovery import cloud_candidates, game_candidates, inspect_path
 from grim_dawn_sync.workflow import LaunchWorkflow
-from grim_dawn_sync.shortcut import install_shortcut
+from grim_dawn_sync.shortcut import install_shortcut, migrate_shortcut
 from grim_dawn_sync.git_vault import GitVault
 from grim_dawn_sync.session_lock import (
     acquire_lock,
@@ -33,6 +34,23 @@ from grim_dawn_sync.snapshot import _copy_verified, restore_from_directory
 from grim_dawn_sync.state import SyncState, load_state, save_state
 from grim_dawn_sync.process_monitor import ProcessMonitor, WindowsProcessMonitor
 from grim_dawn_sync.validation import validate_players
+from grim_dawn_sync.version_catalog import VersionCatalogBuilder
+from grim_dawn_sync.bookmarks import create_bookmark, create_live_bookmark_locked, make_bookmark_annotation
+from grim_dawn_sync.selection import (
+    CancelledSelection,
+    ReconcileCase,
+    SelectionDirective,
+    SelectionRegistry,
+    classify_reconciliation,
+    selection_policy,
+)
+from grim_dawn_sync.selector_ui import (
+    SelectionPresenter,
+    SelectionRequest,
+    TkSelectionPresenter,
+    build_plan_from_request,
+)
+from grim_dawn_sync.catalog_capability import context_digest, issue_capability, read_remote_identity, safety_projection, verify_capability
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -54,9 +72,25 @@ def build_parser() -> argparse.ArgumentParser:
     bootstrap.add_argument("--source-cloud", type=Path, required=True); bootstrap.add_argument("--apply", action="store_true")
     enroll = subparsers.add_parser("enroll", aliases=["join"], help="adopt the current remote snapshot on a new terminal")
     enroll.add_argument("--apply", action="store_true")
-    subparsers.add_parser("launch", help="run the synchronized DPYes launch workflow")
+    launch_parser = subparsers.add_parser("launch", help="select a verified save and run the synchronized DPYes launch workflow")
+    launch_parser.add_argument("--select", help="auto-safe or an opaque candidate ID")
+    launch_parser.add_argument("--catalog-token", help="short-lived catalog capability for --select")
+    launch_parser.add_argument("--confirm", action="store_true", help="second confirmation for a history/bookmark selection")
+    subparsers.add_parser("versions", help="list verified save-version candidates")
+    bookmark_parser = subparsers.add_parser("bookmark", help="create a named immutable bookmark")
+    bookmark_parser.add_argument("--candidate", required=True)
+    bookmark_parser.add_argument("--catalog-token")
+    bookmark_parser.add_argument("--name", required=True)
+    bookmark_parser.add_argument("--note")
+    bookmark_parser.add_argument("--apply", action="store_true")
+    promote_parser = subparsers.add_parser("promote", help="make an explicitly selected save the remote latest without launching")
+    promote_parser.add_argument("--candidate")
+    promote_parser.add_argument("--catalog-token")
+    promote_parser.add_argument("--apply", action="store_true")
     shortcut = subparsers.add_parser("install-shortcut", help="create the Save Sync desktop shortcut")
     shortcut.add_argument("--apply", action="store_true")
+    migrate = subparsers.add_parser("migrate-shortcut", help="inspect the old shortcut and create the selection shortcut without replacement")
+    migrate.add_argument("--apply", action="store_true")
     return parser
 
 
@@ -137,6 +171,315 @@ def _render(payload: dict[str, Any], *, as_json: bool) -> str:
 
 def _vault(config) -> GitVault:
     return GitVault(config.vault_repo, remote=config.remote, branch=config.branch)
+
+
+def versions(config_path: Path) -> dict[str, Any]:
+    config = load_config(config_path)
+    _, catalog, _, _ = _fresh_catalog(config_path, config)
+    selectable = [
+        catalog.candidate(candidate_id)
+        for item in catalog.candidates
+        for candidate_id in (item.candidate_id, *(alias.candidate_id for alias in item.aliases))
+    ]
+    return {"schema_version": "1.0.0", "command": "versions", "catalog_token": catalog.token,
+            "candidates": [{"candidate_id": item.candidate_id, "kind": item.kind,
+                            "file_count": item.file_count, "character_count": item.character_count,
+                            "total_bytes": item.total_bytes,
+                            "diff": {"added": item.diff_from_live.added, "removed": item.diff_from_live.removed, "changed": item.diff_from_live.changed}}
+                           for item in selectable]}
+
+
+def bookmark(config_path: Path, candidate_id: str, name: str, note: str | None, *, apply: bool,
+             catalog_token: str | None = None) -> dict[str, Any]:
+    config = load_config(config_path)
+    make_bookmark_annotation(name, note, created_by=config.machine_id)
+    if catalog_token is None:
+        raise SyncError("catalog_token_required", "Bookmark validation requires a current catalog capability.", 3)
+    vault, catalog, state, projection = _fresh_catalog(config_path, config, supplied_token=catalog_token)
+    candidate = catalog.candidate(candidate_id)
+    if not apply:
+        return {"schema_version": "1.0.0", "command": "bookmark", "dry_run": True, "verified": True}
+    _assert_capability_boundary(config_path, config, state, catalog, projection)
+    vault.bind_remote_identity((str(projection["config"]["remote_fetch_url"]), str(projection["config"]["remote_push_url"])))
+    if candidate.commit is None:
+        manifest = stable_manifest(
+            config.save_root, machine_id=config.machine_id,
+            retries=config.stable_scan_retries, window_seconds=config.stable_window_seconds,
+        )
+        if manifest.get("root_hash") != candidate.root_hash or catalog.remote_head is None:
+            raise SyncError("selection_stale", "Live bookmark candidate changed before execution.", 3)
+
+        def before_lock() -> None:
+            _assert_capability_boundary(config_path, config, state, catalog, projection)
+
+        def after_lock() -> None:
+            _process_preflight(config)
+            if load_config(config_path).public_dict() != config.public_dict():
+                raise SyncError("catalog_context_changed", "Configuration changed during bookmark creation.", 3)
+
+        create_live_bookmark_locked(
+            vault, config.save_root, manifest,
+            state_path=_state_path(config_path), expected_remote_head=catalog.remote_head,
+            display_name=name, note=note, created_by=config.machine_id,
+            retries=config.stable_scan_retries, window_seconds=config.stable_window_seconds,
+            validator=validate_players, before_lock=before_lock, after_lock=after_lock,
+        )
+    else:
+        create_bookmark(vault, candidate.commit, display_name=name, note=note, created_by=config.machine_id)
+    return {"schema_version": "1.0.0", "command": "bookmark", "dry_run": False, "created": True}
+
+
+def _capture_catalog(config_path: Path, expected_config: Any) -> tuple[GitVault, Any, SyncState, dict[str, Any]]:
+    _process_preflight(expected_config)
+    current_config = load_config(config_path)
+    if current_config.public_dict() != expected_config.public_dict():
+        raise SyncError("catalog_context_changed", "Configuration changed while versions were scanned.", 3)
+    state = load_state(_state_path(config_path))
+    if state.phase is not None:
+        raise SyncError("recovery_required", "Recovery state exists; run recover before selecting a save.", 6)
+    vault = _vault(current_config)
+    if inspect_remote_lock_readonly(vault) is not None:
+        raise SyncError("lock_held", "Another save-sync session is active; no selection was made.", 3)
+    catalog = VersionCatalogBuilder(
+        vault, current_config.save_root, machine_id=current_config.machine_id,
+        retries=current_config.stable_scan_retries, window_seconds=current_config.stable_window_seconds,
+        baseline_root_hash=state.last_applied_manifest_root_hash,
+    ).build()
+    remote_identity = read_remote_identity(vault, current_config.remote)
+    # Close the scan around config/state/lock/process too, so the catalog can
+    # never be issued from a hybrid of values observed on opposite sides of I/O.
+    _process_preflight(expected_config)
+    after_config = load_config(config_path)
+    after_state = load_state(_state_path(config_path))
+    if (
+        after_config.public_dict() != current_config.public_dict()
+        or after_state.as_dict() != state.as_dict()
+        or inspect_remote_lock_readonly(vault) is not None
+    ):
+        raise SyncError("catalog_context_changed", "Save selection context changed during verification; reload versions.", 3)
+    if read_remote_identity(vault, current_config.remote) != remote_identity:
+        raise SyncError("catalog_context_changed", "Remote identity changed during verification; reload versions.", 3)
+    projection = safety_projection(current_config, state, catalog, remote_identity=remote_identity)
+    return vault, catalog, state, projection
+
+
+def _fresh_catalog(config_path: Path, config: Any, *, supplied_token: str | None = None) -> tuple[GitVault, Any, SyncState, dict[str, Any]]:
+    """Double-scan every safety input before issuing or consuming a capability."""
+    _, _, _, first = _capture_catalog(config_path, config)
+    vault, catalog, state, second = _capture_catalog(config_path, config)
+    if first != second:
+        raise SyncError("catalog_context_changed", "Save selection context changed during verification; reload versions.", 3)
+    token = issue_capability(second)
+    if supplied_token is not None:
+        verify_capability(supplied_token, second)
+        token = supplied_token
+    catalog = replace(catalog, token=token)
+    return vault, catalog, state, second
+
+
+def _assert_capability_boundary(config_path: Path, config: Any, state: SyncState, catalog: Any,
+                                projection: dict[str, Any]) -> None:
+    """Rebind state/config immediately before the workflow's atomic lock race."""
+    current_config = load_config(config_path)
+    current_state = load_state(_state_path(config_path))
+    if current_config.public_dict() != config.public_dict() or current_state.as_dict() != state.as_dict():
+        raise SyncError("catalog_context_changed", "Selection context changed before execution; reload versions.", 3)
+    verify_capability(catalog.token, projection)
+
+
+def _selection_case(config_path: Path, catalog: Any, vault: GitVault) -> ReconcileCase:
+    if catalog.remote_head is None:
+        raise SyncError("remote_main_missing", "Remote main is missing; run bootstrap first.", 3)
+    try:
+        state = load_state(_state_path(config_path))
+    except SyncError as error:
+        if error.code == "state_missing":
+            raise SyncError("bootstrap_required", "No applied baseline exists; run bootstrap before launch.", 3) from None
+        raise
+    remote = vault.validate_commit_snapshot(catalog.remote_head)
+    case = classify_reconciliation(
+        live_root_hash=catalog.live_root_hash,
+        remote_root_hash=remote.get("root_hash"),
+        baseline_root_hash=state.last_applied_manifest_root_hash,
+    )
+    if case == ReconcileCase.BASELINE_MISSING:
+        raise SyncError("bootstrap_required", "No applied baseline exists; run bootstrap before launch.", 3)
+    return case
+
+
+def _registry_for_catalog(catalog: Any) -> SelectionRegistry:
+    # VersionCatalogBuilder has already verified managed and legacy tag targets.
+    # Resolve every provenance ID through the catalog itself.  Coalesced
+    # bookmark/legacy aliases are reconstructed canonical candidates and are
+    # not equal to their root representative object.
+    authorized_ids = {
+        item.candidate_id
+        for representative in catalog.candidates
+        for item in (representative, *(catalog.candidate(alias.candidate_id) for alias in representative.aliases))
+    }
+    verified = {candidate_id: catalog.candidate(candidate_id) for candidate_id in authorized_ids}
+    return SelectionRegistry(
+        verified_bookmark_target=lambda candidate: verified.get(candidate.candidate_id) == candidate,
+    )
+
+
+def _automatic_request(catalog: Any, mode: str) -> SelectionRequest:
+    candidate = next((item for item in catalog.candidates if item.kind == "live"), None)
+    if candidate is None:
+        raise SyncError("selection_required", "No verified automatic selection is available.", 3)
+    return SelectionRequest(candidate.candidate_id, mode)
+
+
+def _execute_selection_command(
+    config_path: Path,
+    *,
+    command: str,
+    as_json: bool,
+    selected: str | None,
+    catalog_token: str | None,
+    presenter: SelectionPresenter | None = None,
+    confirmed: bool = False,
+) -> dict[str, Any]:
+    config = load_config(config_path)
+    _process_preflight(config)
+    if selected and selected != "auto-safe" and catalog_token is None:
+        raise SyncError("catalog_token_required", "Explicit selection requires a current catalog capability.", 3)
+    ui = presenter or TkSelectionPresenter()
+    while True:
+        interactive = not as_json and selected is None
+        request: SelectionRequest | CancelledSelection | None = None
+        if interactive:
+            captured: dict[str, Any] = {}
+            def build_in_worker() -> Any:
+                vault_value, catalog_value, state_value, projection_value = _fresh_catalog(config_path, config)
+                case_value = _selection_case(config_path, catalog_value, vault_value)
+                captured.update(vault=vault_value, catalog=catalog_value, state=state_value,
+                                projection=projection_value, case=case_value)
+                return catalog_value
+            def directive_after_scan(_catalog: Any) -> SelectionDirective:
+                base = selection_policy(captured["case"])
+                if command == "promote":
+                    return SelectionDirective(True, base.initial_selection, ("promote", "bookmark", "cancel", "reload"),
+                                              base.bookmark_displaced_remote)
+                return base
+            builder_present = getattr(ui, "present_builder", None)
+            if not callable(builder_present):
+                raise SyncError("adapter_contract_invalid", "Selection presenter cannot load catalogs safely.", 2)
+            request = builder_present(build_in_worker, directive_after_scan)
+            try:
+                vault, catalog, state, projection, case = (
+                    captured["vault"], captured["catalog"], captured["state"], captured["projection"], captured["case"],
+                )
+            except KeyError:
+                if isinstance(request, CancelledSelection):
+                    return {"schema_version": "1.0.0", "command": command, "result": {"state": "CANCELLED"}}
+                raise SyncError("selection_catalog_failed", "Verified save versions were not loaded.", 3) from None
+        else:
+            vault, catalog, state, projection = _fresh_catalog(
+                config_path, config, supplied_token=(catalog_token if selected and selected != "auto-safe" else None),
+            )
+            case = _selection_case(config_path, catalog, vault)
+        directive = selection_policy(case)
+        registry = _registry_for_catalog(catalog); registry.register(catalog)
+
+        if selected and selected != "auto-safe":
+            request = SelectionRequest(
+                selected, "promote-only" if command == "promote" else "launch",
+                confirmation_granted=(command == "promote" or confirmed),
+            )
+        elif command == "promote" and as_json:
+            raise SyncError("selection_required", "Promotion requires an explicit current selection.", 3)
+        elif case == ReconcileCase.EQUAL:
+            request = request or _automatic_request(catalog, "launch")
+        elif selected == "auto-safe" or as_json:
+            raise SyncError("selection_required", "Save versions differ; an explicit current selection is required.", 3)
+        elif request is None:
+            raise SyncError("selection_required", "An explicit selection is required.", 3)
+
+        if isinstance(request, CancelledSelection):
+            return {"schema_version": "1.0.0", "command": command, "result": {"state": "CANCELLED"}}
+        if request.action == "reload":
+            selected = None; catalog_token = None
+            continue
+        if request.action == "bookmark":
+            if request.candidate_id is None or not request.display_name:
+                raise SyncError("invalid_selection_request", "Bookmark selection is incomplete.", 3)
+            candidate = catalog.candidate(request.candidate_id)
+            _assert_capability_boundary(config_path, config, state, catalog, projection)
+            vault.bind_remote_identity((str(projection["config"]["remote_fetch_url"]), str(projection["config"]["remote_push_url"])))
+            if candidate.commit is None:
+                manifest = stable_manifest(
+                    config.save_root, machine_id=config.machine_id,
+                    retries=config.stable_scan_retries, window_seconds=config.stable_window_seconds,
+                )
+                if manifest.get("root_hash") != candidate.root_hash or catalog.remote_head is None:
+                    raise SyncError("selection_stale", "Live bookmark candidate changed before execution.", 3)
+
+                def before_lock() -> None:
+                    _assert_capability_boundary(config_path, config, state, catalog, projection)
+
+                def after_lock() -> None:
+                    _process_preflight(config)
+                    if load_config(config_path).public_dict() != config.public_dict():
+                        raise SyncError("catalog_context_changed", "Configuration changed during bookmark creation.", 3)
+
+                create_live_bookmark_locked(
+                    vault, config.save_root, manifest,
+                    state_path=_state_path(config_path), expected_remote_head=catalog.remote_head,
+                    display_name=request.display_name, note=request.note, created_by=config.machine_id,
+                    retries=config.stable_scan_retries, window_seconds=config.stable_window_seconds,
+                    validator=validate_players, before_lock=before_lock, after_lock=after_lock,
+                )
+            else:
+                create_bookmark(vault, candidate.commit, display_name=request.display_name,
+                                note=request.note, created_by=config.machine_id)
+            return {"schema_version": "1.0.0", "command": command, "result": {"state": "BOOKMARKED"}}
+        remote_identity = (
+            str(projection["config"]["remote_fetch_url"]),
+            str(projection["config"]["remote_push_url"]),
+        )
+        plan = build_plan_from_request(
+            registry, request, catalog_token=catalog.token, case=case,
+            expected_context_digest=context_digest(projection), expected_remote_identity=remote_identity,
+        )
+        _assert_capability_boundary(config_path, config, state, catalog, projection)
+        def revalidate_context(expected: str) -> None:
+            _, fresh_catalog, _, fresh_projection = _fresh_catalog(
+                config_path, config, supplied_token=catalog.token,
+            )
+            if context_digest(fresh_projection) != expected or fresh_catalog.token != catalog.token:
+                raise SyncError("catalog_context_changed", "Selection context changed before lock acquisition.", 3)
+        try:
+            result = LaunchWorkflow(config, config_path.parent).execute_selection_plan(
+                plan, registry, context_revalidate=revalidate_context,
+            )
+        except SyncError as error:
+            if interactive and error.code == "selection_stale":
+                # A stale interactive choice is not a recovery event: no lock
+                # or mutation has begun. Re-enter catalog construction so the
+                # presenter can show fresh candidates and let the user reload,
+                # cancel, or select again. Explicit/headless requests still
+                # fail closed to their caller.
+                selected = None
+                catalog_token = None
+                continue
+            raise
+        return {"schema_version": "1.0.0", "command": command, "result": result}
+
+
+def launch(config_path: Path, *, as_json: bool = False, selected: str | None = None,
+           catalog_token: str | None = None, presenter: SelectionPresenter | None = None,
+           confirmed: bool = False) -> dict[str, Any]:
+    return _execute_selection_command(config_path, command="launch", as_json=as_json, selected=selected,
+                                      catalog_token=catalog_token, presenter=presenter, confirmed=confirmed)
+
+
+def promote(config_path: Path, *, apply: bool, as_json: bool = False, selected: str | None = None,
+            catalog_token: str | None = None, presenter: SelectionPresenter | None = None) -> dict[str, Any]:
+    if not apply:
+        return {"schema_version": "1.0.0", "command": "promote", "dry_run": True}
+    return _execute_selection_command(config_path, command="promote", as_json=as_json, selected=selected,
+                                      catalog_token=catalog_token, presenter=presenter)
 
 
 def _state_path(config_path: Path) -> Path:
@@ -223,7 +566,12 @@ def recover(config_path: Path, *, monitor: ProcessMonitor | None = None) -> dict
     # stopped process view as every other mutating save operation.
     _process_preflight(config, monitor)
     vault = _vault(config); vault.preflight()
+    identity = read_remote_identity(vault, config.remote)
+    vault.bind_remote_identity(identity)
     state = load_state(_state_path(config_path))
+    if load_config(config_path).public_dict() != config.public_dict() or load_state(_state_path(config_path)) != state:
+        raise SyncError("recovery_context_changed", "Recovery configuration or state changed before execution.", 6)
+    vault.assert_remote_identity()
     result = recover_session(vault, state, config.machine_id, state_path=_state_path(config_path))
     return {"schema_version":"1.0.0", "command":"recover", "result":result}
 
@@ -653,16 +1001,23 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command in {"preserve", "archive-live"}: payload = preserve(args.config, apply=args.apply)
         elif args.command == "bootstrap": payload = bootstrap(args.config, args.source_cloud, apply=args.apply)
         elif args.command in {"enroll", "join"}: payload = enroll(args.config, apply=args.apply)
-        elif args.command == "launch":
-            config = load_config(args.config)
-            result = LaunchWorkflow(config, args.config.parent).run()
-            payload = {"schema_version": "1.0.0", "command": "launch", "result": result}
+        elif args.command == "versions": payload = versions(args.config)
+        elif args.command == "bookmark": payload = bookmark(args.config, args.candidate, args.name, args.note, apply=args.apply, catalog_token=args.catalog_token)
+        elif args.command == "launch": payload = launch(args.config, as_json=args.json, selected=args.select, catalog_token=args.catalog_token, confirmed=args.confirm)
+        elif args.command == "promote": payload = promote(args.config, apply=args.apply, as_json=args.json, selected=args.candidate, catalog_token=args.catalog_token)
         elif args.command == "install-shortcut":
             if not args.apply: payload = {"schema_version": "1.0.0", "command": "install-shortcut", "dry_run": True}
             else:
                 desktop = Path.home() / "Desktop"
                 install_shortcut(desktop, config_path=args.config)
                 payload = {"schema_version": "1.0.0", "command": "install-shortcut", "created": True}
+        elif args.command == "migrate-shortcut":
+            if not args.apply:
+                payload = {"schema_version": "1.0.0", "command": "migrate-shortcut", "dry_run": True}
+            else:
+                destination, old_current = migrate_shortcut(Path.home() / "Desktop", config_path=args.config)
+                payload = {"schema_version": "1.0.0", "command": "migrate-shortcut", "created": True,
+                           "old_shortcut": "current" if old_current is True else ("stale" if old_current is False else "absent")}
         exit_code = EXIT_OK
     except SyncError as error:
         payload = _safe_error_payload(error)

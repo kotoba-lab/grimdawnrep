@@ -1,8 +1,15 @@
 # セーブ選択・承認付き起動 実装計画
 
 作成日: 2026-08-01
-状態: 実装待ち
+状態: 実装完了・隔離自動受入済み／実機 T7 展開待ち
 対象: `grim_dawn_sync` / Windows 2端末運用
+
+検証境界（2026-08-01）: T0–T6 のコード、runbook、隔離一時 Vault／偽 save による
+自動受入は完了した。完成判定 1–7 と 9 はコードと隔離テストで達成している。
+visibleな隔離 Windows Tk smokeは自動操作で完了した。一方、完成判定 8 の A → B → A
+実機往復、native messageboxの外観を含む人手UI確認、実端末でのshortcut COM検査・作成は
+未実施である。したがって「実装完了」は実環境への展開完了を意味せず、private Vault、
+実セーブ、実 remote main を使う T7 は明示承認後に行う。
 
 ## 1. 背景と目的
 
@@ -374,6 +381,19 @@ DoD:
 
 ### T7: 2端末受入試験と段階展開
 
+現在地: 手順 1 の自動 decision table と、隔離一時 Vault／偽 save で実行できる
+integration 受入は完了した。手順 2 はvisibleな隔離 Windows Tkを実際に起動し、window
+close、Esc、F5、bookmark、launch、promoteを自動操作した。promoteでは危険確認4文と
+Yes結果のplan bindingを確認したが、native messageboxのOS外観は人手確認していない。
+手順 3–8 と実端末 shortcut のCOM検証は未実施であり、実 save／private remoteを
+変更していない。
+
+shortcut migration自体はworkspace temp内のfake Git source、fake config、fake
+`python.exe`、fake Desktopを使う実Windows COM E2Eで隔離受入済みである。旧shortcutの
+mismatch検出、新Save Selection shortcutのcreate-only作成と再inspection、旧shortcut
+不変、引数／WorkingDirectory／source revision一致を確認した。実Desktopと実shortcutは
+この試験の対象外である。
+
 順序:
 
 1. fake Vaultによる全decision table試験。
@@ -456,3 +476,17 @@ DoD:
 7. remote保管版が実際のrestore inspectionに合格する。
 8. A -> B -> Aの実機roundtripが成功する。
 9. 最終状態にlock、recovery phase、Vault差分が残らない。
+
+### 2026-08-01 時点の判定
+
+| 番号 | 状態 | 現在の根拠／残作業 |
+|---|---|---|
+| 1–7 | コード＋隔離テスト達成 | decision table、catalog capability、選択再検証、managed bookmark、archive-before-restore、promote、restore inspectionを隔離環境で受入済み。 |
+| 8 | 未達（実機待ち） | Terminal Bへの段階導入、Terminal Aへの導入、A → B → A実往復をまだ行っていない。 |
+| 9 | コード＋隔離テスト達成 | 隔離試験の完了状態でlock、recovery phase、Vault差分が残らないことを確認済み。実2端末での最終確認はT7に残る。 |
+
+実装の隔離受入ゲートは通過しているが、機能全体の最終完成宣言は 8 の成功後とする。
+visibleな隔離 Windows Tkではclose／Esc／F5／bookmark／launch／promoteと確認4文の
+bindingを受入済みである。展開前にはnative messageboxの外観と人手キーボード操作を確認し、
+実端末で新旧 `.lnk` のTargetPath／Arguments／WorkingDirectoryおよび旧ファイル不変性を
+COMで確認する。

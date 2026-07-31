@@ -11,7 +11,17 @@ import sys
 import pytest
 
 from grim_dawn_sync.errors import EXIT_CONFIGURATION, SyncError
-from grim_dawn_sync.shortcut import LEGACY_SHORTCUT_NAME, SHORTCUT_NAME, ShortcutAdapter, _launch_arguments, install_shortcut
+from grim_dawn_sync.shortcut import (
+    LEGACY_SHORTCUT_NAME,
+    SELECTION_SHORTCUT_NAME,
+    SHORTCUT_NAME,
+    ShortcutAdapter,
+    _launch_arguments,
+    inspect_shortcut,
+    install_shortcut,
+    migrate_shortcut,
+    shortcut_matches,
+)
 
 
 def _config(tmp_path: Path) -> Path:
@@ -145,3 +155,63 @@ def test_windows_adapter_creates_valid_shortcut_via_com(tmp_path: Path) -> None:
     ShortcutAdapter().create(destination, str(Path(sys.executable)), '-c "pass"', str(tmp_path))
     assert destination.is_file()
     assert not list(tmp_path.glob(f"{SHORTCUT_NAME}.new-*"))
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="requires Windows WScript.Shell and Git")
+def test_windows_com_migration_e2e_is_temp_only_create_only_and_revision_bound(tmp_path: Path) -> None:
+    desktop = tmp_path / "Fake Desktop"; desktop.mkdir()
+    source = tmp_path / "Current Source"; source.mkdir()
+    old_source = tmp_path / "Old Source"; old_source.mkdir()
+    fake_python = tmp_path / "Fake Python" / "python.exe"
+    fake_python.parent.mkdir(); fake_python.touch()
+    config = _config(tmp_path)
+
+    def git(*args: str) -> str:
+        result = subprocess.run(
+            ["git", *args], cwd=source, check=True, text=True, encoding="utf-8",
+            capture_output=True,
+        )
+        return result.stdout.strip()
+
+    git("init")
+    git("config", "user.name", "shortcut-smoke")
+    git("config", "user.email", "shortcut-smoke@example.invalid")
+    marker = source / "revision.txt"; marker.write_text("isolated revision\n", encoding="utf-8")
+    git("add", "--", marker.name)
+    git("commit", "-m", "isolated shortcut source")
+    revision_before = git("rev-parse", "HEAD")
+
+    adapter = ShortcutAdapter()
+    old = desktop / SHORTCUT_NAME
+    adapter.create(old, str(fake_python), _launch_arguments(old_source, config), str(old_source))
+    old_bytes = old.read_bytes(); old_stat = old.stat(); old_shape = inspect_shortcut(old, adapter=adapter)
+    assert not shortcut_matches(old_shape, target=fake_python, source_root=source, config_path=config)
+
+    destination, old_current = migrate_shortcut(
+        desktop, config_path=config, source_root=source,
+        executable=str(fake_python), adapter=adapter,
+    )
+    assert destination == desktop / SELECTION_SHORTCUT_NAME and old_current is False
+    created_shape = inspect_shortcut(destination, adapter=adapter)
+    assert shortcut_matches(created_shape, target=fake_python, source_root=source, config_path=config)
+    assert created_shape.target == str(fake_python.resolve())
+    assert created_shape.arguments == _launch_arguments(source.resolve(), config.resolve())
+    assert created_shape.working_directory == str(source.resolve())
+    assert git("rev-parse", "HEAD") == revision_before
+    assert git("status", "--porcelain=v1", "--untracked-files=all") == ""
+    after_old = old.stat()
+    assert old.read_bytes() == old_bytes
+    assert (after_old.st_size, after_old.st_mtime_ns) == (old_stat.st_size, old_stat.st_mtime_ns)
+    assert inspect_shortcut(old, adapter=adapter) == old_shape
+
+    new_bytes = destination.read_bytes(); new_stat = destination.stat()
+    with pytest.raises(SyncError) as caught:
+        migrate_shortcut(
+            desktop, config_path=config, source_root=source,
+            executable=str(fake_python), adapter=adapter,
+        )
+    assert caught.value.code == "shortcut_exists"
+    after_new = destination.stat()
+    assert destination.read_bytes() == new_bytes
+    assert (after_new.st_size, after_new.st_mtime_ns) == (new_stat.st_size, new_stat.st_mtime_ns)
+    assert git("rev-parse", "HEAD") == revision_before

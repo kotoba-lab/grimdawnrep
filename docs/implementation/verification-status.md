@@ -1,5 +1,121 @@
 # Roadmap verification status
 
+## Save Sync startup selection (2026-08-01)
+
+Status: implementation complete and accepted against isolated automated fixtures;
+real-terminal T7 rollout remains pending.
+
+### Implemented and reviewed
+
+- Added a bounded, verified version catalog for live, remote main, history,
+  managed bookmarks, and legacy annotated tags, with coalesced selectable aliases.
+- Added short-lived catalog capabilities bound to configuration, state, remote
+  fetch/push identity, lock absence, live/remote roots, and the complete candidate
+  projection. Stale or changed context fails before the first workflow mutation.
+- Added explicit selection policy and canonical plans for equal, remote-ahead,
+  live-ahead, diverged, and missing-baseline cases. History/bookmark/legacy launch
+  requires a second confirmation.
+- Added create-only managed bookmarks, including a detached live-save bookmark
+  path protected by the remote session lock and recoverable publication intent.
+- Integrated displaced-remote preservation, verified archive/restore, local Vault
+  fast-forward alignment, promote-only publication, remote URL rechecks, and
+  recovery handoff into the launch workflow.
+- Added the Tk worker/main-thread adapter, privacy-safe `versions` output,
+  explicit CLI selection/token/confirmation contracts, and create-only shortcut
+  migration with read-only inspection of the previous `.lnk`.
+- Updated terminology and Terminal A roundtrip/shortcut runbooks so differing
+  saves are never silently approved by headless automation.
+
+Independent review found no remaining High-severity issue. Follow-up review
+findings were resolved and covered by focused tests. The review gate approves
+the code for isolated acceptance and staged manual T7; it is not evidence that
+two-terminal deployment has already occurred. A visible isolated Windows Tk
+window was exercised automatically, but native messagebox appearance and real
+terminal integration remain manual boundaries.
+
+### Verification evidence
+
+- Main T6 targeted acceptance checkpoint: `200 passed, 2 skipped`.
+- Focused suite results recorded during final verification: selection `32 passed`;
+  catalog capability `24 passed`; selector UI `11 passed`; CLI selection
+  `14 passed`; workflow `50 passed, 1 skipped`; shortcut migration `8 passed`;
+  selection contract `1 passed`; version catalog `7 passed`; bookmarks `4 passed`;
+  CLI regression `42 passed`; Terminal A handoff docs `21 passed`.
+- Previously failing remote-only and diverged Vault-base integration paths were
+  repaired and individually re-run: remote-only `1 passed`, both diverged winners
+  `2 passed`. Live-only bookmark and stale-before-mutation integration checks also
+  passed individually.
+- Final low-risk contract additions for coalesced alias privacy and managed-tag
+  count/output bounds: `4 passed`.
+- Visible isolated Windows Tk smoke exercised window close, Esc, F5 reload,
+  bookmark, launch, and promote. Promote verified all four danger statements and
+  returned `promote-only` with confirmation bound. The native messagebox OS chrome
+  was replaced by a deterministic test answer, so its human-visible appearance is
+  still unverified. The selector UI regression after this smoke was `12 passed`.
+- Workspace-temporary Windows COM shortcut migration E2E: `1 passed`. A fake Git
+  source/config/`python.exe` and fake Desktop proved old-shortcut read-only
+  inspection, stale checkout detection, create-only Save Selection migration,
+  exact target/arguments/working directory, unchanged source revision, old `.lnk`
+  byte/timestamp invariance, and second-create rejection. The real Desktop and
+  real shortcuts were not accessed.
+- Explicit history/bookmark/legacy promotion end-to-end coverage: `4 passed`.
+- Real Git recovery coverage for managed bookmark publication/release faults:
+  `4 passed`.
+- Interactive stale refresh, headless stale rejection, and explicit-token stale
+  rejection were exercised fail-closed.
+- Latest broad regression checkpoint across all 25 save-sync test files:
+  `507 passed, 5 skipped in 701.14s`.
+- These entries are overlapping targeted runs and must not be added together as
+  a unique full-suite total. All five skips were existing Windows-environment
+  limitations where symbolic links could not be created: the Git Vault hook,
+  state parent-directory and destination-file checks, workflow ancestor check,
+  and existing-shortcut check. The COM shortcut test passed; no skip was an
+  accepted failure.
+
+No real save, private Vault, or real remote main was changed. Git mutation in
+integration tests was confined to disposable temporary repositories and fake
+saves. No source commit or push was made for this implementation session.
+
+### Observed real-terminal rollout boundary
+
+Read-only inspection reported save sync `ready`, Vault relation `equal`, and game
+process state `clear`. That does not authorize rollout. The following blockers
+remain:
+
+- It is not established whether the currently inspected machine is Terminal A or
+  Terminal B for the staged rollout order.
+- The source checkout is dirty, so an unattended pull/deploy step must not be
+  inferred safe.
+- The new Save Selection shortcut and the expected project virtual environment
+  are absent.
+- The previous Save Sync shortcut does not match the current source/arguments
+  shape and must be treated as stale, not silently reused.
+
+These were read-only observations. No shortcut, environment, real save, private
+Vault, lock, state, or remote ref was changed.
+
+### Remaining T7 manual checklist
+
+1. On real Windows, perform the remaining human UI check: native messagebox
+   appearance, keyboard traversal/focus, readable four-statement warning, and
+   responsiveness during catalog loading. Automated visible Tk already covers
+   close, Esc, reload, bookmark, launch, promote, and confirmation binding.
+2. On Terminal B, COM-inspect the existing shortcut without editing it, run the
+   create-only migration, and verify exact TargetPath, Arguments, and
+   WorkingDirectory. Recheck the old and legacy shortcut fingerprints unchanged.
+3. With explicit authorization and a verified pre-operation managed bookmark,
+   test equal-content launch, remote-ahead selection, cancellation, and reload on
+   Terminal B. Confirm no unintended save or remote-main mutation.
+4. Create a named bookmark and pass an isolated restore inspection; then promote
+   an explicitly chosen past version and confirm the displaced head remains
+   retrievable.
+5. Repeat the shortcut inspection and staged rollout on Terminal A, then perform
+   the documented A → B → A roundtrip with user-visible save evidence.
+6. Finish only after both terminals report `ready`, `vault_relation=equal`, no
+   active lock, no recovery phase, and no unexpected Vault worktree difference.
+   Record the actual manual evidence without logging paths, remote URLs, hashes,
+   character names, or raw save data.
+
 ## M6 item query (2026-07-27)
 
 - T0–T4完了: `records/items/` datasetからEN/JA item v1/v2、affix v1、JSONL照会CLIを生成し、未知Class・未解決参照はfail-closedで出力する。
