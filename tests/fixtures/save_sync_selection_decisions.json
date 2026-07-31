@@ -1,0 +1,7 @@
+[
+  {"case":"equal","live":"baseline","remote":"baseline","show_selector":false,"initial_selection":"remote_head","allowed_operations":["launch","cancel","reload"],"bookmark_displaced_remote":false},
+  {"case":"remote_ahead","live":"baseline","remote":"advanced","show_selector":true,"initial_selection":"remote_head","allowed_operations":["launch","promote","bookmark","cancel","reload"],"bookmark_displaced_remote":false},
+  {"case":"live_ahead","live":"advanced","remote":"baseline","show_selector":true,"initial_selection":"live","allowed_operations":["launch","promote","bookmark","cancel","reload"],"bookmark_displaced_remote":true},
+  {"case":"diverged","live":"live_advanced","remote":"remote_advanced","show_selector":true,"initial_selection":null,"allowed_operations":["launch","promote","bookmark","cancel","reload"],"bookmark_displaced_remote":true},
+  {"case":"baseline_missing","live":"unknown","remote":"unknown","show_selector":false,"initial_selection":null,"allowed_operations":["cancel"],"bookmark_displaced_remote":false}
+]

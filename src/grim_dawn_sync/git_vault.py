@@ -17,9 +17,10 @@ import re
 import stat
 import unicodedata
 import uuid
-from typing import Iterable
+from typing import Callable, Iterable
 
 from grim_dawn_sync.errors import EXIT_CONFLICT, EXIT_CONFIGURATION, EXIT_RECOVERY_REQUIRED, EXIT_VALIDATION, SyncError
+from grim_dawn_sync.catalog_capability import read_remote_identity
 from grim_dawn_sync.manifest import (
     MANIFEST_SCHEMA_VERSION,
     assert_safe_save_file,
@@ -320,6 +321,16 @@ class GitRunner:
             raise SyncError("git_command_failed", "Git command failed.", EXIT_CONFLICT, {"command": args[0] if args else "git"})
         return completed.stdout
 
+    def run_bytes_input(self, *args: str, input_bytes: bytes) -> bytes:
+        argv = (self.executable, *args); self.commands.append(argv)
+        try:
+            completed = subprocess.run(list(argv), cwd=self.cwd, shell=False, input=input_bytes, capture_output=True, check=False)
+        except OSError as error:
+            raise SyncError("git_unavailable", "Git could not be executed.", EXIT_CONFIGURATION) from error
+        if completed.returncode:
+            raise SyncError("git_command_failed", "Git command failed.", EXIT_CONFLICT, {"command": args[0] if args else "git"})
+        return completed.stdout
+
 
 @dataclass(frozen=True)
 class VaultStatus:
@@ -332,6 +343,109 @@ class GitVault:
     def __init__(self, repo: Path, *, remote: str = "origin", branch: str = "main", runner: GitRunner | None = None) -> None:
         self.repo = Path(repo).resolve(); self.remote = _remote_name(remote); self.branch = _branch_name(branch)
         self.runner = runner or GitRunner(self.repo)
+        self.expected_remote_identity: tuple[str, str] | None = None
+
+    def bind_remote_identity(self, expected: tuple[str, str]) -> None:
+        try:
+            actual = read_remote_identity(self, self.remote)
+        except SyncError as error:
+            raise SyncError("remote_identity_changed", "Remote fetch/push destination changed; no write was attempted.", EXIT_CONFLICT) from error
+        if actual != expected:
+            raise SyncError("remote_identity_changed", "Remote fetch/push destination changed; no write was attempted.", EXIT_CONFLICT)
+        self.expected_remote_identity = expected
+
+    def assert_remote_identity(self) -> None:
+        if self.expected_remote_identity is not None:
+            try:
+                actual = read_remote_identity(self, self.remote)
+            except SyncError as error:
+                raise SyncError("remote_identity_changed", "Remote fetch/push destination changed; no write was attempted.", EXIT_CONFLICT) from error
+            if actual != self.expected_remote_identity:
+                raise SyncError("remote_identity_changed", "Remote fetch/push destination changed; no write was attempted.", EXIT_CONFLICT)
+
+    def create_detached_snapshot(self, source: Path, *, machine_id: str, session_id: str,
+                                 expected_manifest: dict, expected_remote_head: str,
+                                 retries: int = 1, window_seconds: float = 0,
+                                 validator=validate_players) -> str:
+        """Write a verified snapshot commit using plumbing without moving a ref."""
+        parent = _oid_value(expected_remote_head); expected = _validated_manifest(expected_manifest)
+        machine_id = _snapshot_token(machine_id, "machine ID"); session_id = _snapshot_token(session_id, "session ID")
+        if expected.get("machine_id") != machine_id or expected.get("file_count", 0) > 100000 or expected.get("total_bytes", 0) > 2 * 1024**3:
+            raise SyncError("bookmark_live_too_large", "Live bookmark snapshot exceeds safe limits.", EXIT_VALIDATION)
+        self.preflight(); self.assert_remote_identity()
+        if self.remote_oid() != parent:
+            raise SyncError("selection_stale", "Remote main changed before live bookmark construction.", EXIT_CONFLICT)
+        current = stable_manifest(source, machine_id=machine_id, retries=retries, window_seconds=window_seconds)
+        if current["root_hash"] != expected["root_hash"] or not validator(source, expected).get("ok"):
+            raise SyncError("source_changed", "Live save changed before bookmark construction.", EXIT_VALIDATION)
+        before_head = self._oid("HEAD")
+        before_status = self.runner.run("status", "--porcelain=v1", "--untracked-files=all").stdout
+        before_refs = self.runner.run("for-each-ref", "--format=%(refname)%00%(objectname)").stdout
+
+        def blob(data: bytes) -> str:
+            raw = self.runner.run_bytes_input("hash-object", "-w", "--stdin", input_bytes=data).decode("ascii", "strict").strip()
+            return _oid_value(raw, "blob")
+        tree: dict[str, Any] = {}
+        for item in expected["files"]:
+            relative = validate_manifest_path(str(item["path"])); path = assert_safe_save_file(Path(source), relative)
+            data = path.read_bytes()
+            if len(data) != item["size"] or hashlib.sha256(data).hexdigest() != item["sha256"]:
+                raise SyncError("source_changed", "Live save changed while bookmark objects were built.", EXIT_VALIDATION)
+            node = tree
+            parts = PurePosixPath(relative).parts
+            for part in parts[:-1]: node = node.setdefault(part, {})
+            node[parts[-1]] = ("blob", blob(data))
+        manifest_blob = blob(json.dumps(expected, ensure_ascii=False, sort_keys=True).encode("utf-8"))
+        metadata = {"schema_version":"1.0.0", "machine_id":machine_id, "session_id":session_id, "root_hash":expected["root_hash"]}
+        vault_blob = blob(json.dumps(metadata, ensure_ascii=False, sort_keys=True).encode("utf-8"))
+
+        def make_tree(node: dict[str, Any]) -> str:
+            rows = bytearray()
+            for name in sorted(node, key=lambda value: value.encode("utf-8")):
+                if "\0" in name or "/" in name or not name: raise SyncError("unsafe_vault_tree", "Detached snapshot path was unsafe.", EXIT_VALIDATION)
+                value = node[name]
+                if isinstance(value, dict): kind, oid, mode = "tree", make_tree(value), "040000"
+                else: kind, oid, mode = value[0], value[1], "100644"
+                rows.extend(f"{mode} {kind} {oid}\t{name}".encode("utf-8") + b"\0")
+            result = self.runner.run_bytes_input("mktree", "-z", input_bytes=bytes(rows)).decode("ascii", "strict").strip()
+            return _oid_value(result, "tree")
+        save_tree = make_tree(tree)
+        sync_tree = make_tree({"manifest.json": ("blob", manifest_blob), "vault.json": ("blob", vault_blob)})
+        root_rows = (f"040000 tree {sync_tree}\t.sync\0" + f"040000 tree {save_tree}\tsave\0").encode("utf-8")
+        root_tree = _oid_value(self.runner.run_bytes_input("mktree", "-z", input_bytes=root_rows).decode("ascii", "strict").strip(), "tree")
+        message = f"Detached save bookmark from {machine_id} root={expected['root_hash']} session={session_id}\n"
+        commit = self.runner.run("commit-tree", root_tree, "-p", parent, input_text=message).stdout.strip()
+        commit = _oid_value(commit)
+        after = stable_manifest(source, machine_id=machine_id, retries=retries, window_seconds=window_seconds)
+        if after["root_hash"] != expected["root_hash"] or self.remote_oid() != parent:
+            raise SyncError("selection_stale", "Live or remote data changed before bookmark publication.", EXIT_CONFLICT)
+        if self._oid("HEAD") != before_head or self.runner.run("status", "--porcelain=v1", "--untracked-files=all").stdout != before_status or self.runner.run("for-each-ref", "--format=%(refname)%00%(objectname)").stdout != before_refs:
+            raise SyncError("detached_snapshot_mutated_vault", "Detached snapshot changed a protected Vault ref or worktree.", EXIT_RECOVERY_REQUIRED)
+        committed = self.validate_commit_snapshot(commit)
+        if committed["root_hash"] != expected["root_hash"]:
+            raise SyncError("committed_save_mismatch", "Detached bookmark snapshot verification failed.", EXIT_RECOVERY_REQUIRED)
+        return commit
+
+    def align_head_to_remote(self, expected_remote_head: str) -> None:
+        """After lock acquisition, move only an older clean local Vault to remote main."""
+        expected = _oid_value(expected_remote_head)
+        self.assert_remote_identity()
+        branch = self.runner.run("symbolic-ref", "--quiet", "HEAD", check=False)
+        if branch.returncode or branch.stdout.strip() != f"refs/heads/{self.branch}":
+            raise SyncError("vault_branch_mismatch", "Vault HEAD is not the configured local branch.", EXIT_CONFLICT)
+        self.preflight()
+        if self.remote_oid() != expected or self._oid(self.remote_ref) != expected:
+            raise SyncError("selection_stale", "Remote main changed before local Vault alignment.", EXIT_CONFLICT)
+        head = self._oid("HEAD")
+        if head is None or self.runner.run("merge-base", "--is-ancestor", head, expected, check=False).returncode:
+            raise SyncError("vault_not_reconciled", "Local Vault cannot be safely aligned to selected remote main.", EXIT_CONFLICT)
+        result = self.runner.run("merge", "--ff-only", expected, check=False)
+        branch_after = self.runner.run("symbolic-ref", "--quiet", "HEAD", check=False)
+        self.assert_remote_identity()
+        remote_after = self.remote_oid()
+        if (result.returncode or self._oid("HEAD") != expected or remote_after != expected
+                or branch_after.returncode or branch_after.stdout.strip() != f"refs/heads/{self.branch}"):
+            raise SyncError("vault_alignment_incomplete", "Local Vault alignment requires recovery.", EXIT_RECOVERY_REQUIRED)
 
     @property
     def remote_ref(self) -> str: return f"refs/remotes/{self.remote}/{self.branch}"
@@ -369,6 +483,307 @@ class GitVault:
 
     def fetch(self) -> None:
         self.runner.run("fetch", "--no-tags", self.remote, f"{self.remote_head}:{self.remote_ref}")
+
+    def remote_history(self, *, limit: int = 10) -> tuple[str, ...]:
+        """Return newest-first, locally fetched remote-main commits.
+
+        This is deliberately a read-only view.  Callers must fetch explicitly
+        before using it, so catalog construction never hides a network or
+        worktree mutation behind history enumeration.
+        """
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise SyncError("invalid_history_limit", "History limit must be between 1 and 100.", EXIT_CONFIGURATION)
+        result = self.runner.run("rev-list", "--max-count", str(limit), self.remote_ref, check=False)
+        if result.returncode:
+            # An absent remote branch is an empty history, while other Git
+            # errors remain fail-closed.
+            if self._oid(self.remote_ref) is None:
+                return ()
+            raise SyncError("git_command_failed", "Remote history could not be read.", EXIT_CONFLICT)
+        commits = tuple(row.strip() for row in result.stdout.splitlines() if row.strip())
+        if len(commits) > limit or any(not _OID.fullmatch(commit) for commit in commits) or len(set(commits)) != len(commits):
+            raise SyncError("malformed_remote_history", "Remote history was malformed.", EXIT_CONFLICT)
+        return commits
+
+    def legacy_annotated_tags(self, *, limit: int = 100) -> tuple[tuple[str, str], ...]:
+        """Return verified local ``archive/*`` and ``milestone/*`` tag targets.
+
+        Legacy tags are display-only catalog input; lightweight tags and any
+        malformed ref/object row are rejected rather than interpreted.
+        """
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise SyncError("invalid_history_limit", "Tag limit must be between 1 and 100.", EXIT_CONFIGURATION)
+        result = self.runner.run(
+            "for-each-ref", "--format=%(refname:short)\t%(objecttype)\t%(objectname)\t%(*objectname)",
+            "refs/tags/archive", "refs/tags/milestone",
+        )
+        rows: list[tuple[str, str]] = []
+        for row in result.stdout.splitlines():
+            fields = row.split("\t")
+            if len(fields) != 4:
+                raise SyncError("malformed_legacy_tag", "Legacy tag list was malformed.", EXIT_CONFLICT)
+            name, object_type, tag_oid, peeled = fields
+            if (
+                not name.startswith(("archive/", "milestone/"))
+                or object_type != "tag"
+                or not _OID.fullmatch(tag_oid)
+                or not _OID.fullmatch(peeled)
+                or any(ord(char) < 32 for char in name)
+            ):
+                raise SyncError("malformed_legacy_tag", "Legacy tag list was malformed.", EXIT_CONFLICT)
+            rows.append((name, peeled))
+        # Tags are not fetched by the normal main-only fetch.  Discover remote
+        # legacy tags explicitly, then fetch each exact immutable ref solely
+        # to validate its annotated object and peeled commit locally.
+        remote_result = self.runner.run(
+            "ls-remote", self.remote, "refs/tags/archive/*", "refs/tags/milestone/*", check=False,
+        )
+        if remote_result.returncode:
+            raise SyncError("legacy_tag_list_failed", "Legacy bookmark refs could not be read.", EXIT_CONFLICT)
+        remote_values: dict[str, dict[str, str]] = {}
+        for row in remote_result.stdout.splitlines():
+            fields = row.split("\t")
+            if len(fields) != 2:
+                raise SyncError("malformed_legacy_tag", "Legacy tag list was malformed.", EXIT_CONFLICT)
+            oid, ref = fields; peeled_remote = ref.endswith("^{}")
+            base = ref[:-3] if peeled_remote else ref
+            if not re.fullmatch(r"refs/tags/(?:archive|milestone)/[^\x00-\x1f]+", base) or not _OID.fullmatch(oid):
+                raise SyncError("malformed_legacy_tag", "Legacy tag list was malformed.", EXIT_CONFLICT)
+            item = remote_values.setdefault(base, {}); key = "peeled" if peeled_remote else "tag"
+            if key in item:
+                raise SyncError("malformed_legacy_tag", "Legacy tag list was malformed.", EXIT_CONFLICT)
+            item[key] = oid
+        known = {name for name, _ in rows}
+        for ref, item in sorted(remote_values.items()):
+            if set(item) != {"tag", "peeled"}:
+                raise SyncError("malformed_legacy_tag", "Legacy tag list was malformed.", EXIT_CONFLICT)
+            local = self.runner.run("rev-parse", "--verify", "--quiet", ref, check=False).stdout.strip()
+            if local and local != item["tag"]:
+                raise SyncError("legacy_tag_local_collision", "Local legacy bookmark ref differs from remote.", EXIT_CONFLICT)
+            if not local:
+                fetched = self.runner.run("fetch", "--no-tags", self.remote, f"{ref}:{ref}", check=False)
+                if fetched.returncode:
+                    raise SyncError("legacy_tag_fetch_failed", "Legacy bookmark could not be fetched for verification.", EXIT_CONFLICT)
+            verified = self.runner.run("rev-parse", "--verify", "--quiet", f"{ref}^{{}}", check=False).stdout.strip()
+            if verified != item["peeled"]:
+                raise SyncError("legacy_tag_remote_mismatch", "Legacy bookmark target could not be verified.", EXIT_CONFLICT)
+            short = ref.removeprefix("refs/tags/")
+            if short not in known:
+                rows.append((short, verified)); known.add(short)
+        if len(rows) > limit:
+            return tuple(rows[:limit])
+        return tuple(rows)
+
+    def _managed_bookmark_rows(self, *, remote: bool) -> tuple[tuple[str, str, str], ...]:
+        """Return ``(short_name, tag_oid, peeled_commit)`` for managed tags.
+
+        ``ls-remote`` is intentionally used without ``--refs``: annotated
+        tags must have the matching peeled ``^{} `` row, otherwise a remote
+        could make an unverifiable object look like a bookmark.
+        """
+        prefix = "refs/tags/grim-dawn-save-"
+        if remote:
+            result = self.runner.run("ls-remote", self.remote, f"{prefix}*", check=False)
+        else:
+            result = self.runner.run(
+                "for-each-ref", "--format=%(refname)\t%(objectname)\t%(*objectname)", prefix,
+            )
+        if result.returncode:
+            raise SyncError("bookmark_list_failed", "Managed bookmark refs could not be read.", EXIT_CONFLICT)
+        if remote and len(result.stdout.encode("utf-8", "surrogatepass")) > 128 * 1024:
+            raise SyncError("bookmark_list_too_large", "Managed bookmark ref output exceeded its safe bound.", EXIT_CONFLICT)
+        values: dict[str, dict[str, str]] = {}
+        for row in result.stdout.splitlines():
+            fields = row.split("\t")
+            if len(fields) != (2 if remote else 3):
+                raise SyncError("malformed_bookmark_ref", "Managed bookmark refs were malformed.", EXIT_CONFLICT)
+            if remote:
+                oid, ref = fields
+                peeled = ref.endswith("^{}")
+                base = ref[:-3] if peeled else ref
+                if not base.startswith(prefix) or not re.fullmatch(r"refs/tags/grim-dawn-save-[0-9a-f]{32}", base) or not _OID.fullmatch(oid):
+                    raise SyncError("malformed_bookmark_ref", "Managed bookmark refs were malformed.", EXIT_CONFLICT)
+                item = values.setdefault(base, {})
+                key = "peeled" if peeled else "tag"
+                if key in item:
+                    raise SyncError("malformed_bookmark_ref", "Managed bookmark refs were malformed.", EXIT_CONFLICT)
+                item[key] = oid
+            else:
+                ref, tag_oid, target = fields
+                if not re.fullmatch(r"refs/tags/grim-dawn-save-[0-9a-f]{32}", ref) or not _OID.fullmatch(tag_oid) or not _OID.fullmatch(target):
+                    raise SyncError("malformed_bookmark_ref", "Managed bookmark refs were malformed.", EXIT_CONFLICT)
+                values[ref] = {"tag": tag_oid, "peeled": target}
+            if remote and len(values) > 100:
+                raise SyncError("bookmark_list_too_large", "Managed bookmark count exceeded its safe bound.", EXIT_CONFLICT)
+        rows: list[tuple[str, str, str]] = []
+        for ref, item in sorted(values.items()):
+            if set(item) != {"tag", "peeled"}:
+                raise SyncError("malformed_bookmark_ref", "Managed bookmark refs were malformed.", EXIT_CONFLICT)
+            rows.append((ref.removeprefix("refs/tags/"), item["tag"], item["peeled"]))
+        return tuple(rows)
+
+    def managed_bookmarks(self, *, limit: int = 100) -> tuple[tuple[str, str, str], ...]:
+        """Fetch and verify remote managed tags, returning annotation strings.
+
+        The returned short tag name is generated by this tool, never supplied
+        by a user.  Fetching tags only materializes verified Git objects; it
+        never changes main, live data, state, locks, or a worktree checkout.
+        """
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise SyncError("invalid_history_limit", "Tag limit must be between 1 and 100.", EXIT_CONFIGURATION)
+        rows = self._managed_bookmark_rows(remote=True)
+        if len(rows) > limit:
+            rows = rows[:limit]
+        results: list[tuple[str, str, str]] = []
+        for name, tag_oid, target in rows:
+            ref = f"refs/tags/{name}"
+            # A tag ref can never be overwritten or moved by this operation.
+            present = self.runner.run("rev-parse", "--verify", "--quiet", ref, check=False).stdout.strip()
+            if present and present != tag_oid:
+                raise SyncError("bookmark_local_collision", "Local managed bookmark ref differs from remote.", EXIT_CONFLICT)
+            if not present:
+                fetched = self.runner.run("fetch", "--no-tags", self.remote, f"{ref}:{ref}", check=False)
+                if fetched.returncode:
+                    raise SyncError("bookmark_fetch_failed", "Managed bookmark could not be fetched for verification.", EXIT_CONFLICT)
+            object_oid = self.runner.run("rev-parse", "--verify", "--quiet", ref, check=False).stdout.strip()
+            peeled = self.runner.run("rev-parse", "--verify", "--quiet", f"{ref}^{{}}", check=False).stdout.strip()
+            if object_oid != tag_oid or peeled != target:
+                raise SyncError("bookmark_remote_mismatch", "Managed bookmark target could not be verified.", EXIT_CONFLICT)
+            shown = self.runner.run("cat-file", "tag", ref, check=False)
+            if shown.returncode or "\n\n" not in shown.stdout:
+                raise SyncError("invalid_bookmark_annotation", "Managed bookmark annotation is invalid.", EXIT_VALIDATION)
+            annotation = shown.stdout.split("\n\n", 1)[1]
+            results.append((name, target, annotation))
+        return tuple(results)
+
+    def create_managed_bookmark(self, commit: str, annotation: str, *, detached_root_hash: str | None = None,
+                                expected_remote_head: str | None = None,
+                                expected_lock_oid: str | None = None,
+                                publication_guard: Callable[[], None] | None = None,
+                                publication_intent: Callable[[str, str, str], None] | None = None,
+                                publication_confirmed: Callable[[str, str, str], None] | None = None) -> tuple[str, str, str]:
+        """Create a UUID-named annotated tag and prove its remote target.
+
+        The annotation has already been strict-validated by ``bookmarks``;
+        this method still treats it solely as stdin data, never argv or shell.
+        """
+        self.assert_remote_identity()
+        commit = _oid_value(commit)
+        if self.runner.run("cat-file", "-e", f"{commit}^{{commit}}", check=False).returncode:
+            raise SyncError("invalid_bookmark_commit", "Bookmark commit is unavailable.", EXIT_VALIDATION)
+        # Only a verified remote-main ancestor is eligible for ordinary use.
+        remote = self.remote_oid()
+        ordinary = remote is not None and self.runner.run("merge-base", "--is-ancestor", commit, remote, check=False).returncode == 0
+        if not ordinary:
+            if detached_root_hash is None or expected_remote_head != remote or not re.fullmatch(r"[0-9a-f]{64}", detached_root_hash):
+                raise SyncError("bookmark_commit_not_allowed", "Bookmark commit is not a verified save version.", EXIT_VALIDATION)
+            parents = self.runner.run("rev-list", "--parents", "-n", "1", commit, check=False).stdout.strip().split()
+            manifest = self.validate_commit_snapshot(commit)
+            containing = self.runner.run("for-each-ref", "--contains", commit, "--format=%(refname)").stdout.strip()
+            if parents != [commit, remote] or manifest.get("root_hash") != detached_root_hash or containing:
+                raise SyncError("bookmark_commit_not_allowed", "Detached bookmark snapshot was not authorized.", EXIT_VALIDATION)
+        name = f"grim-dawn-save-{uuid.uuid4().hex}"
+        ref = f"refs/tags/{name}"
+        if self.runner.run("rev-parse", "--verify", "--quiet", ref, check=False).stdout.strip():
+            raise SyncError("bookmark_exists", "Managed bookmark ref already exists.", EXIT_CONFLICT)
+        if publication_guard is not None:
+            publication_guard()
+        made = self.runner.run("tag", "-a", name, commit, "-F", "-", input_text=annotation, check=False)
+        if made.returncode:
+            raise SyncError("bookmark_create_failed", "Managed bookmark could not be created.", EXIT_RECOVERY_REQUIRED)
+        local_tag_oid = self.runner.run("rev-parse", "--verify", "--quiet", ref, check=False).stdout.strip()
+        if not _OID.fullmatch(local_tag_oid):
+            raise SyncError("bookmark_create_failed", "Managed bookmark tag object was not created.", EXIT_RECOVERY_REQUIRED)
+        if publication_intent is not None:
+            try:
+                publication_intent(name, local_tag_oid, commit)
+            except Exception:
+                # The recoverable intent was not persisted, so this generated
+                # tag must not survive as an untracked local ref.  Cleanup is
+                # allowed only while the exact lock/state guard still holds,
+                # the remote tag is absent, and the local ref still names the
+                # exact annotated-tag object and peeled commit we just made.
+                if publication_guard is not None:
+                    publication_guard()
+                remote_rows = {item[0]: item for item in self._managed_bookmark_rows(remote=True)}
+                if name in remote_rows:
+                    raise SyncError("bookmark_intent_incomplete", "Bookmark intent failed after remote publication; recovery is required.", EXIT_RECOVERY_REQUIRED)
+                actual_tag = self.runner.run("rev-parse", "--verify", "--quiet", ref, check=False).stdout.strip()
+                actual_target = self.runner.run("rev-parse", "--verify", "--quiet", f"{ref}^{{}}", check=False).stdout.strip()
+                actual_type = self.runner.run("cat-file", "-t", ref, check=False).stdout.strip()
+                if actual_tag != local_tag_oid or actual_target != commit or actual_type != "tag":
+                    raise SyncError("bookmark_intent_cleanup_unsafe", "Unpersisted bookmark tag no longer matches its exact object.", EXIT_RECOVERY_REQUIRED)
+                deleted = self.runner.run("tag", "-d", name, check=False)
+                remaining = self.runner.run("rev-parse", "--verify", "--quiet", ref, check=False).stdout.strip()
+                if deleted.returncode or remaining:
+                    raise SyncError("bookmark_intent_cleanup_incomplete", "Unpersisted local bookmark cleanup is incomplete.", EXIT_RECOVERY_REQUIRED)
+                raise
+        self.assert_remote_identity()
+        if publication_guard is not None:
+            publication_guard()
+        if expected_lock_oid is not None:
+            lock_oid = _oid_value(expected_lock_oid, "lock")
+            if expected_remote_head is None:
+                raise SyncError("bookmark_lock_required", "Live bookmark publication requires an exact remote base.", EXIT_CONFLICT)
+            self.runner.run(
+                "push", "--atomic",
+                f"--force-with-lease=refs/tags/grim-dawn-sync-active:{lock_oid}",
+                f"--force-with-lease={self.remote_head}:{expected_remote_head}",
+                self.remote,
+                f"{expected_remote_head}:{self.remote_head}",
+                f"{lock_oid}:refs/tags/grim-dawn-sync-active",
+                f"{ref}:{ref}", check=False,
+            )
+        else:
+            self.runner.run("push", self.remote, f"{ref}:{ref}", check=False)
+        self.assert_remote_identity()
+        if publication_guard is not None:
+            publication_guard()
+        remote_rows = {item[0]: item for item in self._managed_bookmark_rows(remote=True)}
+        row = remote_rows.get(name)
+        # The peeled commit alone is insufficient: a remote could retain a
+        # different annotated tag object with a different user-visible note.
+        # Matching object OIDs proves the local annotation below is exactly the
+        # one stored by the remote immutable ref.
+        if row is None or row[2] != commit or row[1] != local_tag_oid or not _OID.fullmatch(local_tag_oid):
+            raise SyncError("bookmark_push_incomplete", "Managed bookmark remote object was not confirmed.", EXIT_RECOVERY_REQUIRED)
+        if detached_root_hash is not None and self.validate_commit_snapshot(row[2]).get("root_hash") != detached_root_hash:
+            raise SyncError("bookmark_push_incomplete", "Remote bookmark snapshot root was not confirmed.", EXIT_RECOVERY_REQUIRED)
+        shown = self.runner.run("cat-file", "tag", ref, check=False)
+        if shown.returncode or "\n\n" not in shown.stdout:
+            raise SyncError("bookmark_remote_mismatch", "Managed bookmark annotation could not be verified.", EXIT_RECOVERY_REQUIRED)
+        if publication_confirmed is not None:
+            publication_confirmed(name, local_tag_oid, commit)
+        return name, commit, shown.stdout.split("\n\n", 1)[1]
+
+    def publish_managed_bookmark_intent(self, name: str, tag_oid: str, commit: str, root_hash: str, *,
+                                        expected_remote_head: str, expected_lock_oid: str,
+                                        publication_guard: Callable[[], None]) -> None:
+        """Idempotently finish one exact persisted managed-tag publication."""
+        if not re.fullmatch(r"grim-dawn-save-[0-9a-f]{32}", name):
+            raise SyncError("invalid_bookmark_intent", "Managed bookmark intent ref is invalid.", EXIT_RECOVERY_REQUIRED)
+        tag_oid = _oid_value(tag_oid, "tag"); commit = _oid_value(commit); lock_oid = _oid_value(expected_lock_oid, "lock")
+        expected_remote_head = _oid_value(expected_remote_head); ref = f"refs/tags/{name}"
+        if not re.fullmatch(r"[0-9a-f]{64}", root_hash):
+            raise SyncError("invalid_bookmark_intent", "Managed bookmark intent root is invalid.", EXIT_RECOVERY_REQUIRED)
+        local_tag = self.runner.run("rev-parse", "--verify", "--quiet", ref, check=False).stdout.strip()
+        local_target = self.runner.run("rev-parse", "--verify", "--quiet", f"{ref}^{{}}", check=False).stdout.strip()
+        if local_tag != tag_oid or local_target != commit or self.validate_commit_snapshot(commit).get("root_hash") != root_hash:
+            raise SyncError("invalid_bookmark_intent", "Local managed bookmark intent does not match its objects.", EXIT_RECOVERY_REQUIRED)
+        publication_guard()
+        self.runner.run(
+            "push", "--atomic",
+            f"--force-with-lease=refs/tags/grim-dawn-sync-active:{lock_oid}",
+            f"--force-with-lease={self.remote_head}:{expected_remote_head}",
+            self.remote,
+            f"{expected_remote_head}:{self.remote_head}", f"{lock_oid}:refs/tags/grim-dawn-sync-active",
+            f"{ref}:{ref}", check=False,
+        )
+        publication_guard()
+        rows = {row[0]: row for row in self._managed_bookmark_rows(remote=True)}
+        row = rows.get(name)
+        if row is None or row[1] != tag_oid or row[2] != commit or self.validate_commit_snapshot(commit).get("root_hash") != root_hash:
+            raise SyncError("bookmark_push_incomplete", "Persisted bookmark publication was not confirmed.", EXIT_RECOVERY_REQUIRED)
 
     def _oid(self, ref: str) -> str | None:
         result = self.runner.run("rev-parse", "--verify", "--quiet", ref, check=False)
@@ -554,9 +969,11 @@ class GitVault:
         return oid
 
     def push(self, expected_oid: str | None = None) -> str:
+        self.assert_remote_identity()
         oid = self._oid("HEAD")
         if oid is None: raise SyncError("vault_unborn", "Vault has no local commit to push.", EXIT_CONFIGURATION)
         if expected_oid and oid != expected_oid: raise SyncError("vault_head_changed", "Vault HEAD changed before push.", EXIT_CONFLICT)
+        self.assert_remote_identity()
         pushed = self.runner.run("push", self.remote, f"HEAD:{self.remote_head}", check=False)
         if pushed.returncode:
             raise SyncError("push_incomplete", "Local vault commit was retained; remote push did not complete.", EXIT_RECOVERY_REQUIRED, {"local_commit": oid})
@@ -569,9 +986,18 @@ class GitVault:
         if self.runner.run("cat-file", "-e", f"{commit}^{{commit}}", check=False).returncode:
             raise SyncError("invalid_restore_commit", "Restore commit was not available.", EXIT_VALIDATION)
         ancestry = self.runner.run("merge-base", "--is-ancestor", commit, "HEAD", check=False).returncode
-        if ancestry == 1: raise SyncError("restore_commit_not_in_history", "Restore commit is not in vault history.", EXIT_VALIDATION)
-        if ancestry != 0: raise SyncError("git_command_failed", "Restore commit ancestry could not be verified.", EXIT_CONFLICT)
+        if ancestry == 1:
+            managed_targets = {target for _, target, _ in self.managed_bookmarks(limit=100)}
+            if commit not in managed_targets:
+                raise SyncError("restore_commit_not_in_history", "Restore commit is not in vault history or a verified managed bookmark.", EXIT_VALIDATION)
+        elif ancestry != 0:
+            raise SyncError("git_command_failed", "Restore commit ancestry could not be verified.", EXIT_CONFLICT)
         manifest = self.validate_commit_snapshot(commit)
+        _safe_destination_ancestors(destination)
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            raise SyncError("historical_extract_failed", "Historical save parent could not be created safely.", EXIT_VALIDATION) from error
         _safe_destination_ancestors(destination)
         listing = self.runner.run("ls-tree", "-r", "-z", commit, "--", "save").stdout
         tree_files: set[str] = set()

@@ -10,6 +10,8 @@ import pytest
 from grim_dawn_sync.config import parse_config
 from grim_dawn_sync.errors import EXIT_CONFLICT, EXIT_RECOVERY_REQUIRED, EXIT_VALIDATION, SyncError
 from grim_dawn_sync.workflow import DomainAdapters, LaunchWorkflow, WorkflowState
+from grim_dawn_sync.selection import ReconcileCase, SelectionRegistry
+from grim_dawn_sync.version_catalog import ManifestDiff, SaveCandidate, VersionCatalog
 
 
 def config(tmp_path: Path):
@@ -43,6 +45,7 @@ class FakeAdapters:
     def fetch_and_reconcile(self): self._call("fetch"); return SimpleNamespace(relation=self.relation)
     def remote_oid(self): self._call("remote_oid"); return self.remote
     def acquire(self, base): self._call("acquire"); assert base == self.remote; return self.lock
+    def align_selection_base(self, base): self._call("align"); assert base == self.remote
     def prepare_remote_restore(self, base, session): self._call("prepare"); assert (base, session) == (self.remote, "session-1"); return "plan"
     def archive_before_restore(self, plan): self._call("archive_before"); assert plan == "plan"; return "archived-plan"
     def apply_remote_save(self, plan): self._call("apply"); assert plan == "archived-plan"; return {"ok": True}
@@ -358,3 +361,196 @@ def test_validation_failure_rescues_only_locally_and_retains_lock(tmp_path: Path
     with pytest.raises(SyncError) as got: subject.run()
     assert got.value.code == "unsupported_save_version"
     assert "rescue" in adapters.calls and not {"snapshot", "push", "release"}.intersection(adapters.calls)
+
+
+def test_selection_stale_and_cancel_boundary_do_not_acquire_or_write(tmp_path: Path) -> None:
+    adapters = FakeAdapters(); subject, _ = run(tmp_path, adapters)
+    live, remote, commit = "1" * 64, "2" * 64, "a" * 40
+    item = SaveCandidate("remote", "remote_head", "remote", "x", "m", remote, commit, 0, 0, 0, (), ManifestDiff(0, 0, 0))
+    catalog = VersionCatalog("t" * 32, commit, live, (item,)); registry = SelectionRegistry(); registry.register(catalog)
+    plan = registry.build_plan(catalog_token=catalog.token, candidate_id=item.candidate_id, mode="launch", case=ReconcileCase.REMOTE_AHEAD)
+    adapters.live_manifest = lambda: {"root_hash": "f" * 64}
+    adapters.remote_oid = lambda: commit
+    with pytest.raises(SyncError) as caught:
+        subject.execute_selection_plan(plan, registry)
+    assert caught.value.code == "selection_stale" and adapters.calls == ["preflight"] and not subject.mutated
+
+
+def test_selection_bookmarks_before_restore_and_post_lock_failure_has_recovery(tmp_path: Path) -> None:
+    adapters = FakeAdapters(); subject, _ = run(tmp_path, adapters)
+    live, remote, commit = "1" * 64, "2" * 64, "a" * 40
+    item = SaveCandidate("live", "live", "live", "x", "m", live, None, 0, 0, 0, (), ManifestDiff(0, 0, 0))
+    catalog = VersionCatalog("u" * 32, commit, live, (item,)); registry = SelectionRegistry(); registry.register(catalog)
+    plan = registry.build_plan(catalog_token=catalog.token, candidate_id=item.candidate_id, mode="launch", case=ReconcileCase.LIVE_AHEAD)
+    adapters.live_manifest = lambda: {"root_hash": live}
+    adapters.remote_oid = lambda: commit
+    adapters.bookmark_displaced_remote = lambda oid, _plan: adapters.calls.append("bookmark")
+    adapters.wait_save_stable = lambda: {"root_hash": live, "character_count": 1, "file_count": 1, "total_bytes": 1}
+    adapters.validate = lambda *_: (_ for _ in ()).throw(SyncError("save_invalid", "x", EXIT_VALIDATION))
+    with pytest.raises(SyncError) as caught:
+        subject.execute_selection_plan(plan, registry)
+    assert caught.value.details["next_command"] == "grim-dawn-sync recover"
+    assert adapters.calls.index("bookmark") < adapters.calls.index("launch")
+
+
+def test_context_digest_and_remote_identity_revalidate_immediately_before_lock(tmp_path: Path) -> None:
+    adapters = FakeAdapters(); subject, _ = run(tmp_path, adapters)
+    live, remote, commit = "1" * 64, "2" * 64, "a" * 40
+    item = SaveCandidate("live", "live", "live", "x", "m", live, None, 0, 0, 0, (), ManifestDiff(0, 0, 0))
+    catalog = VersionCatalog("v" * 32, commit, live, (item,)); registry = SelectionRegistry(); registry.register(catalog)
+    identity = ("test://vault", "test://vault")
+    plan = registry.build_plan(catalog_token=catalog.token, candidate_id=item.candidate_id, mode="launch",
+                               case=ReconcileCase.LIVE_AHEAD, expected_context_digest="d" * 64,
+                               expected_remote_identity=identity)
+    adapters.live_manifest = lambda: {"root_hash": live}
+    adapters.remote_oid = lambda: commit
+    adapters.bind_remote_identity = lambda value: adapters.calls.append("bind") if value == identity else pytest.fail("identity")
+    def bookmark(*_args):
+        adapters.calls.append("bookmark")
+        raise SyncError("bookmark_push_incomplete", "x", EXIT_RECOVERY_REQUIRED)
+    adapters.bookmark_displaced_remote = bookmark
+    with pytest.raises(SyncError):
+        subject.execute_selection_plan(plan, registry, context_revalidate=lambda digest: adapters.calls.append("context") if digest == "d" * 64 else pytest.fail("digest"))
+    assert adapters.calls[:4] == ["preflight", "context", "bind", "acquire"]
+
+
+def test_promote_only_live_rechecks_selected_root_immediately_before_snapshot(tmp_path: Path) -> None:
+    adapters = FakeAdapters(); subject, _ = run(tmp_path, adapters)
+    live, commit = "1" * 64, "a" * 40
+    item = SaveCandidate("live", "live", "live", "x", "m", live, None, 0, 0, 0, (), ManifestDiff(0, 0, 0))
+    catalog = VersionCatalog("v" * 32, commit, live, (item,)); registry = SelectionRegistry(); registry.register(catalog)
+    plan = registry.build_plan(catalog_token=catalog.token, candidate_id=item.candidate_id, mode="promote-only", case=ReconcileCase.LIVE_AHEAD)
+    roots = iter((live, live, live, "9" * 64))
+    adapters.live_manifest = lambda: {"root_hash": next(roots)}
+    adapters.remote_oid = lambda: commit
+    adapters.bookmark_displaced_remote = lambda *_: adapters.calls.append("bookmark")
+    adapters.wait_save_stable = lambda: {"root_hash": live, "character_count": 1, "file_count": 1, "total_bytes": 1}
+    adapters.validate = lambda manifest, _baseline: adapters.calls.append("validate") or manifest
+    adapters.archive_after_game = lambda manifest: adapters.calls.append("archive_after_game") or manifest["root_hash"]
+    with pytest.raises(SyncError) as caught:
+        subject.execute_selection_plan(plan, registry)
+    assert caught.value.code == "selected_save_changed"
+    assert "snapshot" not in adapters.calls and caught.value.details["next_command"] == "grim-dawn-sync recover"
+
+
+def test_promote_only_verifies_published_remote_root_and_keeps_safe_handoff(tmp_path: Path) -> None:
+    adapters = FakeAdapters(); subject, _ = run(tmp_path, adapters)
+    live, commit = "1" * 64, "a" * 40
+    item = SaveCandidate("live", "live", "live", "x", "m", live, None, 0, 0, 0, (), ManifestDiff(0, 0, 0))
+    catalog = VersionCatalog("w" * 32, commit, live, (item,)); registry = SelectionRegistry(); registry.register(catalog)
+    plan = registry.build_plan(catalog_token=catalog.token, candidate_id=item.candidate_id, mode="promote-only", case=ReconcileCase.LIVE_AHEAD)
+    adapters.live_manifest = lambda: {"root_hash": live}
+    adapters.remote_oid = lambda: commit
+    adapters.bookmark_displaced_remote = lambda *_: adapters.calls.append("bookmark")
+    adapters.wait_save_stable = lambda: {"root_hash": live, "character_count": 1, "file_count": 1, "total_bytes": 1}
+    adapters.validate = lambda manifest, _baseline: adapters.calls.append("validate") or manifest
+    adapters.mark_committed = lambda *_: adapters.calls.append("mark_committed")
+    adapters.remote_manifest = lambda *_: {"root_hash": "9" * 64}
+    with pytest.raises(SyncError) as caught:
+        subject.execute_selection_plan(plan, registry)
+    assert caught.value.code == "selected_publish_mismatch"
+    assert caught.value.details["local_commit"] == "c" * 40 and caught.value.details["root_hash"] == live
+    assert "release" not in adapters.calls
+
+
+def test_selection_post_lock_logging_failure_keeps_recovery_handoff(tmp_path: Path) -> None:
+    class FailAfterAcquire:
+        def write(self, state, *_args, **_kwargs):
+            if state is WorkflowState.BOOKMARK_DISPLACED_REMOTE:
+                raise OSError("audit")
+    adapters = FakeAdapters(); subject, _ = run(tmp_path, adapters); subject.logger = FailAfterAcquire()
+    live, commit = "1" * 64, "a" * 40
+    item = SaveCandidate("live", "live", "live", "x", "m", live, None, 0, 0, 0, (), ManifestDiff(0, 0, 0))
+    catalog = VersionCatalog("z" * 32, commit, live, (item,)); registry = SelectionRegistry(); registry.register(catalog)
+    plan = registry.build_plan(catalog_token=catalog.token, candidate_id=item.candidate_id, mode="launch", case=ReconcileCase.LIVE_AHEAD)
+    adapters.live_manifest = lambda: {"root_hash": live}; adapters.remote_oid = lambda: commit
+    with pytest.raises(SyncError) as caught:
+        subject.execute_selection_plan(plan, registry)
+    assert caught.value.code == "logging_failed" and caught.value.exit_code == EXIT_RECOVERY_REQUIRED
+    assert caught.value.details["next_command"] == "grim-dawn-sync recover"
+
+
+def test_selection_unexpected_post_lock_fault_is_normalized_for_recovery(tmp_path: Path) -> None:
+    adapters = FakeAdapters(); subject, _ = run(tmp_path, adapters)
+    live, commit = "1" * 64, "a" * 40
+    item = SaveCandidate("live", "live", "live", "x", "m", live, None, 0, 0, 0, (), ManifestDiff(0, 0, 0))
+    catalog = VersionCatalog("q" * 32, commit, live, (item,)); registry = SelectionRegistry(); registry.register(catalog)
+    plan = registry.build_plan(catalog_token=catalog.token, candidate_id=item.candidate_id, mode="launch", case=ReconcileCase.LIVE_AHEAD)
+    adapters.live_manifest = lambda: {"root_hash": live}; adapters.remote_oid = lambda: commit
+    adapters.bookmark_displaced_remote = lambda *_: (_ for _ in ()).throw(OSError("private adapter cause"))
+    with pytest.raises(SyncError) as caught:
+        subject.execute_selection_plan(plan, registry)
+    assert caught.value.code == "unexpected_failure" and caught.value.exit_code == EXIT_RECOVERY_REQUIRED
+    assert caught.value.details["next_command"] == "grim-dawn-sync recover"
+    assert "private adapter cause" not in str(caught.value)
+
+
+@pytest.mark.parametrize("race", ["pre_lock", "post_lock"])
+def test_remote_candidate_live_race_stops_before_any_save_mutation(tmp_path: Path, race: str) -> None:
+    adapters = FakeAdapters(); subject, _ = run(tmp_path, adapters)
+    live, selected, commit = "1" * 64, "2" * 64, "a" * 40
+    item = SaveCandidate("remote", "remote_head", "remote", "x", "m", selected, commit, 0, 0, 0, (), ManifestDiff(0, 0, 0))
+    catalog = VersionCatalog("r" * 32, commit, live, (item,)); registry = SelectionRegistry(); registry.register(catalog)
+    plan = registry.build_plan(catalog_token=catalog.token, candidate_id=item.candidate_id, mode="launch", case=ReconcileCase.REMOTE_AHEAD)
+    roots = iter((live, "9" * 64)) if race == "pre_lock" else iter((live, live, "9" * 64))
+    adapters.live_manifest = lambda: {"root_hash": next(roots)}; adapters.remote_oid = lambda: commit
+    with pytest.raises(SyncError) as caught:
+        subject.execute_selection_plan(plan, registry)
+    assert caught.value.code == "selection_stale"
+    assert not {"prepare", "archive_before", "apply"}.intersection(adapters.calls)
+    if race == "pre_lock":
+        assert "acquire" not in adapters.calls and not subject.mutated
+    else:
+        assert "acquire" in adapters.calls and caught.value.exit_code == EXIT_RECOVERY_REQUIRED
+        assert caught.value.details["next_command"] == "grim-dawn-sync recover"
+
+
+@pytest.mark.parametrize("stage", ["bookmark", "prepare", "archive_before", "apply", "launch", "wait", "validate", "archive_after_game", "snapshot", "mark_committed", "push", "remote_verify", "release"])
+def test_every_selection_post_lock_sync_fault_is_recovery_required(tmp_path: Path, stage: str) -> None:
+    adapters = FakeAdapters(); subject, _ = run(tmp_path, adapters)
+    live, selected, commit = "1" * 64, "2" * 64, "a" * 40
+    remote_stage = stage in {"prepare", "archive_before", "apply"}
+    kind = "remote_head" if remote_stage else "live"; root = selected if remote_stage else live; chosen = commit if remote_stage else None
+    item = SaveCandidate("chosen", kind, kind, "x", "m", root, chosen, 0, 0, 0, (), ManifestDiff(0, 0, 0))
+    catalog = VersionCatalog("s" * 32, commit, live, (item,)); registry = SelectionRegistry(); registry.register(catalog)
+    mode = "promote-only" if stage == "remote_verify" else "launch"
+    case = ReconcileCase.REMOTE_AHEAD if remote_stage else ReconcileCase.LIVE_AHEAD
+    plan = registry.build_plan(catalog_token=catalog.token, candidate_id=item.candidate_id, mode=mode, case=case)
+    adapters.live_manifest = lambda: {"root_hash": live}; adapters.remote_oid = lambda: commit
+    adapters.wait_save_stable = lambda: {"root_hash": root, "character_count": 1, "file_count": 1, "total_bytes": 1}
+    adapters.validate = lambda manifest, _baseline: adapters._call("validate") or manifest
+    adapters.mark_committed = lambda *_: adapters._call("mark_committed")
+    adapters.bookmark_displaced_remote = lambda *_: adapters._call("bookmark")
+    adapters.remote_manifest = lambda *_: adapters._call("remote_verify") or {"root_hash": root}
+    fault = SyncError(f"fault_{stage}", "safe failure", EXIT_VALIDATION)
+    if stage in {"prepare", "archive_before", "apply", "launch", "validate", "archive_after_game", "snapshot", "mark_committed", "push", "release"}:
+        adapters.failure = (stage, fault)
+    elif stage == "bookmark":
+        adapters.bookmark_displaced_remote = lambda *_: (_ for _ in ()).throw(fault)
+    elif stage == "wait":
+        adapters.wait_save_stable = lambda: (_ for _ in ()).throw(fault)
+        adapters.rescue_raw = lambda *_: "3" * 64
+    else:
+        adapters.remote_manifest = lambda *_: (_ for _ in ()).throw(fault)
+    adapters.last_archive_destination = "save-20260801T000000Z-1111111111111111-" + "a" * 32
+    adapters.last_archive_root = live
+    with pytest.raises(SyncError) as caught:
+        subject.execute_selection_plan(plan, registry)
+    assert caught.value.code == f"fault_{stage}" and caught.value.message == "safe failure"
+    assert caught.value.exit_code == EXIT_RECOVERY_REQUIRED
+    assert caught.value.details["next_command"] == "grim-dawn-sync recover"
+    assert caught.value.details["archive"].startswith("save-")
+
+
+def test_lock_push_unknown_during_acquire_requires_recovery(tmp_path: Path) -> None:
+    adapters = FakeAdapters(); subject, _ = run(tmp_path, adapters)
+    live, commit = "1" * 64, "a" * 40
+    item = SaveCandidate("live", "live", "live", "x", "m", live, None, 0, 0, 0, (), ManifestDiff(0, 0, 0))
+    catalog = VersionCatalog("p" * 32, commit, live, (item,)); registry = SelectionRegistry(); registry.register(catalog)
+    plan = registry.build_plan(catalog_token=catalog.token, candidate_id=item.candidate_id, mode="launch", case=ReconcileCase.LIVE_AHEAD)
+    adapters.live_manifest = lambda: {"root_hash": live}; adapters.remote_oid = lambda: commit
+    adapters.acquire = lambda _base: (_ for _ in ()).throw(SyncError("lock_push_unknown", "Lock result is unknown.", EXIT_CONFLICT))
+    with pytest.raises(SyncError) as caught:
+        subject.execute_selection_plan(plan, registry)
+    assert caught.value.code == "lock_push_unknown" and caught.value.exit_code == EXIT_RECOVERY_REQUIRED
+    assert caught.value.details["next_command"] == "grim-dawn-sync recover"

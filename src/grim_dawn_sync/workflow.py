@@ -22,10 +22,12 @@ from grim_dawn_sync.session_lock import acquire_lock, release_lock
 from grim_dawn_sync.snapshot import _copy_verified, _manifest, apply_restore, archive_before_restore, plan_restore
 from grim_dawn_sync.state import SyncState, load_state, save_state
 from grim_dawn_sync.validation import destructive_change, validate_players
+from grim_dawn_sync.bookmarks import create_bookmark
+from grim_dawn_sync.selection import SelectionPlan, SelectionRegistry
 
 
 class WorkflowState(str, Enum):
-    PREFLIGHT="PREFLIGHT"; FETCH_REMOTE="FETCH_REMOTE"; RECONCILE="RECONCILE"; ACQUIRE_LOCK="ACQUIRE_LOCK"
+    PREFLIGHT="PREFLIGHT"; FETCH_REMOTE="FETCH_REMOTE"; RECONCILE="RECONCILE"; BUILD_CATALOG="BUILD_CATALOG"; WAIT_SELECTION="WAIT_SELECTION"; REVALIDATE_SELECTION="REVALIDATE_SELECTION"; ACQUIRE_LOCK="ACQUIRE_LOCK"; BOOKMARK_DISPLACED_REMOTE="BOOKMARK_DISPLACED_REMOTE"
     ARCHIVE_BEFORE_RESTORE="ARCHIVE_BEFORE_RESTORE"; APPLY_REMOTE_SAVE="APPLY_REMOTE_SAVE"; START_DPYES="START_DPYES"
     WAIT_GAME_START="WAIT_GAME_START"; WAIT_GAME_EXIT="WAIT_GAME_EXIT"; WAIT_SAVE_STABLE="WAIT_SAVE_STABLE"
     VALIDATE_SAVE="VALIDATE_SAVE"; ARCHIVE_AFTER_GAME="ARCHIVE_AFTER_GAME"; UPDATE_VAULT="UPDATE_VAULT"
@@ -103,6 +105,22 @@ class DomainAdapters:
         return self.vault.read_manifest(base)
     def fetch_and_reconcile(self): return self.vault.update_fast_forward()
     def remote_oid(self) -> str | None: return self.vault.remote_oid()
+    def bookmark_displaced_remote(self, commit: str, plan: SelectionPlan) -> None:
+        """Preserve the exact old remote head before any restore or main push."""
+        if not commit:
+            raise SyncError("remote_main_missing", "Remote main is missing; no selection was applied.", EXIT_CONFLICT)
+        # The generated tag ref is opaque; only this fixed, plain-text label is
+        # used for an automatic safety bookmark.
+        create_bookmark(
+            self.vault, commit,
+            display_name="Automatic pre-selection remote backup",
+            note=None,
+            created_by=self.config.machine_id,
+        )
+    def bind_remote_identity(self, expected: tuple[str, str]) -> None:
+        self.vault.bind_remote_identity(expected)
+    def align_selection_base(self, expected_remote_head: str) -> None:
+        self.vault.align_head_to_remote(expected_remote_head)
     def acquire(self, base: str): return acquire_lock(self.vault,self.config.machine_id,base,state_path=self.state_path)
     def prepare_remote_restore(self, base: str, session: str):
         source=self.local_root/"staging"/session
@@ -239,6 +257,156 @@ class LaunchWorkflow:
             self.adapters.quarantine(live)
             raise SyncError("save_conflict","Live and remote saves both advanced; live save was quarantined.",EXIT_CONFLICT)
         raise SyncError("reconcile_inconsistent","Save baselines are inconsistent; run recover.",EXIT_RECOVERY_REQUIRED)
+
+    def execute_selection_plan(self, plan: SelectionPlan, registry: SelectionRegistry, *,
+                               context_revalidate: Callable[[str], None] | None = None) -> dict[str, str]:
+        """Execute one canonical selection only after its final stale check.
+
+        This intentionally leaves the legacy ``run`` path intact while CLI/UI
+        adapters migrate.  Every operation through ``WAIT_SELECTION`` is
+        read-only; the canonical plan returned by ``revalidate`` is the only
+        object trusted after that boundary.
+        """
+        lock = None; manifest: dict | None = None; safe_oid: str | None = None; safe_root_hash: str | None = None
+        acquire_started = False
+        archive_id: str | None = None; quarantine_id: str | None = None
+        archive_root: str | None = None; quarantine_root: str | None = None
+        def capture_destinations() -> None:
+            nonlocal archive_id, quarantine_id, archive_root, quarantine_root
+            archive_id = getattr(self.adapters, "last_archive_destination", archive_id)
+            quarantine_id = getattr(self.adapters, "last_quarantine_destination", quarantine_id)
+            archive_root = getattr(self.adapters, "last_archive_root", archive_root)
+            quarantine_root = getattr(self.adapters, "last_quarantine_root", quarantine_root)
+        def recovery_details() -> dict[str, str]:
+            details: dict[str, str] = {"last_state": self.state.value, "next_command": "grim-dawn-sync recover"}
+            if re.fullmatch(r"[A-Za-z0-9._-]{1,128}", self.config.machine_id): details["machine_id"] = self.config.machine_id
+            if self.session and re.fullmatch(r"[A-Za-z0-9._-]{1,128}", self.session): details["session_id"] = self.session
+            if safe_oid and re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", safe_oid): details["local_commit"] = safe_oid
+            if safe_root_hash and re.fullmatch(r"[0-9a-f]{64}", safe_root_hash): details["root_hash"] = safe_root_hash
+            if archive_id and re.fullmatch(r"save-[0-9TZ-]+-[0-9a-f]{16}-[0-9a-f]{32}", archive_id): details["archive"] = archive_id
+            if quarantine_id and re.fullmatch(r"save-[0-9TZ-]+-[0-9a-f]{16}-[0-9a-f]{32}", quarantine_id): details["quarantine"] = quarantine_id
+            return details
+        def require_live_root(expected: str, *, post_lock: bool) -> dict:
+            observed = self._call("live_manifest")
+            if observed.get("root_hash") != expected:
+                raise SyncError(
+                    "selection_stale",
+                    "Live save changed after selection; reload versions." if not post_lock else "Live save changed after lock acquisition; run recover.",
+                    EXIT_RECOVERY_REQUIRED if post_lock else EXIT_CONFLICT,
+                )
+            return observed
+        try:
+            self._require_adapter_contract()
+            self._at(WorkflowState.PREFLIGHT); self._call("preflight")
+            self._at(WorkflowState.REVALIDATE_SELECTION)
+            canonical = registry.revalidate(
+                plan, live_manifest=lambda: self._call("live_manifest"), remote_head=lambda: self._call("remote_oid"),
+            )
+            # No state, lock, archive, live-save, or vault mutation happened
+            # before the registry returned this canonical capability.
+            current_live = require_live_root(canonical.expected_live_root_hash, post_lock=False)
+            if current_live.get("root_hash") != canonical.selected_root_hash and canonical.selected_commit is None:
+                raise SyncError("selection_stale", "Save data changed while selection was open; reload versions.", EXIT_CONFLICT)
+            self.baseline = current_live
+            if canonical.expected_context_digest is not None:
+                if context_revalidate is None:
+                    raise SyncError("adapter_contract_invalid", "Selection context cannot be revalidated.", EXIT_CONFLICT)
+                context_revalidate(canonical.expected_context_digest)
+            if canonical.expected_remote_identity is not None:
+                binder = getattr(self.adapters, "bind_remote_identity", None)
+                if not callable(binder):
+                    raise SyncError("adapter_contract_invalid", "Remote identity cannot be bound.", EXIT_CONFLICT)
+                binder(canonical.expected_remote_identity)
+            self._at(WorkflowState.ACQUIRE_LOCK)
+            acquire_started = True
+            lock = self._call("acquire", canonical.expected_remote_head)
+            self.mutated = True; self.session = lock.session.session_id
+            # Close every live-save race before the first post-lock mutation,
+            # including remote candidates whose selected root differs by design.
+            require_live_root(canonical.expected_live_root_hash, post_lock=True)
+            if canonical.bookmark_displaced_remote:
+                self._at(WorkflowState.BOOKMARK_DISPLACED_REMOTE)
+                bookmark = getattr(self.adapters, "bookmark_displaced_remote", None)
+                if not callable(bookmark):
+                    raise SyncError("adapter_contract_invalid", "Selection adapter cannot preserve remote data.", EXIT_RECOVERY_REQUIRED)
+                bookmark(canonical.expected_remote_head, canonical)
+            align = getattr(self.adapters, "align_selection_base", None)
+            if not callable(align):
+                raise SyncError("adapter_contract_invalid", "Selection adapter cannot align the Vault base.", EXIT_RECOVERY_REQUIRED)
+            align(canonical.expected_remote_head)
+            if canonical.selected_commit is not None:
+                require_live_root(canonical.expected_live_root_hash, post_lock=True)
+                restore_plan = self._call("prepare_remote_restore", canonical.selected_commit, self.session)
+                self._at(WorkflowState.ARCHIVE_BEFORE_RESTORE)
+                restore_plan = self._call("archive_before_restore", restore_plan)
+                capture_destinations()
+                require_live_root(canonical.expected_live_root_hash, post_lock=True)
+                self._at(WorkflowState.APPLY_REMOTE_SAVE); self._call("apply_remote_save", restore_plan)
+                try: restored = self._call("wait_save_stable")
+                except SyncError:
+                    quarantine_root = self._call("rescue_raw", None); capture_destinations(); raise
+                if restored.get("root_hash") != canonical.selected_root_hash:
+                    raise SyncError("selected_restore_mismatch", "Selected save did not match its verified manifest.", EXIT_RECOVERY_REQUIRED)
+                self.baseline = restored
+            else:
+                self._skip(WorkflowState.ARCHIVE_BEFORE_RESTORE); self._skip(WorkflowState.APPLY_REMOTE_SAVE)
+            if canonical.mode == "launch":
+                self._call("launch", lambda value: self._at(WorkflowState(value)))
+                self._at(WorkflowState.WAIT_SAVE_STABLE)
+                try: stable = self._call("wait_save_stable")
+                except SyncError:
+                    quarantine_root = self._call("rescue_raw", None); capture_destinations(); raise
+            else:
+                stable = self._call("wait_save_stable")
+                if stable.get("root_hash") != canonical.selected_root_hash:
+                    raise SyncError("selected_save_changed", "Selected save changed before promotion.", EXIT_RECOVERY_REQUIRED)
+            self._at(WorkflowState.VALIDATE_SAVE)
+            try: manifest = self._call("validate", stable, self.baseline)
+            except SyncError:
+                quarantine_root = self._call("rescue_raw", stable); capture_destinations(); raise
+            if canonical.mode == "promote-only" and manifest.get("root_hash") != canonical.selected_root_hash:
+                raise SyncError("selected_save_changed", "Validated save no longer matches the selected version.", EXIT_RECOVERY_REQUIRED)
+            self._at(WorkflowState.ARCHIVE_AFTER_GAME); archive_root = self._call("archive_after_game", manifest); capture_destinations()
+            if canonical.mode == "promote-only" and self._call("live_manifest").get("root_hash") != canonical.selected_root_hash:
+                raise SyncError("selected_save_changed", "Selected save changed before publication.", EXIT_RECOVERY_REQUIRED)
+            oid = self._call("snapshot", self.session, manifest, lambda value: self._at(WorkflowState(value)))
+            safe_oid = oid; safe_root_hash = manifest["root_hash"]; self._call("mark_committed", lock, oid, safe_root_hash)
+            self._at(WorkflowState.PUSH, safe_oid=oid, safe_root_hash=manifest["root_hash"])
+            pushed = self._call("push", oid)
+            safe_oid = pushed
+            if canonical.mode == "promote-only":
+                published = self._call("remote_manifest", pushed, "selection-published")
+                if published.get("root_hash") != canonical.selected_root_hash:
+                    raise SyncError("selected_publish_mismatch", "Published save does not match the selected version.", EXIT_RECOVERY_REQUIRED)
+            self._at(WorkflowState.RELEASE_LOCK); self._call("release", lock, pushed, manifest)
+            self._at(WorkflowState.COMPLETE, safe_oid=pushed, safe_root_hash=manifest["root_hash"])
+            return {"state": "COMPLETE", "commit": pushed}
+        except SyncError as error:
+            capture_destinations()
+            recovery_required = self.mutated or (acquire_started and error.code == "lock_push_unknown")
+            if recovery_required:
+                error = SyncError(error.code, error.message, EXIT_RECOVERY_REQUIRED, {**error.details, **recovery_details()})
+            try:
+                self.logger.write(self.state, "failed", error.code, session_id=self.session,
+                                  last_successful_state=self.last_success, safe_oid=safe_oid, safe_root_hash=safe_root_hash,
+                                  archive_root=archive_root, quarantine_root=quarantine_root,
+                                  archive_id=archive_id, quarantine_id=quarantine_id)
+            except Exception:
+                pass
+            raise error
+        except Exception:
+            capture_destinations()
+            try:
+                self.logger.write(self.state, "failed", "unexpected_failure", session_id=self.session,
+                                  last_successful_state=self.last_success, safe_oid=safe_oid, safe_root_hash=safe_root_hash,
+                                  archive_root=archive_root, quarantine_root=quarantine_root,
+                                  archive_id=archive_id, quarantine_id=quarantine_id)
+            except Exception:
+                pass
+            code = EXIT_RECOVERY_REQUIRED if self.mutated else 2
+            error = SyncError("unexpected_failure", "Selection workflow stopped; run recover before trying again.", code)
+            if self.mutated: error.details = recovery_details()
+            raise error from None
     def run(self)->dict[str,str]:
         lock=None; manifest=None; safe_oid=None; safe_root_hash=None; archive_root=None; quarantine_root=None
         archive_id=None; quarantine_id=None

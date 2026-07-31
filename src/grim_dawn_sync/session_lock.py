@@ -35,6 +35,12 @@ class Lock:
 def _fail(code: str, message: str, exit_code: int = EXIT_CONFLICT, details: dict | None = None) -> None:
     raise SyncError(code, message, exit_code, details or {})
 
+
+def _recovery_guard(vault: GitVault, state_path: Path, expected: SyncState) -> None:
+    vault.assert_remote_identity()
+    if load_state(state_path) != expected:
+        _fail("recovery_state_changed", "Recovery state changed before mutation.", EXIT_RECOVERY_REQUIRED)
+
 def _session(payload: object) -> Session:
     if not isinstance(payload, dict) or set(payload) != {"schema_version", "session_id", "machine_id", "base_commit", "started_at"} or payload.get("schema_version") != "1.0.0": _fail("invalid_lock", "Remote lock JSON is not canonical.")
     sid, machine, base, stamp = (payload[k] for k in ("session_id", "machine_id", "base_commit", "started_at"))
@@ -133,6 +139,7 @@ def _inspect_local_tag(vault: GitVault, tag: str, expected_oid: str) -> Session:
     return session
 
 def acquire_lock(vault: GitVault, machine_id: str, base_commit: str, *, state_path: Path | None = None) -> Lock:
+    vault.assert_remote_identity()
     if state_path is None: _fail("state_required", "Lock acquisition requires terminal-local state.", EXIT_RECOVERY_REQUIRED)
     if vault.remote_oid() != base_commit: _fail("stale_lock_base", "Remote main no longer matches the lock base.")
     if _remote_lock(vault) is not None: _fail("lock_held", "A remote save-sync lock already exists.")
@@ -154,6 +161,7 @@ def acquire_lock(vault: GitVault, machine_id: str, base_commit: str, *, state_pa
             except SyncError:
                 _fail("stale_lock_cleanup_incomplete", "Remote main changed and state cleanup is incomplete.", EXIT_RECOVERY_REQUIRED)
             _fail("stale_lock_base", "Remote main changed before lock push.")
+        vault.assert_remote_identity()
         pushed = vault.runner.run("push", vault.remote, f"{oid}:{LOCK_REF}", check=False)
         try: remote = _remote_lock(vault)
         except SyncError:
@@ -193,6 +201,7 @@ def _resume_bootstrap(
             "Bootstrap live save was not confirmed; apply and verify it before pushing.",
             EXIT_RECOVERY_REQUIRED,
         )
+    _recovery_guard(vault, state_path, state)
     commit = state.local_commit
     if vault.runner.run("cat-file", "-e", f"{commit}^{{commit}}", check=False).returncode:
         _fail("bootstrap_local_commit_missing", "Bootstrap recovery commit is unavailable.")
@@ -204,6 +213,7 @@ def _resume_bootstrap(
         _fail("bootstrap_remote_conflict", "Remote main no longer permits bootstrap recovery.")
     if remote is None:
         try:
+            _recovery_guard(vault, state_path, state)
             vault.runner.run("push", vault.remote, f"{commit}:{vault.remote_head}", check=False)
         except SyncError:
             # The subprocess may have updated the remote before its result was
@@ -219,6 +229,7 @@ def _resume_bootstrap(
             _fail("bootstrap_push_incomplete", "Bootstrap push was not confirmed.", EXIT_RECOVERY_REQUIRED)
         # A non-zero push result with the exact remote OID is an ambiguous
         # success.  Confirmation, not subprocess status, is authoritative.
+    _recovery_guard(vault, state_path, state)
     save_state(
         state_path,
         SyncState(
@@ -315,8 +326,11 @@ def release_lock(
     *,
     state_path: Path | None = None,
     confirmed_root_hash: str | None = None,
+    expected_state: SyncState | None = None,
 ) -> None:
     if state_path is None: _fail("state_required", "Lock release requires terminal-local state.", EXIT_RECOVERY_REQUIRED)
+    if expected_state is not None:
+        _recovery_guard(vault, state_path, expected_state)
     try:
         if vault.remote_oid() != pushed_commit: _fail("release_remote_main_mismatch", "Remote main does not match the pushed session commit.")
         remote = _remote_lock(vault)
@@ -336,14 +350,21 @@ def release_lock(
         phase="release_pending",
         pushed_commit=pushed_commit,
     )
+    if expected_state is not None:
+        _recovery_guard(vault, state_path, expected_state)
+    else:
+        vault.assert_remote_identity()
     save_state(state_path, pending)
+    _recovery_guard(vault, state_path, pending)
     result = vault.runner.run("push", f"--force-with-lease={LOCK_REF}:{lock.oid}", vault.remote, f":{LOCK_REF}", check=False)
     try: after = _remote_lock(vault)
     except SyncError: _fail("release_incomplete", "Lock deletion could not be confirmed.", EXIT_RECOVERY_REQUIRED)
     if result.returncode or after is not None: _fail("release_incomplete", "Lock release was not confirmed; recovery is required.", EXIT_RECOVERY_REQUIRED)
     if lock.local_tag:
+        _recovery_guard(vault, state_path, pending)
         deleted = vault.runner.run("tag", "-d", lock.local_tag, check=False)
         if deleted.returncode: _fail("release_cleanup_incomplete", "Remote lock was released but local cleanup is incomplete.", EXIT_RECOVERY_REQUIRED)
+    _recovery_guard(vault, state_path, pending)
     save_state(
         state_path,
         SyncState(
@@ -355,6 +376,51 @@ def release_lock(
             machine_id=lock.session.machine_id if confirmed_root_hash is not None else None,
         ),
     )
+
+
+def release_bookmark_lock(vault: GitVault, lock: Lock, original: SyncState, *, state_path: Path) -> None:
+    """Release a tag-only session while atomically preserving its old baseline."""
+    if original.phase is not None or original.last_applied_remote_commit is None or original.last_applied_manifest_root_hash is None:
+        _fail("bookmark_release_state_invalid", "Bookmark session has no inactive baseline to restore.")
+    if vault.remote_oid() != lock.session.base_commit or _remote_lock(vault) != lock.oid:
+        _fail("bookmark_release_mismatch", "Bookmark session remote state changed before release.")
+    current = load_state(state_path)
+    if (
+        current.phase not in {"lock_held", "bookmark_release_pending"}
+        or current.session_id != lock.session.session_id
+        or current.machine_id != lock.session.machine_id
+        or current.base_commit != lock.session.base_commit
+        or current.lock_oid != lock.oid
+        or current.local_tag != lock.local_tag
+        or (current.phase == "bookmark_release_pending" and (
+            current.last_applied_remote_commit != original.last_applied_remote_commit
+            or current.last_applied_manifest_root_hash != original.last_applied_manifest_root_hash
+            or current.pushed_commit != lock.session.base_commit
+        ))
+    ):
+        _fail("bookmark_release_state_invalid", "Bookmark session state does not match its lock.")
+    pending = SyncState(
+        last_applied_remote_commit=original.last_applied_remote_commit,
+        last_applied_manifest_root_hash=original.last_applied_manifest_root_hash,
+        session_id=lock.session.session_id, machine_id=lock.session.machine_id,
+        base_commit=lock.session.base_commit, lock_oid=lock.oid, local_tag=lock.local_tag,
+        phase="bookmark_release_pending", pushed_commit=lock.session.base_commit,
+        bookmark_ref=current.bookmark_ref, bookmark_tag_oid=current.bookmark_tag_oid,
+        bookmark_root_hash=current.bookmark_root_hash,
+    )
+    vault.assert_remote_identity()
+    save_state(state_path, pending)
+    _recovery_guard(vault, state_path, pending)
+    result = vault.runner.run("push", f"--force-with-lease={LOCK_REF}:{lock.oid}", vault.remote, f":{LOCK_REF}", check=False)
+    try: after = _remote_lock(vault)
+    except SyncError: _fail("release_incomplete", "Bookmark lock deletion could not be confirmed.", EXIT_RECOVERY_REQUIRED)
+    if result.returncode or after is not None: _fail("release_incomplete", "Bookmark lock release was not confirmed.", EXIT_RECOVERY_REQUIRED)
+    if lock.local_tag:
+        _recovery_guard(vault, state_path, pending)
+        if vault.runner.run("tag", "-d", lock.local_tag, check=False).returncode:
+            _fail("release_cleanup_incomplete", "Bookmark lock was released but local cleanup is incomplete.", EXIT_RECOVERY_REQUIRED)
+    _recovery_guard(vault, state_path, pending)
+    save_state(state_path, original)
 
 
 def _adopt_verified_snapshot_head(
@@ -411,6 +477,7 @@ def _adopt_verified_snapshot_head(
         local_commit=head,
         last_applied_manifest_root_hash=manifest["root_hash"],
     )
+    _recovery_guard(vault, state_path, state)
     save_state(state_path, adopted)
     return adopted
 
@@ -463,6 +530,7 @@ def _release_abandoned_lock_held_session(
         state.base_commit,
         state_path=state_path,
         confirmed_root_hash=manifest["root_hash"],
+        expected_state=state,
     )
     return "abandoned_lock_released"
 
@@ -470,16 +538,59 @@ def _release_abandoned_lock_held_session(
 def recover_session(vault: GitVault, state: SyncState, machine_id: str, *, state_path: Path | None = None) -> str:
     """Recover only an exactly matching local session; otherwise make no change."""
     if state_path is None: _fail("state_required", "Recovery requires terminal-local state.", EXIT_RECOVERY_REQUIRED)
+    _recovery_guard(vault, state_path, state)
     if state.phase == "bootstrap_pending":
         _resume_bootstrap(vault, state, machine_id, state_path=state_path)
         return "bootstrap_complete"
     if not state.session_id or state.machine_id != machine_id or not state.base_commit or not state.lock_oid or not state.local_tag: _fail("recovery_state_invalid", "Recovery state is incomplete.")
     remote = _remote_lock(vault); main = vault.remote_oid()
     if remote is None:
+        if state.phase == "bookmark_publish_pending" and main == state.base_commit:
+            rows = {row[0]: row for row in vault._managed_bookmark_rows(remote=True)}
+            row = rows.get(state.bookmark_ref or "")
+            if row is not None and (row[1] != state.bookmark_tag_oid or row[2] != state.local_commit
+                                    or vault.validate_commit_snapshot(row[2]).get("root_hash") != state.bookmark_root_hash):
+                _fail("bookmark_recovery_mismatch", "Remote bookmark does not match the persisted publication intent.", EXIT_RECOVERY_REQUIRED)
+            if row is None and state.bookmark_ref:
+                _recovery_guard(vault, state_path, state)
+                deleted = vault.runner.run("tag", "-d", state.bookmark_ref, check=False)
+                if deleted.returncode:
+                    _fail("release_cleanup_incomplete", "Unpublished local bookmark cleanup is incomplete.", EXIT_RECOVERY_REQUIRED)
+            present = vault.runner.run("rev-parse", "--verify", "--quiet", f"refs/tags/{state.local_tag}", check=False).returncode == 0
+            if present:
+                _recovery_guard(vault, state_path, state)
+                if vault.runner.run("tag", "-d", state.local_tag, check=False).returncode:
+                    _fail("release_cleanup_incomplete", "Remote bookmark lock is absent but local cleanup is incomplete.", EXIT_RECOVERY_REQUIRED)
+            _recovery_guard(vault, state_path, state)
+            save_state(state_path, SyncState(
+                last_applied_remote_commit=state.last_applied_remote_commit,
+                last_applied_manifest_root_hash=state.last_applied_manifest_root_hash,
+                machine_id=machine_id,
+            ))
+            return "bookmark_complete" if row is not None else "bookmark_not_published"
+        if state.phase == "bookmark_release_pending" and main == state.base_commit:
+            present = vault.runner.run("rev-parse", "--verify", "--quiet", f"refs/tags/{state.local_tag}", check=False).returncode == 0
+            if present:
+                _recovery_guard(vault, state_path, state)
+                if vault.runner.run("tag", "-d", state.local_tag, check=False).returncode:
+                    _fail("release_cleanup_incomplete", "Remote bookmark lock is absent but local cleanup is incomplete.", EXIT_RECOVERY_REQUIRED)
+            _recovery_guard(vault, state_path, state)
+            save_state(
+                state_path,
+                SyncState(
+                    last_applied_remote_commit=state.last_applied_remote_commit,
+                    last_applied_manifest_root_hash=state.last_applied_manifest_root_hash,
+                    machine_id=machine_id,
+                ),
+            )
+            return "bookmark_complete"
         if state.pushed_commit and main == state.pushed_commit:
             present = vault.runner.run("rev-parse", "--verify", "--quiet", f"refs/tags/{state.local_tag}", check=False).returncode == 0
-            if present and vault.runner.run("tag", "-d", state.local_tag, check=False).returncode:
-                _fail("release_cleanup_incomplete", "Remote lock is absent but local cleanup is incomplete.", EXIT_RECOVERY_REQUIRED)
+            if present:
+                _recovery_guard(vault, state_path, state)
+                if vault.runner.run("tag", "-d", state.local_tag, check=False).returncode:
+                    _fail("release_cleanup_incomplete", "Remote lock is absent but local cleanup is incomplete.", EXIT_RECOVERY_REQUIRED)
+            _recovery_guard(vault, state_path, state)
             save_state(
                 state_path,
                 SyncState(
@@ -495,6 +606,37 @@ def recover_session(vault: GitVault, state: SyncState, machine_id: str, *, state
         _fail("recovery_local_tag_mismatch", "Local recovery tag payload does not match state.")
     lock = inspect_remote_lock_readonly(vault)
     if lock is None or remote != state.lock_oid or lock.session != local_session: _fail("recovery_lock_mismatch", "Remote lock belongs to another session.")
+    if state.phase == "bookmark_publish_pending":
+        def publication_guard() -> None:
+            _recovery_guard(vault, state_path, state)
+            if vault.remote_oid() != state.base_commit:
+                _fail("bookmark_recovery_mismatch", "Remote main changed during bookmark recovery.", EXIT_RECOVERY_REQUIRED)
+            owned = inspect_remote_lock_readonly(vault)
+            if owned is None or owned.oid != state.lock_oid or owned.session != lock.session:
+                _fail("bookmark_recovery_mismatch", "Remote lock changed during bookmark recovery.", EXIT_RECOVERY_REQUIRED)
+
+        vault.publish_managed_bookmark_intent(
+            state.bookmark_ref or "", state.bookmark_tag_oid or "", state.local_commit or "",
+            state.bookmark_root_hash or "", expected_remote_head=state.base_commit,
+            expected_lock_oid=state.lock_oid, publication_guard=publication_guard,
+        )
+        confirmed = replace(state, phase="bookmark_release_pending", local_commit=None,
+                            pushed_commit=state.base_commit)
+        _recovery_guard(vault, state_path, state)
+        save_state(state_path, confirmed)
+        state = confirmed
+    if state.phase == "bookmark_release_pending":
+        release_bookmark_lock(
+            vault,
+            Lock(lock.session, remote, state.local_tag),
+            SyncState(
+                last_applied_remote_commit=state.last_applied_remote_commit,
+                last_applied_manifest_root_hash=state.last_applied_manifest_root_hash,
+                machine_id=machine_id,
+            ),
+            state_path=state_path,
+        )
+        return "bookmark_released"
     if state.phase == "lock_held" and state.local_commit is None:
         # A clean vault still at the base proves that no snapshot commit was
         # started.  This is the only case in which a failed launch may abandon
@@ -511,9 +653,15 @@ def recover_session(vault: GitVault, state: SyncState, machine_id: str, *, state
             try: pushed = vault.push(state.local_commit)
             except SyncError: raise
             state = replace(state, pushed_commit=pushed, phase="pushed")
-            if state_path: save_state(state_path, state)
+            if state_path:
+                _recovery_guard(vault, state_path, replace(state, pushed_commit=None, phase="committed"))
+                save_state(state_path, state)
             main = vault.remote_oid()
-        elif main == state.local_commit: state = replace(state, pushed_commit=state.local_commit, phase="pushed")
+        elif main == state.local_commit:
+            previous = state
+            state = replace(state, pushed_commit=state.local_commit, phase="pushed")
+            _recovery_guard(vault, state_path, previous)
+            save_state(state_path, state)
         else: _fail("recovery_remote_diverged", "Remote main advanced unexpectedly.")
     if state.pushed_commit:
         if main != state.pushed_commit: _fail("recovery_remote_diverged", "Remote main does not match the recovered commit.")
@@ -523,6 +671,7 @@ def recover_session(vault: GitVault, state: SyncState, machine_id: str, *, state
             state.pushed_commit,
             state_path=state_path,
             confirmed_root_hash=state.last_applied_manifest_root_hash,
+            expected_state=state,
         )
         return "released"
     _fail("recovery_no_commit", "Recovery has no local commit to push.")

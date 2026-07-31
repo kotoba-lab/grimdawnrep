@@ -29,9 +29,14 @@ STATE_KEYS = frozenset(
         "local_commit",
         "pushed_commit",
         "bootstrap_live_applied",
+        "bookmark_ref",
+        "bookmark_tag_oid",
+        "bookmark_root_hash",
     }
 )
-PRE_BOOTSTRAP_STATE_KEYS = STATE_KEYS - {"bootstrap_live_applied"}
+PRE_BOOKMARK_INTENT_STATE_KEYS = STATE_KEYS - {"bookmark_ref", "bookmark_tag_oid", "bookmark_root_hash"}
+PRE_LIVE_MARKER_STATE_KEYS = STATE_KEYS - {"bootstrap_live_applied"}
+PRE_BOOTSTRAP_STATE_KEYS = PRE_BOOKMARK_INTENT_STATE_KEYS - {"bootstrap_live_applied"}
 LEGACY_STATE_KEYS = frozenset(
     {
         "schema_version",
@@ -50,8 +55,11 @@ _OPTIONAL = (
     "local_tag",
     "local_commit",
     "pushed_commit",
+    "bookmark_ref",
+    "bookmark_tag_oid",
+    "bookmark_root_hash",
 )
-_PHASES = {None, "bootstrap_pending", "lock_held", "committed", "pushed", "release_pending"}
+_PHASES = {None, "bootstrap_pending", "lock_held", "committed", "pushed", "release_pending", "bookmark_publish_pending", "bookmark_release_pending"}
 _SESSION_FIELDS = ("session_id", "machine_id", "base_commit", "lock_oid", "local_tag")
 _OID = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 _HASH = re.compile(r"^[0-9a-f]{64}$")
@@ -72,6 +80,9 @@ class SyncState:
     local_commit: str | None = None
     pushed_commit: str | None = None
     bootstrap_live_applied: bool = False
+    bookmark_ref: str | None = None
+    bookmark_tag_oid: str | None = None
+    bookmark_root_hash: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -83,7 +94,7 @@ def parse_state(payload: dict[str, Any]) -> SyncState:
     # The original empty state format is accepted only for backwards-compatible
     # upgrades; all persisted session state uses the complete exact shape.
     keys = frozenset(payload)
-    if keys not in (STATE_KEYS, PRE_BOOTSTRAP_STATE_KEYS, LEGACY_STATE_KEYS):
+    if keys not in (STATE_KEYS, PRE_BOOKMARK_INTENT_STATE_KEYS, PRE_LIVE_MARKER_STATE_KEYS, PRE_BOOTSTRAP_STATE_KEYS, LEGACY_STATE_KEYS):
         raise SyncError("invalid_state", "State must contain exactly the required schema fields.")
     values = {key: payload.get(key) for key in _OPTIONAL}
     if any(value is not None and (not isinstance(value, str) or not value) for value in values.values()):
@@ -94,7 +105,7 @@ def parse_state(payload: dict[str, Any]) -> SyncState:
         raise SyncError("invalid_state", "Bootstrap live-applied marker must be boolean.")
     if phase not in _PHASES:
         raise SyncError("invalid_state", "State phase is invalid.")
-    if keys in (STATE_KEYS, PRE_BOOTSTRAP_STATE_KEYS):
+    if keys in (STATE_KEYS, PRE_BOOKMARK_INTENT_STATE_KEYS, PRE_LIVE_MARKER_STATE_KEYS, PRE_BOOTSTRAP_STATE_KEYS):
         _validate_current_transition(phase, values, bootstrap_live_applied)
     elif values["session_id"] is not None:
         raise SyncError("invalid_state", "Legacy state may not contain an active session.")
@@ -121,6 +132,7 @@ def _validate_current_transition(
             or values["local_commit"] is not None
             or values["pushed_commit"] is not None
             or bootstrap_live_applied
+            or any(values[key] is not None for key in ("bookmark_ref", "bookmark_tag_oid", "bookmark_root_hash"))
         ):
             raise SyncError("invalid_state", "Inactive state must not contain recovery session fields.")
         if values["machine_id"] is not None and not _TOKEN.fullmatch(values["machine_id"]):
@@ -181,6 +193,32 @@ def _validate_current_transition(
         pushed_commit is None or (local_commit is not None and local_commit != pushed_commit)
     ):
         raise SyncError("invalid_state", "Release-pending state must identify the pushed commit.")
+    if phase == "bookmark_release_pending" and (
+        local_commit is not None or pushed_commit != values["base_commit"]
+        or values["last_applied_remote_commit"] is None or values["last_applied_manifest_root_hash"] is None
+    ):
+        raise SyncError("invalid_state", "Bookmark release state must preserve the prior baseline and unchanged main.")
+    bookmark_fields = (values["bookmark_ref"], values["bookmark_tag_oid"], values["bookmark_root_hash"])
+    if phase == "bookmark_publish_pending":
+        if (
+            local_commit is None or pushed_commit is not None
+            or values["last_applied_remote_commit"] is None or values["last_applied_manifest_root_hash"] is None
+            or not all(bookmark_fields)
+            or not re.fullmatch(r"grim-dawn-save-[0-9a-f]{32}", values["bookmark_ref"] or "")
+            or not _OID.fullmatch(values["bookmark_tag_oid"] or "")
+            or not _HASH.fullmatch(values["bookmark_root_hash"] or "")
+        ):
+            raise SyncError("invalid_state", "Bookmark publish state must contain one exact managed tag intent.")
+    elif phase == "bookmark_release_pending":
+        if any(bookmark_fields) and (
+            not all(bookmark_fields)
+            or not re.fullmatch(r"grim-dawn-save-[0-9a-f]{32}", values["bookmark_ref"] or "")
+            or not _OID.fullmatch(values["bookmark_tag_oid"] or "")
+            or not _HASH.fullmatch(values["bookmark_root_hash"] or "")
+        ):
+            raise SyncError("invalid_state", "Bookmark release state has an incomplete managed tag result.")
+    elif any(bookmark_fields):
+        raise SyncError("invalid_state", "Only bookmark publication states may contain managed tag fields.")
 
 
 def _is_reparse(result: os.stat_result) -> bool:

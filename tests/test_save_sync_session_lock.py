@@ -10,6 +10,7 @@ import threading
 
 import pytest
 
+from grim_dawn_sync.catalog_capability import read_remote_identity
 from grim_dawn_sync.errors import SyncError
 from grim_dawn_sync.git_vault import GitResult, GitVault
 from grim_dawn_sync.session_lock import (
@@ -24,6 +25,51 @@ from grim_dawn_sync.session_lock import (
     release_lock,
 )
 from grim_dawn_sync.state import SyncState, load_state, save_state
+
+
+def test_recover_rejects_bound_remote_identity_change_before_mutation(tmp_path: Path) -> None:
+    vault, _ = _vaults(tmp_path)
+    base = vault.remote_oid(); assert base
+    state_path = tmp_path / "state.json"
+    acquire_lock(vault, "machine-a", base, state_path=state_path)
+    state = load_state(state_path)
+    vault.bind_remote_identity(read_remote_identity(vault, "origin"))
+    other = tmp_path / "other.git"
+    _git(tmp_path, "init", "--bare", str(other))
+    _git(vault.repo, "config", "remote.origin.pushurl", str(other))
+    with pytest.raises(SyncError) as caught:
+        recover_session(vault, state, "machine-a", state_path=state_path)
+    assert caught.value.code == "remote_identity_changed"
+    assert load_state(state_path) == state
+
+
+def test_recover_rejects_bound_remote_url_change_before_mutation(tmp_path: Path) -> None:
+    vault, _ = _vaults(tmp_path)
+    base = vault.remote_oid(); assert base
+    state_path = tmp_path / "state.json"
+    acquire_lock(vault, "machine-a", base, state_path=state_path)
+    state = load_state(state_path)
+    vault.bind_remote_identity(read_remote_identity(vault, "origin"))
+    other = tmp_path / "other.git"
+    _git(tmp_path, "init", "--bare", str(other))
+    _git(vault.repo, "remote", "set-url", "origin", str(other))
+    with pytest.raises(SyncError) as caught:
+        recover_session(vault, state, "machine-a", state_path=state_path)
+    assert caught.value.code == "remote_identity_changed"
+    assert load_state(state_path) == state
+
+
+def test_recover_rejects_disk_state_change_before_mutation(tmp_path: Path) -> None:
+    vault, _ = _vaults(tmp_path)
+    base = vault.remote_oid(); assert base
+    state_path = tmp_path / "state.json"
+    acquire_lock(vault, "machine-a", base, state_path=state_path)
+    stale = load_state(state_path)
+    save_state(state_path, SyncState())
+    with pytest.raises(SyncError) as caught:
+        recover_session(vault, stale, "machine-a", state_path=state_path)
+    assert caught.value.code == "recovery_state_changed"
+    assert load_state(state_path) == SyncState()
 
 
 def _git(path: Path, *args: str) -> str:
@@ -764,9 +810,20 @@ def test_recovery_rejects_machine_and_local_oid_mismatch_without_remote_change(t
     with pytest.raises(SyncError) as caught:
         recover_session(vault, state, "machine-b", state_path=state_path)
     assert caught.value.code == "recovery_state_invalid" and inspect_remote_lock(vault).oid == lock.oid  # type: ignore[union-attr]
+    before = state_path.read_bytes()
     with pytest.raises(SyncError) as caught:
         recover_session(vault, replace(state, lock_oid="0" * 40), "machine-a", state_path=state_path)
+    assert caught.value.code == "recovery_state_changed" and inspect_remote_lock(vault).oid == lock.oid  # type: ignore[union-attr]
+    assert state_path.read_bytes() == before
+
+    # If the exact persisted state itself carries the bad local object ID, the
+    # disk guard passes and the established local-tag mismatch contract remains.
+    persisted_mismatch = replace(state, lock_oid="0" * 40)
+    save_state(state_path, persisted_mismatch); persisted_before = state_path.read_bytes()
+    with pytest.raises(SyncError) as caught:
+        recover_session(vault, persisted_mismatch, "machine-a", state_path=state_path)
     assert caught.value.code == "recovery_local_tag_mismatch" and inspect_remote_lock(vault).oid == lock.oid  # type: ignore[union-attr]
+    assert state_path.read_bytes() == persisted_before
 
 
 @pytest.mark.parametrize("tamper", ["header", "json", "base"])

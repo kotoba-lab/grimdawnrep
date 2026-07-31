@@ -16,6 +16,38 @@ from grim_dawn_sync.git_vault import GitResult, GitRunner, GitVault
 from grim_dawn_sync.manifest import stable_manifest
 
 
+@pytest.mark.parametrize("oversized", ["count", "bytes"])
+def test_managed_bookmark_remote_listing_fails_closed_before_slicing_or_fetch(
+    tmp_path: Path, oversized: str,
+) -> None:
+    prefix = "refs/tags/grim-dawn-save-"
+    if oversized == "count":
+        rows: list[str] = []
+        for index in range(101):
+            ref = f"{prefix}{index:032x}"
+            rows.extend((f"{'a' * 40}\t{ref}", f"{'b' * 40}\t{ref}^{{}}"))
+        output = "\n".join(rows) + "\n"
+        assert len(output.encode("utf-8")) < 128 * 1024
+    else:
+        output = "x" * (128 * 1024 + 1)
+
+    class ListingRunner:
+        def __init__(self) -> None:
+            self.commands: list[tuple[str, ...]] = []
+
+        def run(self, *args: str, **_kwargs: object) -> GitResult:
+            self.commands.append(args)
+            assert args[:2] == ("ls-remote", "origin")
+            return GitResult(args, output, "", 0)
+
+    runner = ListingRunner()
+    vault = GitVault(tmp_path, runner=runner)  # type: ignore[arg-type]
+    with pytest.raises(SyncError) as caught:
+        vault.managed_bookmarks(limit=100)
+    assert caught.value.code == "bookmark_list_too_large"
+    assert len(runner.commands) == 1
+
+
 def git(cwd: Path, *args: str) -> str:
     return subprocess.run(["git", *args], cwd=cwd, check=True, text=True, encoding="utf-8", capture_output=True).stdout
 
@@ -52,6 +84,49 @@ def commands(vault: GitVault) -> list[tuple[str, ...]]:
 def assert_no_forbidden(vault: GitVault) -> None:
     flattened = [argument for command in vault.runner.commands for argument in command]
     assert not any(argument in {"pull", "rebase", "reset", "--force", "checkout"} for argument in flattened)
+
+
+def behind_remote_main(tmp_path: Path) -> tuple[GitVault, Path, str, str]:
+    _, first, second = clone_pair(tmp_path)
+    source = save(tmp_path / "source", b"base")
+    writer = GitVault(first)
+    base = writer.snapshot(source, machine_id="a", session_id="base", validator=valid)
+    writer.push(base)
+    checkout_remote_main(second)
+    (source / "main" / "a" / "player.gdc").write_bytes(b"remote-new")
+    remote = writer.snapshot(source, machine_id="a", session_id="remote", validator=valid)
+    writer.push(remote)
+    reader = GitVault(second)
+    reader.fetch()
+    return reader, second, base, remote
+
+
+def test_align_head_to_remote_uses_only_configured_branch_ff_merge(tmp_path) -> None:
+    vault, repo, base, remote = behind_remote_main(tmp_path)
+    vault.align_head_to_remote(remote)
+    assert git(repo, "rev-parse", "HEAD").strip() == remote
+    assert ("merge", "--ff-only", remote) in commands(vault)
+    assert not any(command and command[0] == "reset" for command in commands(vault))
+
+
+@pytest.mark.parametrize("mode", ["wrong_branch", "detached", "dirty", "non_ff"])
+def test_align_head_to_remote_rejects_unsafe_head_before_mutation(tmp_path, mode: str) -> None:
+    vault, repo, base, remote = behind_remote_main(tmp_path)
+    if mode == "wrong_branch":
+        git(repo, "checkout", "-b", "wrong")
+    elif mode == "detached":
+        git(repo, "checkout", "--detach", base)
+    elif mode == "dirty":
+        (repo / "unmanaged.tmp").write_text("dirty", encoding="utf-8")
+    else:
+        (repo / "save" / "main" / "a" / "player.gdc").write_bytes(b"local-diverged")
+        git(repo, "add", "--", "save")
+        git(repo, "commit", "-m", "local divergence")
+    before = git(repo, "rev-parse", "HEAD").strip()
+    with pytest.raises(SyncError):
+        vault.align_head_to_remote(remote)
+    assert git(repo, "rev-parse", "HEAD").strip() == before
+    assert not any(command and command[0] == "merge" for command in commands(vault))
 
 
 class ArchiveRunner:
