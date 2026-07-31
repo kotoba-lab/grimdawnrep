@@ -7,7 +7,7 @@ import inspect
 import pytest
 
 from grim_dawn_sync.selection import CancelledSelection, ReconcileCase, SelectionDirective, SelectionRegistry
-from grim_dawn_sync.selector_ui import SelectionRequest, TkSelectionPresenter, _candidate_detail_text, build_plan_from_request, load_catalog_in_worker, present_tk
+from grim_dawn_sync.selector_ui import SelectionRequest, TkSelectionPresenter, _candidate_detail_text, build_plan_from_request, load_catalog_in_worker, present_tk, present_tk_from_builder
 from grim_dawn_sync.version_catalog import ManifestDiff, SaveCandidate, VersionCatalog
 
 
@@ -37,6 +37,46 @@ def test_tk_init_failure_is_fail_closed(monkeypatch) -> None:
     try: present_tk(_catalog(), SelectionDirective(True, "remote_head", ("launch", "cancel"), False))
     except SyncError as error: assert error.code == "selection_ui_unavailable"
     else: raise AssertionError("Tk failure must not select automatically")
+
+
+def test_equal_policy_never_displays_or_constructs_selector_widgets(monkeypatch) -> None:
+    import tkinter
+    from tkinter import ttk
+
+    events: list[str] = []
+
+    class Root:
+        def withdraw(self): events.append("withdraw")
+        def deiconify(self): events.append("deiconify")
+        def title(self, _value): pass
+        def minsize(self, *_value): pass
+        def columnconfigure(self, *_args, **_kwargs): pass
+        def rowconfigure(self, *_args, **_kwargs): pass
+        def protocol(self, *_args): pass
+        def bind(self, *_args): pass
+        def mainloop(self): pass
+        def destroy(self): events.append("destroy")
+
+    class Handle:
+        def close(self): pass
+
+    def immediate(_root, build, on_loaded, on_error):
+        try: on_loaded(build())
+        except SyncError as error: on_error(error)
+        return Handle()
+
+    live = SaveCandidate("c" * 32, "live", "Live", "now", "m", "1" * 64, None,
+                         1, 2, 3, (), ManifestDiff(0, 0, 0))
+    catalog = VersionCatalog("t" * 32, "b" * 40, "1" * 64, (live,))
+    monkeypatch.setattr(tkinter, "Tk", Root)
+    monkeypatch.setattr(ttk, "Frame", lambda *_args, **_kwargs: pytest.fail("selector widget constructed"))
+    monkeypatch.setattr("grim_dawn_sync.selector_ui.load_catalog_in_worker", immediate)
+    result = present_tk_from_builder(
+        lambda: catalog,
+        SelectionDirective(False, "live", ("launch",), False),
+    )
+    assert result == SelectionRequest(live.candidate_id, "launch")
+    assert events[0] == "withdraw" and "deiconify" not in events
 
 
 def test_catalog_worker_marshals_callbacks_to_after() -> None:
@@ -137,3 +177,5 @@ def test_close_escape_cancel_and_reload_requests_are_domain_noops() -> None:
     assert 'bind("<Escape>", lambda _event: close())' in source
     assert "_candidate_detail_text(item, catalog, resolved, selectable)" in source
     assert "_candidate_detail_text(item, catalog, directive, selectable)" not in source
+    assert source.index("root.withdraw()") < source.index("load_catalog_in_worker")
+    assert source.index("if not resolved.show_selector:") < source.index("root.deiconify()")

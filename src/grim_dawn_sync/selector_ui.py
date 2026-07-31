@@ -129,16 +129,15 @@ def load_catalog_in_worker(root: object, build: Callable[[], VersionCatalog], on
 
 
 def present_tk_from_builder(build: Callable[[], VersionCatalog], directive: SelectionDirective | Callable[[VersionCatalog], SelectionDirective]) -> SelectionRequest | CancelledSelection:
-    """Create the window immediately, then populate it from a worker result."""
+    """Resolve policy off-screen and show a window only when selection is needed."""
     root = None; worker: CatalogWorker | None = None
     result: SelectionRequest | CancelledSelection = CancelledSelection()
     callback_error: BaseException | None = None
     try:
         import tkinter as tk
         from tkinter import messagebox, ttk
-        root = tk.Tk(); root.title("Grim Dawn Save Selection"); root.minsize(720, 420)
+        root = tk.Tk(); root.withdraw(); root.title("Grim Dawn Save Selection"); root.minsize(720, 420)
         root.columnconfigure(0, weight=1); root.rowconfigure(0, weight=1)
-        loading = ttk.Label(root, text="Loading verified save versions…", padding=20); loading.grid(sticky="nsew")
 
         def fail_callback(_exc, value, _traceback) -> None:
             nonlocal callback_error
@@ -162,7 +161,6 @@ def present_tk_from_builder(build: Callable[[], VersionCatalog], directive: Sele
                 if item is None:
                     on_error(SyncError("selection_required", "No verified automatic selection is available.", EXIT_CONFLICT)); return
                 result = SelectionRequest(item.candidate_id, "launch"); close(); return
-            loading.destroy()
             frame = ttk.Frame(root, padding=12); frame.grid(sticky="nsew"); frame.columnconfigure(0, weight=1); frame.rowconfigure(1, weight=1)
             ttk.Label(frame, text="Choose the save data to use", font=("TkDefaultFont", 12, "bold")).grid(row=0, column=0, sticky="w")
             tree = ttk.Treeview(frame, columns=("name", "kind", "time", "files", "changes"), show="headings", selectmode="browse", height=9)
@@ -227,6 +225,7 @@ def present_tk_from_builder(build: Callable[[], VersionCatalog], directive: Sele
                 ttk.Button(destructive, text="Make latest and exit", command=lambda: choose("promote-only"), underline=0).grid()
             root.protocol("WM_DELETE_WINDOW", close)
             tree.focus_set()
+            root.deiconify()
         worker = load_catalog_in_worker(root, build, populate, on_error)
         root.protocol("WM_DELETE_WINDOW", close); root.bind("<Escape>", lambda _event: close())
         root.mainloop()
