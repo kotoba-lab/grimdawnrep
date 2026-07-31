@@ -26,17 +26,19 @@ def _projection(note: str | None = None) -> dict:
     return safety_projection(config, state, catalog)
 
 
-def test_capability_is_deterministic_only_inside_current_utc_bucket() -> None:
+def test_capability_uses_exact_issue_time_across_one_bucket_boundary() -> None:
     projection = _projection()
-    one = issue_capability(projection, clock=lambda: 600.0, monotonic_clock=lambda: 1200.0)
-    assert one == issue_capability(projection, clock=lambda: 899.999, monotonic_clock=lambda: 1499.999)
-    assert one.startswith("c1_") and len(one) == 67
-    verify_capability(one, projection, clock=lambda: 899.999, monotonic_clock=lambda: 1499.999)
+    one = issue_capability(projection, clock=lambda: 299.9, monotonic_clock=lambda: 599.9)
+    assert one == issue_capability(projection, clock=lambda: 299.9, monotonic_clock=lambda: 599.9)
+    assert one != issue_capability(projection, clock=lambda: 299.901, monotonic_clock=lambda: 599.901)
+    assert one.startswith("c2_")
+    verify_capability(one, projection, clock=lambda: 300.1, monotonic_clock=lambda: 600.1)
+    verify_capability(one, projection, clock=lambda: 599.899, monotonic_clock=lambda: 899.899)
     with pytest.raises(SyncError) as error:
-        verify_capability(one, projection, clock=lambda: 900.0, monotonic_clock=lambda: 1499.999)
+        verify_capability(one, projection, clock=lambda: 599.9, monotonic_clock=lambda: 899.9)
     assert error.value.code == "catalog_expired"
     with pytest.raises(SyncError) as error:
-        verify_capability(one, projection, clock=lambda: 600.0, monotonic_clock=lambda: 1500.0)
+        verify_capability(one, projection, clock=lambda: 600.1, monotonic_clock=lambda: 900.1)
     assert error.value.code == "catalog_expired"
 
 
@@ -64,7 +66,10 @@ def test_every_safety_projection_change_invalidates_token(changed) -> None:
     assert error.value.code == "catalog_expired"
 
 
-@pytest.mark.parametrize("token", ["", "c1_", "c1_" + "g" * 64, "c1_" + "0" * 63, "refs/heads/main"])
+@pytest.mark.parametrize("token", [
+    "", "c1_" + "0" * 64, "c2_", "c2_zz_1_" + "0" * 64,
+    "c2_1_1_" + "g" * 64, "c2_1_1_" + "0" * 63, "refs/heads/main",
+])
 def test_malformed_or_ref_injection_token_is_rejected(token: str) -> None:
     with pytest.raises(SyncError) as error:
         verify_capability(token, _projection(), clock=lambda: 600.0, monotonic_clock=lambda: 1200.0)
@@ -88,6 +93,19 @@ def test_clock_exceptions_fail_closed() -> None:
     with pytest.raises(SyncError) as error:
         issue_capability(_projection(), clock=broken, monotonic_clock=lambda: 1.0)
     assert error.value.code == "catalog_clock_invalid"
+
+
+def test_verification_rejects_backwards_or_unavailable_clocks() -> None:
+    projection = _projection()
+    token = issue_capability(projection, clock=lambda: 10.0, monotonic_clock=lambda: 20.0)
+    for kwargs in (
+        {"clock": lambda: 9.999, "monotonic_clock": lambda: 20.0},
+        {"clock": lambda: 10.0, "monotonic_clock": lambda: 19.999},
+        {"clock": lambda: (_ for _ in ()).throw(RuntimeError("private")), "monotonic_clock": lambda: 20.0},
+    ):
+        with pytest.raises(SyncError) as error:
+            verify_capability(token, projection, **kwargs)
+        assert error.value.code == "catalog_clock_invalid"
 
 
 def test_capability_verifies_in_a_separate_python_process() -> None:

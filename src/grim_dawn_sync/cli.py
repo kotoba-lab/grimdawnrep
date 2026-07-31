@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import replace
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -50,7 +51,14 @@ from grim_dawn_sync.selector_ui import (
     TkSelectionPresenter,
     build_plan_from_request,
 )
-from grim_dawn_sync.catalog_capability import context_digest, issue_capability, read_remote_identity, safety_projection, verify_capability
+from grim_dawn_sync.catalog_capability import (
+    configuration_identity,
+    context_digest,
+    issue_capability,
+    read_remote_identity,
+    safety_projection,
+    verify_capability,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -229,6 +237,79 @@ def bookmark(config_path: Path, candidate_id: str, name: str, note: str | None, 
     return {"schema_version": "1.0.0", "command": "bookmark", "dry_run": False, "created": True}
 
 
+_REMOTE_REF_SNAPSHOT_MAX_BYTES = 256 * 1024
+_REMOTE_REF_SNAPSHOT_MAX_ROWS = 500
+
+
+def _remote_ref_snapshot(vault: GitVault) -> str:
+    """Hash the bounded remote refs that can affect selection semantics."""
+    result = vault.runner.run(
+        "ls-remote", vault.remote, vault.remote_head,
+        "refs/tags/grim-dawn-save-*", "refs/tags/archive/*", "refs/tags/milestone/*",
+        check=False,
+    )
+    encoded = result.stdout.encode("utf-8", "surrogatepass")
+    if result.returncode or len(encoded) > _REMOTE_REF_SNAPSHOT_MAX_BYTES:
+        raise SyncError("catalog_ref_snapshot_failed", "Remote save-version refs could not be verified.", 4)
+    rows: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for row in result.stdout.splitlines():
+        fields = row.split("\t")
+        if len(fields) != 2:
+            raise SyncError("catalog_ref_snapshot_invalid", "Remote save-version refs were malformed.", 4)
+        oid, ref = fields
+        base = ref[:-3] if ref.endswith("^{}") else ref
+        allowed = (
+            ref == vault.remote_head
+            or re.fullmatch(r"refs/tags/grim-dawn-save-[0-9a-f]{32}", base) is not None
+            or re.fullmatch(r"refs/tags/(?:archive|milestone)/[^\x00-\x1f]+", base) is not None
+        )
+        if (
+            not allowed
+            or re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", oid) is None
+            or ref in seen
+            or len(ref.encode("utf-8", "surrogatepass")) > 512
+        ):
+            raise SyncError("catalog_ref_snapshot_invalid", "Remote save-version refs were malformed.", 4)
+        seen.add(ref)
+        rows.append((ref, oid))
+        if len(rows) > _REMOTE_REF_SNAPSHOT_MAX_ROWS:
+            raise SyncError("catalog_ref_snapshot_failed", "Remote save-version ref count exceeded its safe bound.", 4)
+    canonical = "".join(f"{ref}\t{oid}\n" for ref, oid in sorted(rows))
+    return hashlib.sha256(canonical.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def _execution_context_projection(config: Any, state: SyncState, *, remote_identity: tuple[str, str],
+                                  live_root_hash: str, remote_head: str | None,
+                                  remote_ref_snapshot: str) -> dict[str, Any]:
+    """Canonical lightweight state that must still match immediately before locking."""
+    return {
+        "schema_version": "1.0.0",
+        "config": configuration_identity(config, remote_identity=remote_identity),
+        "state": state.as_dict(),
+        "lock": None,
+        "remote_head": remote_head,
+        "live_root_hash": live_root_hash,
+        "baseline_root_hash": state.last_applied_manifest_root_hash,
+        "remote_ref_snapshot": remote_ref_snapshot,
+    }
+
+
+def _remote_lock_snapshot(vault: GitVault) -> str | None:
+    """Read only the active-lock ref; the annotated OID binds its full payload."""
+    lock_ref = "refs/tags/grim-dawn-sync-active"
+    result = vault.runner.run("ls-remote", "--refs", vault.remote, lock_ref, check=False)
+    rows = [row.split("\t") for row in result.stdout.splitlines() if row]
+    if (
+        result.returncode
+        or len(rows) > 1
+        or (rows and (len(rows[0]) != 2 or rows[0][1] != lock_ref
+                      or re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", rows[0][0]) is None))
+    ):
+        raise SyncError("catalog_lock_snapshot_invalid", "Remote save-sync lock could not be verified.", 4)
+    return rows[0][0] if rows else None
+
+
 def _capture_catalog(config_path: Path, expected_config: Any) -> tuple[GitVault, Any, SyncState, dict[str, Any]]:
     _process_preflight(expected_config)
     current_config = load_config(config_path)
@@ -240,12 +321,13 @@ def _capture_catalog(config_path: Path, expected_config: Any) -> tuple[GitVault,
     vault = _vault(current_config)
     if inspect_remote_lock_readonly(vault) is not None:
         raise SyncError("lock_held", "Another save-sync session is active; no selection was made.", 3)
+    remote_identity = read_remote_identity(vault, current_config.remote)
+    remote_refs = _remote_ref_snapshot(vault)
     catalog = VersionCatalogBuilder(
         vault, current_config.save_root, machine_id=current_config.machine_id,
         retries=current_config.stable_scan_retries, window_seconds=current_config.stable_window_seconds,
         baseline_root_hash=state.last_applied_manifest_root_hash,
     ).build()
-    remote_identity = read_remote_identity(vault, current_config.remote)
     # Close the scan around config/state/lock/process too, so the catalog can
     # never be issued from a hybrid of values observed on opposite sides of I/O.
     _process_preflight(expected_config)
@@ -259,23 +341,57 @@ def _capture_catalog(config_path: Path, expected_config: Any) -> tuple[GitVault,
         raise SyncError("catalog_context_changed", "Save selection context changed during verification; reload versions.", 3)
     if read_remote_identity(vault, current_config.remote) != remote_identity:
         raise SyncError("catalog_context_changed", "Remote identity changed during verification; reload versions.", 3)
+    if _remote_ref_snapshot(vault) != remote_refs:
+        raise SyncError("catalog_context_changed", "Remote save-version refs changed during verification; reload versions.", 3)
+    manifest = stable_manifest(
+        current_config.save_root, machine_id=current_config.machine_id,
+        retries=current_config.stable_scan_retries, window_seconds=current_config.stable_window_seconds,
+    )
+    if manifest.get("root_hash") != catalog.live_root_hash or vault.remote_oid() != catalog.remote_head:
+        raise SyncError("catalog_context_changed", "Live or remote save data changed during verification; reload versions.", 3)
     projection = safety_projection(current_config, state, catalog, remote_identity=remote_identity)
+    projection["execution_context"] = _execution_context_projection(
+        current_config, state, remote_identity=remote_identity,
+        live_root_hash=catalog.live_root_hash, remote_head=catalog.remote_head,
+        remote_ref_snapshot=remote_refs,
+    )
     return vault, catalog, state, projection
 
 
 def _fresh_catalog(config_path: Path, config: Any, *, supplied_token: str | None = None) -> tuple[GitVault, Any, SyncState, dict[str, Any]]:
-    """Double-scan every safety input before issuing or consuming a capability."""
-    _, _, _, first = _capture_catalog(config_path, config)
-    vault, catalog, state, second = _capture_catalog(config_path, config)
-    if first != second:
-        raise SyncError("catalog_context_changed", "Save selection context changed during verification; reload versions.", 3)
-    token = issue_capability(second)
+    """Build one catalog bracketed by lightweight safety observations."""
+    vault, catalog, state, projection = _capture_catalog(config_path, config)
+    token = issue_capability(projection)
     if supplied_token is not None:
-        verify_capability(supplied_token, second)
+        verify_capability(supplied_token, projection)
         token = supplied_token
     catalog = replace(catalog, token=token)
-    return vault, catalog, state, second
+    return vault, catalog, state, projection
 
+
+def _capture_execution_context(config_path: Path, expected_config: Any, expected_state: SyncState,
+                               vault: GitVault) -> dict[str, Any]:
+    """Re-read execution inputs without rebuilding commits or candidates."""
+    _process_preflight(expected_config)
+    current_config = load_config(config_path)
+    current_state = load_state(_state_path(config_path))
+    if current_config.public_dict() != expected_config.public_dict() or current_state.as_dict() != expected_state.as_dict():
+        raise SyncError("catalog_context_changed", "Selection context changed before lock acquisition.", 3)
+    if current_state.phase is not None:
+        raise SyncError("recovery_required", "Recovery state exists; run recover before selecting a save.", 6)
+    if _remote_lock_snapshot(vault) is not None:
+        raise SyncError("lock_held", "Another save-sync session is active; no selection was made.", 3)
+    remote_identity = read_remote_identity(vault, current_config.remote)
+    remote_refs = _remote_ref_snapshot(vault)
+    manifest = stable_manifest(
+        current_config.save_root, machine_id=current_config.machine_id,
+        retries=current_config.stable_scan_retries, window_seconds=current_config.stable_window_seconds,
+    )
+    return _execution_context_projection(
+        current_config, current_state, remote_identity=remote_identity,
+        live_root_hash=str(manifest.get("root_hash")), remote_head=vault.remote_oid(),
+        remote_ref_snapshot=remote_refs,
+    )
 
 def _assert_capability_boundary(config_path: Path, config: Any, state: SyncState, catalog: Any,
                                 projection: dict[str, Any]) -> None:
@@ -440,14 +556,14 @@ def _execute_selection_command(
         )
         plan = build_plan_from_request(
             registry, request, catalog_token=catalog.token, case=case,
-            expected_context_digest=context_digest(projection), expected_remote_identity=remote_identity,
+            expected_context_digest=context_digest(projection["execution_context"]),
+            expected_remote_identity=remote_identity,
         )
         _assert_capability_boundary(config_path, config, state, catalog, projection)
         def revalidate_context(expected: str) -> None:
-            _, fresh_catalog, _, fresh_projection = _fresh_catalog(
-                config_path, config, supplied_token=catalog.token,
-            )
-            if context_digest(fresh_projection) != expected or fresh_catalog.token != catalog.token:
+            fresh_context = _capture_execution_context(config_path, config, state, vault)
+            verify_capability(catalog.token, projection)
+            if context_digest(fresh_context) != expected:
                 raise SyncError("catalog_context_changed", "Selection context changed before lock acquisition.", 3)
         try:
             result = LaunchWorkflow(config, config_path.parent).execute_selection_plan(

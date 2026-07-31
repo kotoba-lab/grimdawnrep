@@ -15,7 +15,9 @@ from grim_dawn_sync.errors import EXIT_CONFLICT, EXIT_VALIDATION, SyncError
 
 
 CAPABILITY_SECONDS = 300
-_TOKEN = re.compile(r"^c1_[0-9a-f]{64}$")
+_CAPABILITY_MILLISECONDS = CAPABILITY_SECONDS * 1000
+_MAX_TIMESTAMP_MILLISECONDS = (1 << 64) - 1
+_TOKEN = re.compile(r"^c2_([0-9a-f]{1,16})_([0-9a-f]{1,16})_([0-9a-f]{64})$")
 
 
 def read_remote_identity(vault: Any, remote: str) -> tuple[str, str]:
@@ -113,15 +115,18 @@ def context_digest(projection: dict[str, Any]) -> str:
     return hashlib.sha256(canonical_bytes(projection)).hexdigest()
 
 
-def _bucket(now: float) -> int:
+def _milliseconds(now: float) -> int:
     if isinstance(now, bool) or not isinstance(now, (int, float)) or not math.isfinite(now) or now < 0:
         raise SyncError("catalog_clock_invalid", "Catalog capability clock is invalid.", EXIT_CONFLICT)
-    return int(now) // CAPABILITY_SECONDS
+    value = int(now * 1000)
+    if value > _MAX_TIMESTAMP_MILLISECONDS:
+        raise SyncError("catalog_clock_invalid", "Catalog capability clock is invalid.", EXIT_CONFLICT)
+    return value
 
 
-def _read_bucket(clock: Callable[[], float]) -> int:
+def _read_milliseconds(clock: Callable[[], float]) -> int:
     try:
-        return _bucket(clock())
+        return _milliseconds(clock())
     except SyncError:
         raise
     except Exception as error:
@@ -130,19 +135,43 @@ def _read_bucket(clock: Callable[[], float]) -> int:
 
 def issue_capability(projection: dict[str, Any], *, clock: Callable[[], float] = time.time,
                      monotonic_clock: Callable[[], float] = time.monotonic) -> str:
-    wall_bucket = _read_bucket(clock)
-    monotonic_bucket = _read_bucket(monotonic_clock)
+    wall_millis = _read_milliseconds(clock)
+    monotonic_millis = _read_milliseconds(monotonic_clock)
     digest = hashlib.sha256(
-        canonical_bytes(projection) + b"\0" + str(wall_bucket).encode("ascii")
-        + b"\0" + str(monotonic_bucket).encode("ascii")
+        canonical_bytes(projection) + b"\0" + str(wall_millis).encode("ascii")
+        + b"\0" + str(monotonic_millis).encode("ascii")
     ).hexdigest()
-    return "c1_" + digest
+    return f"c2_{wall_millis:x}_{monotonic_millis:x}_{digest}"
 
 
 def verify_capability(token: str, projection: dict[str, Any], *, clock: Callable[[], float] = time.time,
                       monotonic_clock: Callable[[], float] = time.monotonic) -> None:
-    if not isinstance(token, str) or not _TOKEN.fullmatch(token):
+    match = _TOKEN.fullmatch(token) if isinstance(token, str) else None
+    if match is None:
         raise SyncError("invalid_catalog_token", "Catalog capability is malformed or altered.", EXIT_VALIDATION)
-    expected = issue_capability(projection, clock=clock, monotonic_clock=monotonic_clock)
+    issued_wall = int(match.group(1), 16)
+    issued_monotonic = int(match.group(2), 16)
+    current_wall = _read_milliseconds(clock)
+    current_monotonic = _read_milliseconds(monotonic_clock)
+    if current_wall < issued_wall or current_monotonic < issued_monotonic:
+        raise SyncError("catalog_clock_invalid", "Catalog capability clock moved backwards.", EXIT_CONFLICT)
+    wall_age = current_wall - issued_wall
+    monotonic_age = current_monotonic - issued_monotonic
+    wall_bucket = current_wall // _CAPABILITY_MILLISECONDS
+    monotonic_bucket = current_monotonic // _CAPABILITY_MILLISECONDS
+    issued_wall_bucket = issued_wall // _CAPABILITY_MILLISECONDS
+    issued_monotonic_bucket = issued_monotonic // _CAPABILITY_MILLISECONDS
+    if (
+        issued_wall_bucket not in {wall_bucket, wall_bucket - 1}
+        or issued_monotonic_bucket not in {monotonic_bucket, monotonic_bucket - 1}
+        or wall_age >= _CAPABILITY_MILLISECONDS
+        or monotonic_age >= _CAPABILITY_MILLISECONDS
+    ):
+        raise SyncError("catalog_expired", "Catalog capability expired or its verified context changed.", EXIT_CONFLICT)
+    digest = hashlib.sha256(
+        canonical_bytes(projection) + b"\0" + str(issued_wall).encode("ascii")
+        + b"\0" + str(issued_monotonic).encode("ascii")
+    ).hexdigest()
+    expected = f"c2_{issued_wall:x}_{issued_monotonic:x}_{digest}"
     if not hmac.compare_digest(token, expected):
         raise SyncError("catalog_expired", "Catalog capability expired or its verified context changed.", EXIT_CONFLICT)

@@ -35,7 +35,20 @@ def _install_context(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, live: s
     calls: list[object] = []
 
     class Vault:
-        runner = SimpleNamespace(run=lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout="test://remote\n"))
+        remote = "origin"
+        remote_head = "refs/heads/main"
+        class Runner:
+            def run(self, *args, **_kwargs):
+                if args[0] == "remote":
+                    return SimpleNamespace(returncode=0, stdout="test://remote\n")
+                if args[0] == "ls-remote":
+                    if "--refs" in args:
+                        return SimpleNamespace(returncode=0, stdout="")
+                    return SimpleNamespace(returncode=0, stdout=f"{commit}\trefs/heads/main\n")
+                raise AssertionError(args)
+        runner = Runner()
+        def remote_oid(self) -> str:
+            return commit
         def validate_commit_snapshot(self, oid: str) -> dict[str, str]:
             assert oid == commit
             return {"root_hash": remote}
@@ -63,6 +76,7 @@ def _install_context(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, live: s
     monkeypatch.setattr(cli, "VersionCatalogBuilder", Builder)
     state = SyncState(last_applied_remote_commit=commit, last_applied_manifest_root_hash=baseline, machine_id="machine")
     monkeypatch.setattr(cli, "load_state", lambda _path: state)
+    monkeypatch.setattr(cli, "stable_manifest", lambda *_args, **_kwargs: {"root_hash": live})
     monkeypatch.setattr(cli, "LaunchWorkflow", Workflow)
     return config_path, catalog, calls
 
@@ -83,7 +97,7 @@ def test_json_and_auto_safe_refuse_different_saves_without_mutation(monkeypatch:
         with pytest.raises(SyncError) as error:
             cli.launch(config_path, **kwargs)
         assert error.value.code == "selection_required"
-    assert calls == ["preflight"] * 10
+    assert calls == ["preflight"] * 6
 
 
 def test_interactive_selection_and_cancel_are_explicit(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -132,8 +146,10 @@ def test_versions_token_is_consumed_by_a_fresh_process_equivalent_scan(monkeypat
 def test_changed_or_tampered_catalog_token_is_rejected(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     live, remote = "1" * 64, "2" * 64
     config_path, _, calls = _install_context(monkeypatch, tmp_path, live=live, remote=remote, baseline=live)
+    token = cli.versions(config_path)["catalog_token"]
+    tampered = token[:-1] + ("0" if token[-1] != "0" else "1")
     with pytest.raises(SyncError) as error:
-        cli.launch(config_path, as_json=True, selected="remote-id", catalog_token="c1_" + "0" * 64)
+        cli.launch(config_path, as_json=True, selected="remote-id", catalog_token=tampered)
     assert error.value.code == "catalog_expired" and calls == ["preflight"] * 5
 
 
@@ -155,32 +171,58 @@ def test_versions_json_projection_does_not_expose_roots_commits_or_labels(monkey
     assert "machine" not in rendered and "remote_head" in rendered
 
 
-def test_double_scan_rejects_live_remote_or_tag_candidate_change(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_single_build_rejects_live_change_during_lightweight_close(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     live, remote = "1" * 64, "2" * 64
-    config_path, catalog, _ = _install_context(monkeypatch, tmp_path, live=live, remote=remote, baseline=live)
-    changed = VersionCatalog(
-        catalog.token, catalog.remote_head, "3" * 64,
-        catalog.candidates + (_candidate("bookmark-id", "bookmark", "4" * 64, "b" * 40),),
-    )
-    values = iter((catalog, changed))
+    config_path, _, _ = _install_context(monkeypatch, tmp_path, live=live, remote=remote, baseline=live)
 
-    class ChangingBuilder:
-        def __init__(self, *_args: object, **_kwargs: object) -> None: pass
-        def build(self) -> VersionCatalog: return next(values)
-
-    monkeypatch.setattr(cli, "VersionCatalogBuilder", ChangingBuilder)
+    monkeypatch.setattr(cli, "stable_manifest", lambda *_args, **_kwargs: {"root_hash": "3" * 64})
     with pytest.raises(SyncError) as error:
         cli.versions(config_path)
     assert error.value.code == "catalog_context_changed"
 
 
-def test_double_scan_rejects_fetch_or_push_url_change(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+@pytest.mark.parametrize("equal", [True, False], ids=["equal", "divergent"])
+def test_interactive_builds_catalog_once_and_prelock_revalidation_does_not_rebuild(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, equal: bool,
+) -> None:
+    live = "1" * 64
+    remote = live if equal else "2" * 64
+    config_path, _, _ = _install_context(monkeypatch, tmp_path, live=live, remote=remote, baseline=live)
+    original_builder = cli.VersionCatalogBuilder
+    builds: list[str] = []
+
+    class CountingBuilder:
+        def __init__(self, *args, **kwargs):
+            self.inner = original_builder(*args, **kwargs)
+        def build(self):
+            builds.append("build")
+            return self.inner.build()
+
+    monkeypatch.setattr(cli, "VersionCatalogBuilder", CountingBuilder)
+
+    class Presenter:
+        def present_builder(self, build, directive):
+            catalog = build()
+            policy = directive(catalog)
+            if equal:
+                assert policy.show_selector is False
+                return SelectionRequest("live-id", "launch")
+            assert policy.show_selector is True
+            return SelectionRequest("remote-id", "launch")
+
+    assert cli.launch(config_path, presenter=Presenter())["result"]["state"] == "COMPLETE"
+    assert builds == ["build"]
+
+
+def test_single_build_rejects_fetch_or_push_url_change(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     live, remote = "1" * 64, "2" * 64
     config_path, _, _ = _install_context(monkeypatch, tmp_path, live=live, remote=remote, baseline=live)
     vault = cli._vault(None)
     class ChangingRunner:
         calls = 0
         def run(self, *args, **_kwargs):
+            if args[0] == "ls-remote":
+                return SimpleNamespace(returncode=0, stdout=f"{'a' * 40}\trefs/heads/main\n")
             pair = self.calls // 2; self.calls += 1
             url = "test://remote" if pair == 0 else "test://changed"
             return SimpleNamespace(returncode=0, stdout=url + "\n")
@@ -191,7 +233,7 @@ def test_double_scan_rejects_fetch_or_push_url_change(monkeypatch: pytest.Monkey
     assert error.value.code == "catalog_context_changed"
 
 
-def test_double_scan_rejects_state_config_lock_and_recovery_changes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_single_build_rejects_state_config_lock_and_recovery_changes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     live, remote = "1" * 64, "2" * 64
     config_path, _, _ = _install_context(monkeypatch, tmp_path, live=live, remote=remote, baseline=live)
     state_one = SyncState(last_applied_remote_commit="a" * 40, last_applied_manifest_root_hash=live, machine_id="machine")
@@ -394,6 +436,7 @@ def test_interactive_stale_then_reload_rebuilds_fresh_catalog_before_reselection
         projection = {
             "generation": generation,
             "config": {"remote_fetch_url": "test://remote", "remote_push_url": "test://remote"},
+            "execution_context": {"generation": generation},
         }
         return Vault(), catalog, state, projection
 
