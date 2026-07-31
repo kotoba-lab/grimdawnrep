@@ -12,7 +12,7 @@ import uuid
 
 from grim_dawn_sync.bookmarks import parse_bookmark_annotation
 from grim_dawn_sync.errors import EXIT_VALIDATION, SyncError
-from grim_dawn_sync.git_vault import GitVault
+from grim_dawn_sync.git_vault import GitVault, SnapshotValidationCache
 from grim_dawn_sync.manifest import stable_manifest
 
 
@@ -158,22 +158,43 @@ class VersionCatalogBuilder:
         if remote_head is not None and (not commits or commits[0] != remote_head):
             raise SyncError("malformed_remote_history", "Remote history does not begin at remote main.")
 
-        candidates: list[SaveCandidate] = [self._candidate("live", "This device's current data", None, live, live)]
+        snapshots = SnapshotValidationCache()
+        metadata_by_commit: dict[str, dict] = {}
+        diff_by_root: dict[str, ManifestDiff] = {str(live["root_hash"]): ManifestDiff(0, 0, 0)}
+
+        def snapshot(commit: str) -> dict:
+            return self.vault.validate_commit_snapshot(commit, cache=snapshots)
+
+        def metadata(commit: str) -> dict:
+            if commit not in metadata_by_commit:
+                metadata_by_commit[commit] = self.vault.read_vault_metadata(commit)
+            return metadata_by_commit[commit]
+
+        def candidate(kind: CandidateKind, display_name: str, commit: str | None, manifest: dict,
+                      *, note: str | None = None) -> SaveCandidate:
+            root_hash = str(manifest["root_hash"])
+            if root_hash not in diff_by_root:
+                diff_by_root[root_hash] = _diff(live, manifest)
+            return self._candidate(kind, display_name, commit, manifest, live, note=note,
+                                   diff=diff_by_root[root_hash])
+
+        candidates: list[SaveCandidate] = [candidate("live", "This device's current data", None, live)]
         for index, commit in enumerate(commits):
-            manifest = self.vault.validate_commit_snapshot(commit)
-            metadata = self.vault.read_vault_metadata(commit)
-            if metadata["root_hash"] != manifest["root_hash"]:
+            manifest = snapshot(commit)
+            provenance = metadata(commit)
+            if provenance["root_hash"] != manifest["root_hash"]:
                 raise SyncError("invalid_vault_metadata", "Committed provenance does not match its manifest.", EXIT_VALIDATION)
             kind: CandidateKind = "remote_head" if index == 0 else "history"
             name = "Sync destination latest" if kind == "remote_head" else "Remote main snapshot"
-            candidates.append(self._candidate(kind, name, commit, manifest, live))
+            candidates.append(candidate(kind, name, commit, manifest))
         for ref, commit, annotation in self.vault.managed_bookmarks():
-            metadata = parse_bookmark_annotation(annotation)
-            manifest = self.vault.validate_commit_snapshot(commit)
-            candidates.append(self._candidate("bookmark", str(metadata["display_name"]), commit, manifest, live, note=metadata["note"]))
+            bookmark = parse_bookmark_annotation(annotation)
+            manifest = snapshot(commit)
+            candidates.append(candidate("bookmark", str(bookmark["display_name"]), commit, manifest,
+                                        note=bookmark["note"]))
         for name, commit in self.vault.legacy_annotated_tags():
-            manifest = self.vault.validate_commit_snapshot(commit)
-            candidates.append(self._candidate("legacy", name, commit, manifest, live))
+            manifest = snapshot(commit)
+            candidates.append(candidate("legacy", name, commit, manifest))
         try:
             now = self.clock()
         except Exception as error:
@@ -200,7 +221,8 @@ class VersionCatalogBuilder:
                               candidates=scoped, baseline_root_hash=self.baseline_root_hash)
 
     @staticmethod
-    def _candidate(kind: CandidateKind, display_name: str, commit: str | None, manifest: dict, live: dict, *, note: str | None = None) -> SaveCandidate:
+    def _candidate(kind: CandidateKind, display_name: str, commit: str | None, manifest: dict, live: dict, *,
+                   note: str | None = None, diff: ManifestDiff | None = None) -> SaveCandidate:
         seed = f"{kind}\0{commit or manifest['root_hash']}\0{manifest['root_hash']}".encode("ascii")
         candidate_id = hashlib.sha256(seed).hexdigest()[:32]
-        return SaveCandidate(candidate_id, kind, display_name, str(manifest["created_at"]), str(manifest["machine_id"]), str(manifest["root_hash"]), commit, int(manifest["character_count"]), int(manifest["file_count"]), int(manifest["total_bytes"]), _labels(manifest), _diff(live, manifest), note)
+        return SaveCandidate(candidate_id, kind, display_name, str(manifest["created_at"]), str(manifest["machine_id"]), str(manifest["root_hash"]), commit, int(manifest["character_count"]), int(manifest["file_count"]), int(manifest["total_bytes"]), _labels(manifest), diff or _diff(live, manifest), note)

@@ -6,7 +6,7 @@ Locking and the CLI workflow deliberately live in later tickets.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import json
 from pathlib import Path, PurePosixPath
@@ -17,6 +17,7 @@ import re
 import stat
 import unicodedata
 import uuid
+import math
 from typing import Callable, Iterable
 
 from grim_dawn_sync.errors import EXIT_CONFLICT, EXIT_CONFIGURATION, EXIT_RECOVERY_REQUIRED, EXIT_VALIDATION, SyncError
@@ -33,6 +34,12 @@ from grim_dawn_sync.validation import validate_players
 
 
 _MANAGED = ("save", ".sync/manifest.json", ".sync/vault.json")
+_DEFAULT_GIT_TIMEOUT_SECONDS = 60.0
+_TAG_FETCH_BATCH_SIZE = 16
+_TAG_REF_OUTPUT_LIMIT = 128 * 1024
+_TAG_REF_COUNT_LIMIT = 100
+_TAG_REF_BYTE_LIMIT = 512
+_CAT_FILE_BATCH_SIZE = 256
 
 
 def _reparse(st: os.stat_result) -> bool:
@@ -295,41 +302,132 @@ class GitResult:
     returncode: int
 
 
+@dataclass
+class SnapshotValidationCache:
+    """Build-scoped cache for immutable Git objects verified by exact OID."""
+    manifests: dict[str, dict] = field(default_factory=dict)
+    blobs: dict[str, tuple[int, str]] = field(default_factory=dict)
+
+
 class GitRunner:
     """Small argv-only adapter; tests may inspect ``commands``."""
-    def __init__(self, cwd: Path, executable: str = "git") -> None:
+    def __init__(self, cwd: Path, executable: str = "git", *, timeout_seconds: float = _DEFAULT_GIT_TIMEOUT_SECONDS) -> None:
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or not math.isfinite(timeout_seconds)
+            or timeout_seconds <= 0
+        ):
+            raise ValueError("Git timeout must be a positive finite number.")
         self.cwd = Path(cwd).resolve(); self.executable = executable; self.commands: list[tuple[str, ...]] = []
+        self.timeout_seconds = float(timeout_seconds)
+        self.environment = os.environ.copy()
+        # Keep key-based and configured credential-helper authentication intact,
+        # but never permit a Git/GCM/SSH prompt.  stdin is also closed below, so
+        # a malformed helper cannot fall back to a console prompt.
+        self.environment.update({
+            # Environment precedence prevents repository/global core.askPass
+            # from launching an arbitrary UI. Git itself is a deterministic
+            # non-interactive failure helper if credential helpers/SSH keys do
+            # not already satisfy authentication.
+            "GIT_ASKPASS": self.executable,
+            "SSH_ASKPASS": self.executable,
+            "GIT_TERMINAL_PROMPT": "0",
+            "GCM_INTERACTIVE": "Never",
+            "SSH_ASKPASS_REQUIRE": "never",
+        })
+
+    def _popen_options(self, *, text: bool, input_supplied: bool) -> dict[str, object]:
+        options: dict[str, object] = {
+            "cwd": self.cwd,
+            "stdin": subprocess.PIPE if input_supplied else subprocess.DEVNULL,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "shell": False,
+            "env": self.environment,
+            "text": text,
+        }
+        if text:
+            options.update({"encoding": "utf-8", "errors": "replace"})
+        if os.name == "nt":
+            # A separate process group lets taskkill below reliably terminate
+            # Git's SSH/GCM helper descendants after a timeout.
+            options["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        return options
+
+    @staticmethod
+    def _terminate_timed_out_process(process: subprocess.Popen[object]) -> None:
+        """Best-effort termination which includes Windows child processes."""
+        if os.name == "nt":
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                    timeout=10,
+                    shell=False,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        try:
+            process.kill()
+        except OSError:
+            pass
+
+    def _communicate(self, argv: tuple[str, ...], *, input_data: str | bytes | None, text: bool) -> tuple[str | bytes, str | bytes, int]:
+        try:
+            process = subprocess.Popen(
+                list(argv),
+                **self._popen_options(text=text, input_supplied=input_data is not None),
+            )
+        except OSError as error:
+            raise SyncError("git_unavailable", "Git could not be executed.", EXIT_CONFIGURATION) from error
+        try:
+            stdout, stderr = process.communicate(input_data, timeout=self.timeout_seconds)
+        except subprocess.TimeoutExpired as error:
+            self._terminate_timed_out_process(process)
+            try:
+                process.communicate(timeout=10)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            self._raise_timeout(error)
+        return stdout, stderr, process.returncode
+
+    def _run_options(self) -> dict[str, object]:
+        """Compatibility view for narrow test adapters; production uses Popen."""
+        return {"cwd": self.cwd, "capture_output": True,
+                "check": False, "timeout": self.timeout_seconds, "env": self.environment}
+
+    @staticmethod
+    def _raise_timeout(error: subprocess.TimeoutExpired) -> None:
+        raise SyncError("git_timeout", "Git operation exceeded its safe time limit.", EXIT_CONFLICT) from error
 
     def run(self, *args: str, check: bool = True, input_text: str | None = None) -> GitResult:
         argv = (self.executable, *args); self.commands.append(argv)
-        try:
-            completed = subprocess.run(list(argv), cwd=self.cwd, shell=False, input=input_text, text=True, encoding="utf-8", errors="replace", capture_output=True, check=False)
-        except OSError as error:
-            raise SyncError("git_unavailable", "Git could not be executed.", EXIT_CONFIGURATION) from error
-        result = GitResult(tuple(args), completed.stdout, completed.stderr, completed.returncode)
+        stdout, stderr, returncode = self._communicate(argv, input_data=input_text, text=True)
+        assert isinstance(stdout, str) and isinstance(stderr, str)
+        result = GitResult(tuple(args), stdout, stderr, returncode)
         if check and result.returncode:
             raise SyncError("git_command_failed", "Git command failed.", EXIT_CONFLICT, {"command": args[0] if args else "git"})
         return result
 
     def run_bytes(self, *args: str) -> bytes:
         argv = (self.executable, *args); self.commands.append(argv)
-        try:
-            completed = subprocess.run(list(argv), cwd=self.cwd, shell=False, capture_output=True, check=False)
-        except OSError as error:
-            raise SyncError("git_unavailable", "Git could not be executed.", EXIT_CONFIGURATION) from error
-        if completed.returncode:
+        stdout, _stderr, returncode = self._communicate(argv, input_data=None, text=False)
+        assert isinstance(stdout, bytes)
+        if returncode:
             raise SyncError("git_command_failed", "Git command failed.", EXIT_CONFLICT, {"command": args[0] if args else "git"})
-        return completed.stdout
+        return stdout
 
     def run_bytes_input(self, *args: str, input_bytes: bytes) -> bytes:
         argv = (self.executable, *args); self.commands.append(argv)
-        try:
-            completed = subprocess.run(list(argv), cwd=self.cwd, shell=False, input=input_bytes, capture_output=True, check=False)
-        except OSError as error:
-            raise SyncError("git_unavailable", "Git could not be executed.", EXIT_CONFIGURATION) from error
-        if completed.returncode:
+        stdout, _stderr, returncode = self._communicate(argv, input_data=input_bytes, text=False)
+        assert isinstance(stdout, bytes)
+        if returncode:
             raise SyncError("git_command_failed", "Git command failed.", EXIT_CONFLICT, {"command": args[0] if args else "git"})
-        return completed.stdout
+        return stdout
 
 
 @dataclass(frozen=True)
@@ -505,6 +603,38 @@ class GitVault:
             raise SyncError("malformed_remote_history", "Remote history was malformed.", EXIT_CONFLICT)
         return commits
 
+    def _materialize_remote_tags(
+        self,
+        expected: dict[str, tuple[str, str]],
+        *,
+        collision_code: str,
+        fetch_code: str,
+        mismatch_code: str,
+    ) -> dict[str, str]:
+        """Fetch bounded exact tag refs only after every local collision check."""
+        missing: list[str] = []
+        for ref, (tag_oid, _target) in expected.items():
+            present = self.runner.run("rev-parse", "--verify", "--quiet", ref, check=False).stdout.strip()
+            if present and present != tag_oid:
+                raise SyncError(collision_code, "Local tag ref differs from its verified remote object.", EXIT_CONFLICT)
+            if not present:
+                missing.append(ref)
+        for start in range(0, len(missing), _TAG_FETCH_BATCH_SIZE):
+            chunk = missing[start:start + _TAG_FETCH_BATCH_SIZE]
+            fetched = self.runner.run(
+                "fetch", "--no-tags", self.remote, *(f"{ref}:{ref}" for ref in chunk), check=False,
+            )
+            if fetched.returncode:
+                raise SyncError(fetch_code, "Verified remote tags could not be fetched.", EXIT_CONFLICT)
+        verified: dict[str, str] = {}
+        for ref, (tag_oid, target) in expected.items():
+            object_oid = self.runner.run("rev-parse", "--verify", "--quiet", ref, check=False).stdout.strip()
+            peeled = self.runner.run("rev-parse", "--verify", "--quiet", f"{ref}^{{}}", check=False).stdout.strip()
+            if object_oid != tag_oid or peeled != target:
+                raise SyncError(mismatch_code, "Remote tag target could not be verified.", EXIT_CONFLICT)
+            verified[ref] = peeled
+        return verified
+
     def legacy_annotated_tags(self, *, limit: int = 100) -> tuple[tuple[str, str], ...]:
         """Return verified local ``archive/*`` and ``milestone/*`` tag targets.
 
@@ -517,6 +647,8 @@ class GitVault:
             "for-each-ref", "--format=%(refname:short)\t%(objecttype)\t%(objectname)\t%(*objectname)",
             "refs/tags/archive", "refs/tags/milestone",
         )
+        if len(result.stdout.encode("utf-8", "surrogatepass")) > _TAG_REF_OUTPUT_LIMIT:
+            raise SyncError("legacy_tag_list_too_large", "Legacy bookmark ref output exceeded its safe bound.", EXIT_CONFLICT)
         rows: list[tuple[str, str]] = []
         for row in result.stdout.splitlines():
             fields = row.split("\t")
@@ -529,9 +661,12 @@ class GitVault:
                 or not _OID.fullmatch(tag_oid)
                 or not _OID.fullmatch(peeled)
                 or any(ord(char) < 32 for char in name)
+                or len(f"refs/tags/{name}".encode("utf-8", "surrogatepass")) > _TAG_REF_BYTE_LIMIT
             ):
                 raise SyncError("malformed_legacy_tag", "Legacy tag list was malformed.", EXIT_CONFLICT)
             rows.append((name, peeled))
+            if len(rows) > _TAG_REF_COUNT_LIMIT:
+                raise SyncError("legacy_tag_list_too_large", "Legacy bookmark count exceeded its safe bound.", EXIT_CONFLICT)
         # Tags are not fetched by the normal main-only fetch.  Discover remote
         # legacy tags explicitly, then fetch each exact immutable ref solely
         # to validate its annotated object and peeled commit locally.
@@ -540,6 +675,8 @@ class GitVault:
         )
         if remote_result.returncode:
             raise SyncError("legacy_tag_list_failed", "Legacy bookmark refs could not be read.", EXIT_CONFLICT)
+        if len(remote_result.stdout.encode("utf-8", "surrogatepass")) > _TAG_REF_OUTPUT_LIMIT:
+            raise SyncError("legacy_tag_list_too_large", "Legacy bookmark ref output exceeded its safe bound.", EXIT_CONFLICT)
         remote_values: dict[str, dict[str, str]] = {}
         for row in remote_result.stdout.splitlines():
             fields = row.split("\t")
@@ -547,32 +684,36 @@ class GitVault:
                 raise SyncError("malformed_legacy_tag", "Legacy tag list was malformed.", EXIT_CONFLICT)
             oid, ref = fields; peeled_remote = ref.endswith("^{}")
             base = ref[:-3] if peeled_remote else ref
-            if not re.fullmatch(r"refs/tags/(?:archive|milestone)/[^\x00-\x1f]+", base) or not _OID.fullmatch(oid):
+            if (
+                not re.fullmatch(r"refs/tags/(?:archive|milestone)/[^\x00-\x1f]+", base)
+                or len(base.encode("utf-8", "surrogatepass")) > _TAG_REF_BYTE_LIMIT
+                or not _OID.fullmatch(oid)
+            ):
                 raise SyncError("malformed_legacy_tag", "Legacy tag list was malformed.", EXIT_CONFLICT)
             item = remote_values.setdefault(base, {}); key = "peeled" if peeled_remote else "tag"
             if key in item:
                 raise SyncError("malformed_legacy_tag", "Legacy tag list was malformed.", EXIT_CONFLICT)
             item[key] = oid
+            if len(remote_values) > _TAG_REF_COUNT_LIMIT:
+                raise SyncError("legacy_tag_list_too_large", "Legacy bookmark count exceeded its safe bound.", EXIT_CONFLICT)
         known = {name for name, _ in rows}
+        selected: dict[str, tuple[str, str]] = {}
         for ref, item in sorted(remote_values.items()):
             if set(item) != {"tag", "peeled"}:
                 raise SyncError("malformed_legacy_tag", "Legacy tag list was malformed.", EXIT_CONFLICT)
-            local = self.runner.run("rev-parse", "--verify", "--quiet", ref, check=False).stdout.strip()
-            if local and local != item["tag"]:
-                raise SyncError("legacy_tag_local_collision", "Local legacy bookmark ref differs from remote.", EXIT_CONFLICT)
-            if not local:
-                fetched = self.runner.run("fetch", "--no-tags", self.remote, f"{ref}:{ref}", check=False)
-                if fetched.returncode:
-                    raise SyncError("legacy_tag_fetch_failed", "Legacy bookmark could not be fetched for verification.", EXIT_CONFLICT)
-            verified = self.runner.run("rev-parse", "--verify", "--quiet", f"{ref}^{{}}", check=False).stdout.strip()
-            if verified != item["peeled"]:
-                raise SyncError("legacy_tag_remote_mismatch", "Legacy bookmark target could not be verified.", EXIT_CONFLICT)
             short = ref.removeprefix("refs/tags/")
-            if short not in known:
-                rows.append((short, verified)); known.add(short)
-        if len(rows) > limit:
-            return tuple(rows[:limit])
-        return tuple(rows)
+            if short not in known and len(rows) + len(selected) < limit:
+                selected[ref] = (item["tag"], item["peeled"])
+        verified = self._materialize_remote_tags(
+            selected,
+            collision_code="legacy_tag_local_collision",
+            fetch_code="legacy_tag_fetch_failed",
+            mismatch_code="legacy_tag_remote_mismatch",
+        )
+        for ref in selected:
+            short = ref.removeprefix("refs/tags/")
+            rows.append((short, verified[ref])); known.add(short)
+        return tuple(rows[:limit])
 
     def _managed_bookmark_rows(self, *, remote: bool) -> tuple[tuple[str, str, str], ...]:
         """Return ``(short_name, tag_oid, peeled_commit)`` for managed tags.
@@ -590,7 +731,7 @@ class GitVault:
             )
         if result.returncode:
             raise SyncError("bookmark_list_failed", "Managed bookmark refs could not be read.", EXIT_CONFLICT)
-        if remote and len(result.stdout.encode("utf-8", "surrogatepass")) > 128 * 1024:
+        if len(result.stdout.encode("utf-8", "surrogatepass")) > _TAG_REF_OUTPUT_LIMIT:
             raise SyncError("bookmark_list_too_large", "Managed bookmark ref output exceeded its safe bound.", EXIT_CONFLICT)
         values: dict[str, dict[str, str]] = {}
         for row in result.stdout.splitlines():
@@ -610,10 +751,12 @@ class GitVault:
                 item[key] = oid
             else:
                 ref, tag_oid, target = fields
-                if not re.fullmatch(r"refs/tags/grim-dawn-save-[0-9a-f]{32}", ref) or not _OID.fullmatch(tag_oid) or not _OID.fullmatch(target):
+                if (len(ref.encode("utf-8", "surrogatepass")) > _TAG_REF_BYTE_LIMIT
+                        or not re.fullmatch(r"refs/tags/grim-dawn-save-[0-9a-f]{32}", ref)
+                        or not _OID.fullmatch(tag_oid) or not _OID.fullmatch(target)):
                     raise SyncError("malformed_bookmark_ref", "Managed bookmark refs were malformed.", EXIT_CONFLICT)
                 values[ref] = {"tag": tag_oid, "peeled": target}
-            if remote and len(values) > 100:
+            if len(values) > _TAG_REF_COUNT_LIMIT:
                 raise SyncError("bookmark_list_too_large", "Managed bookmark count exceeded its safe bound.", EXIT_CONFLICT)
         rows: list[tuple[str, str, str]] = []
         for ref, item in sorted(values.items()):
@@ -634,21 +777,16 @@ class GitVault:
         rows = self._managed_bookmark_rows(remote=True)
         if len(rows) > limit:
             rows = rows[:limit]
+        expected = {f"refs/tags/{name}": (tag_oid, target) for name, tag_oid, target in rows}
+        self._materialize_remote_tags(
+            expected,
+            collision_code="bookmark_local_collision",
+            fetch_code="bookmark_fetch_failed",
+            mismatch_code="bookmark_remote_mismatch",
+        )
         results: list[tuple[str, str, str]] = []
         for name, tag_oid, target in rows:
             ref = f"refs/tags/{name}"
-            # A tag ref can never be overwritten or moved by this operation.
-            present = self.runner.run("rev-parse", "--verify", "--quiet", ref, check=False).stdout.strip()
-            if present and present != tag_oid:
-                raise SyncError("bookmark_local_collision", "Local managed bookmark ref differs from remote.", EXIT_CONFLICT)
-            if not present:
-                fetched = self.runner.run("fetch", "--no-tags", self.remote, f"{ref}:{ref}", check=False)
-                if fetched.returncode:
-                    raise SyncError("bookmark_fetch_failed", "Managed bookmark could not be fetched for verification.", EXIT_CONFLICT)
-            object_oid = self.runner.run("rev-parse", "--verify", "--quiet", ref, check=False).stdout.strip()
-            peeled = self.runner.run("rev-parse", "--verify", "--quiet", f"{ref}^{{}}", check=False).stdout.strip()
-            if object_oid != tag_oid or peeled != target:
-                raise SyncError("bookmark_remote_mismatch", "Managed bookmark target could not be verified.", EXIT_CONFLICT)
             shown = self.runner.run("cat-file", "tag", ref, check=False)
             if shown.returncode or "\n\n" not in shown.stdout:
                 raise SyncError("invalid_bookmark_annotation", "Managed bookmark annotation is invalid.", EXIT_VALIDATION)
@@ -828,7 +966,52 @@ class GitVault:
                 EXIT_VALIDATION,
             ) from error
 
-    def _committed_save_files(self, commit: str) -> dict[str, tuple[int, str]]:
+    def _read_blob_batch(self, oids: Iterable[str], cache: dict[str, tuple[int, str]]) -> None:
+        """Hash validated blob OIDs through bounded ``cat-file --batch`` chunks."""
+        missing = tuple(dict.fromkeys(oid for oid in oids if oid not in cache))
+        if not missing:
+            return
+        pending: dict[str, tuple[int, str]] = {}
+        batch_runner = getattr(self.runner, "run_bytes_input", None)
+        if not callable(batch_runner):
+            # Compatibility for narrow test adapters. Production GitRunner
+            # always takes the bounded batch path.
+            for oid in missing:
+                blob = self.runner.run_bytes("cat-file", "blob", oid)
+                pending[oid] = (len(blob), hashlib.sha256(blob).hexdigest())
+            cache.update(pending)
+            return
+        for start in range(0, len(missing), _CAT_FILE_BATCH_SIZE):
+            chunk = missing[start:start + _CAT_FILE_BATCH_SIZE]
+            output = batch_runner("cat-file", "--batch", input_bytes=b"".join(
+                oid.encode("ascii") + b"\n" for oid in chunk
+            ))
+            cursor = 0
+            parsed: dict[str, tuple[int, str]] = {}
+            for expected_oid in chunk:
+                newline = output.find(b"\n", cursor)
+                if newline < 0:
+                    raise SyncError("invalid_remote_manifest", "Remote save blob batch was malformed.", EXIT_VALIDATION)
+                try:
+                    header = output[cursor:newline].decode("ascii", "strict").split(" ")
+                    if len(header) != 3 or header[0] != expected_oid or header[1] != "blob" or not header[2].isdigit():
+                        raise ValueError
+                    size = int(header[2])
+                except (UnicodeError, ValueError, OverflowError) as error:
+                    raise SyncError("invalid_remote_manifest", "Remote save blob batch was malformed.", EXIT_VALIDATION) from error
+                content_start = newline + 1
+                content_end = content_start + size
+                if content_end >= len(output) or output[content_end:content_end + 1] != b"\n":
+                    raise SyncError("invalid_remote_manifest", "Remote save blob batch was malformed.", EXIT_VALIDATION)
+                blob = output[content_start:content_end]
+                parsed[expected_oid] = (size, hashlib.sha256(blob).hexdigest())
+                cursor = content_end + 1
+            if cursor != len(output):
+                raise SyncError("invalid_remote_manifest", "Remote save blob batch was malformed.", EXIT_VALIDATION)
+            pending.update(parsed)
+        cache.update(pending)
+
+    def _committed_save_files(self, commit: str, *, blob_cache: dict[str, tuple[int, str]] | None = None) -> dict[str, tuple[int, str]]:
         """Return the complete, verified ``save/`` blob table for a commit.
 
         This deliberately consumes NUL-delimited Git output and object bytes;
@@ -838,7 +1021,7 @@ class GitVault:
             listing = self.runner.run_bytes("ls-tree", "-r", "-z", commit, "--", "save")
         except SyncError as error:
             raise SyncError("invalid_remote_manifest", "Remote commit save tree could not be read.", EXIT_VALIDATION) from error
-        result: dict[str, tuple[int, str]] = {}
+        paths: dict[str, str] = {}
         folded: set[str] = set()
         for raw in listing.split(b"\0"):
             if not raw:
@@ -857,15 +1040,18 @@ class GitVault:
             except SyncError as error:
                 raise SyncError("unsafe_vault_tree", "Vault tree contains an unsafe path.", EXIT_VALIDATION) from error
             key = unicodedata.normalize("NFC", relative).casefold()
-            if relative in result or key in folded:
+            if relative in paths or key in folded:
                 raise SyncError("unsafe_vault_tree", "Vault tree has colliding paths.", EXIT_VALIDATION)
-            try:
-                blob = self.runner.run_bytes("cat-file", "blob", oid)
-            except SyncError as error:
-                raise SyncError("invalid_remote_manifest", "Remote save blob could not be read.", EXIT_VALIDATION) from error
             folded.add(key)
-            result[relative] = (len(blob), hashlib.sha256(blob).hexdigest())
-        return result
+            paths[relative] = oid
+        verified = {} if blob_cache is None else blob_cache
+        try:
+            self._read_blob_batch(paths.values(), verified)
+        except SyncError as error:
+            if error.code == "invalid_remote_manifest":
+                raise
+            raise SyncError("invalid_remote_manifest", "Remote save blob could not be read.", EXIT_VALIDATION) from error
+        return {path: verified[oid] for path, oid in paths.items()}
 
     def read_vault_metadata(self, commit: str) -> dict:
         """Read exact committed snapshot provenance without materializing it."""
@@ -901,14 +1087,18 @@ class GitVault:
             )
         return payload
 
-    def validate_commit_snapshot(self, commit: str) -> dict:
+    def validate_commit_snapshot(self, commit: str, *, cache: SnapshotValidationCache | None = None) -> dict:
         """Fail closed unless every committed save blob matches its manifest."""
         commit = _oid_value(commit)
+        if cache is not None and commit in cache.manifests:
+            return cache.manifests[commit]
         manifest = self.read_manifest(commit)
-        actual = self._committed_save_files(commit)
+        actual = self._committed_save_files(commit, blob_cache=None if cache is None else cache.blobs)
         declared = {str(item["path"]): (int(item["size"]), str(item["sha256"])) for item in manifest["files"]}
         if actual != declared:
             raise SyncError("committed_save_mismatch", "Committed save tree does not match its manifest.", EXIT_VALIDATION)
+        if cache is not None:
+            cache.manifests[commit] = manifest
         return manifest
 
     def snapshot(self, source: Path, *, machine_id: str, session_id: str, expected_manifest: dict | None = None, retries: int = 1, window_seconds: float = 0, validator=validate_players, state_hook=None) -> str:
