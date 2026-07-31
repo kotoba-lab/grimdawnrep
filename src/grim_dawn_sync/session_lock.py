@@ -12,7 +12,7 @@ from pathlib import Path
 
 from grim_dawn_sync.errors import EXIT_CONFLICT, EXIT_RECOVERY_REQUIRED, SyncError
 from grim_dawn_sync.git_vault import GitRunner, GitVault, _OID
-from grim_dawn_sync.state import SyncState, load_state, save_state
+from grim_dawn_sync.state import SyncState, load_state, save_state, save_state_if_unchanged
 
 LOCK_REF = "refs/tags/grim-dawn-sync-active"
 _TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -138,7 +138,8 @@ def _inspect_local_tag(vault: GitVault, tag: str, expected_oid: str) -> Session:
         _fail("recovery_local_tag_mismatch", "Local recovery tag is malformed.")
     return session
 
-def acquire_lock(vault: GitVault, machine_id: str, base_commit: str, *, state_path: Path | None = None) -> Lock:
+def acquire_lock(vault: GitVault, machine_id: str, base_commit: str, *, state_path: Path | None = None,
+                 expected_pre_state: SyncState | None = None) -> Lock:
     vault.assert_remote_identity()
     if state_path is None: _fail("state_required", "Lock acquisition requires terminal-local state.", EXIT_RECOVERY_REQUIRED)
     if vault.remote_oid() != base_commit: _fail("stale_lock_base", "Remote main no longer matches the lock base.")
@@ -152,15 +153,33 @@ def acquire_lock(vault: GitVault, machine_id: str, base_commit: str, *, state_pa
         oid = vault.runner.run("rev-parse", tag).stdout.strip()
         if not _OID.fullmatch(oid) or vault.runner.run("cat-file", "-t", tag).stdout.strip() != "tag": _fail("lock_create_failed", "Could not create an annotated session tag.", EXIT_RECOVERY_REQUIRED)
         intent = SyncState(session_id=session.session_id, machine_id=machine_id, base_commit=base_commit, lock_oid=oid, local_tag=tag, phase="lock_held")
-        save_state(state_path, intent)
-        if vault.remote_oid() != base_commit:
+        try:
+            if expected_pre_state is None:
+                save_state(state_path, intent)
+            else:
+                save_state_if_unchanged(state_path, expected_pre_state, intent)
+        except SyncError as error:
             deleted = vault.runner.run("tag", "-d", tag, check=False)
             if deleted.returncode:
-                _fail("stale_lock_cleanup_incomplete", "Remote main changed and local cleanup is incomplete.", EXIT_RECOVERY_REQUIRED)
-            try: save_state(state_path, SyncState())
+                _fail("lock_race_cleanup_incomplete", "Local lock cleanup is incomplete.", EXIT_RECOVERY_REQUIRED)
+            if expected_pre_state is not None and error.code in {"selection_stale", "state_busy"}:
+                raise SyncError("selection_stale", "Recovery state changed before lock acquisition.", EXIT_CONFLICT) from None
+            raise
+        def cleanup_unpushed_intent(code: str, message: str) -> None:
+            """Restore the exact pre-state before deleting an unpublished local tag."""
+            try:
+                if expected_pre_state is None:
+                    save_state(state_path, SyncState())
+                else:
+                    save_state_if_unchanged(state_path, intent, expected_pre_state)
             except SyncError:
-                _fail("stale_lock_cleanup_incomplete", "Remote main changed and state cleanup is incomplete.", EXIT_RECOVERY_REQUIRED)
-            _fail("stale_lock_base", "Remote main changed before lock push.")
+                _fail("lock_race_cleanup_incomplete", "Lock state cleanup is incomplete.", EXIT_RECOVERY_REQUIRED)
+            deleted = vault.runner.run("tag", "-d", tag, check=False)
+            if deleted.returncode:
+                _fail("lock_race_cleanup_incomplete", "Local lock cleanup is incomplete.", EXIT_RECOVERY_REQUIRED)
+            _fail(code, message)
+        if vault.remote_oid() != base_commit:
+            cleanup_unpushed_intent("stale_lock_base", "Remote main changed before lock push.")
         vault.assert_remote_identity()
         pushed = vault.runner.run("push", vault.remote, f"{oid}:{LOCK_REF}", check=False)
         try: remote = _remote_lock(vault)
@@ -170,10 +189,7 @@ def acquire_lock(vault: GitVault, machine_id: str, base_commit: str, *, state_pa
             lock = Lock(session, oid, tag)
             return lock
         if remote is not None:
-            cleaned = vault.runner.run("tag", "-d", tag, check=False)
-            if cleaned.returncode: _fail("lock_race_cleanup_incomplete", "Another machine acquired the lock; local cleanup is incomplete.", EXIT_RECOVERY_REQUIRED)
-            save_state(state_path, SyncState())
-            _fail("lock_race_lost", "Another machine acquired the remote lock.")
+            cleanup_unpushed_intent("lock_race_lost", "Another machine acquired the remote lock.")
         _fail("lock_push_unknown" if pushed.returncode else "lock_unconfirmed", "Lock acquisition was not confirmed; local recovery artifacts were retained.", EXIT_RECOVERY_REQUIRED, {"session_id":session.session_id,"machine_id":machine_id,"base_commit":base_commit,"lock_oid":oid,"local_tag":tag})
     finally:
         try: os.unlink(raw)

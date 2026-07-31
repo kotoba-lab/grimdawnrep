@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import inspect
 from pathlib import Path
 import stat
 from types import SimpleNamespace
@@ -9,7 +10,7 @@ import pytest
 
 from grim_dawn_sync.config import parse_config
 from grim_dawn_sync.errors import EXIT_CONFLICT, EXIT_RECOVERY_REQUIRED, EXIT_VALIDATION, SyncError
-from grim_dawn_sync.workflow import DomainAdapters, LaunchWorkflow, WorkflowState
+from grim_dawn_sync.workflow import DomainAdapters, LaunchWorkflow, WorkflowAdapters, WorkflowState
 from grim_dawn_sync.selection import ReconcileCase, SelectionRegistry
 from grim_dawn_sync.version_catalog import ManifestDiff, SaveCandidate, VersionCatalog
 
@@ -44,7 +45,10 @@ class FakeAdapters:
     def remote_manifest(self, base, session): return {"root_hash":"new"}
     def fetch_and_reconcile(self): self._call("fetch"); return SimpleNamespace(relation=self.relation)
     def remote_oid(self): self._call("remote_oid"); return self.remote
-    def acquire(self, base): self._call("acquire"); assert base == self.remote; return self.lock
+    def acquire(self, base, *, expected_pre_state=None):
+        self._call("acquire"); assert base == self.remote
+        assert expected_pre_state is None
+        return self.lock
     def align_selection_base(self, base): self._call("align"); assert base == self.remote
     def prepare_remote_restore(self, base, session): self._call("prepare"); assert (base, session) == (self.remote, "session-1"); return "plan"
     def archive_before_restore(self, plan): self._call("archive_before"); assert plan == "plan"; return "archived-plan"
@@ -67,6 +71,13 @@ class FakeAdapters:
 def run(tmp_path: Path, adapters: FakeAdapters) -> tuple[LaunchWorkflow, Path]:
     root = tmp_path / "local"
     return LaunchWorkflow(config(tmp_path), root, adapters=adapters), root / "logs" / "launch.jsonl"
+
+
+def test_acquire_protocol_production_and_fake_share_expected_pre_state_keyword() -> None:
+    for owner in (WorkflowAdapters, DomainAdapters, FakeAdapters):
+        parameter = inspect.signature(owner.acquire).parameters["expected_pre_state"]
+        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        assert parameter.default is None
 
 
 def test_domain_remote_manifest_reads_commit_without_creating_staging(tmp_path: Path) -> None:
@@ -409,9 +420,76 @@ def test_context_digest_and_remote_identity_revalidate_immediately_before_lock(t
         adapters.calls.append("bookmark")
         raise SyncError("bookmark_push_incomplete", "x", EXIT_RECOVERY_REQUIRED)
     adapters.bookmark_displaced_remote = bookmark
+    def context(digest):
+        adapters.calls.append("context") if digest == "d" * 64 else pytest.fail("digest")
+    def after_lock(digest, lock):
+        assert digest == "d" * 64 and lock is adapters.lock
+        adapters.calls.append("context_after_lock")
+    context.after_lock = after_lock
     with pytest.raises(SyncError):
-        subject.execute_selection_plan(plan, registry, context_revalidate=lambda digest: adapters.calls.append("context") if digest == "d" * 64 else pytest.fail("digest"))
+        subject.execute_selection_plan(plan, registry, context_revalidate=context)
+    assert adapters.calls[:5] == ["preflight", "context", "bind", "acquire", "context_after_lock"]
+
+
+def test_context_change_across_lock_stops_before_plan_execution(tmp_path: Path) -> None:
+    adapters = FakeAdapters(); subject, _ = run(tmp_path, adapters)
+    live, commit = "1" * 64, "a" * 40
+    item = SaveCandidate("live", "live", "live", "x", "m", live, None, 0, 0, 0, (), ManifestDiff(0, 0, 0))
+    catalog = VersionCatalog("v" * 32, commit, live, (item,)); registry = SelectionRegistry(); registry.register(catalog)
+    plan = registry.build_plan(
+        catalog_token=catalog.token, candidate_id=item.candidate_id, mode="launch",
+        case=ReconcileCase.LIVE_AHEAD, expected_context_digest="d" * 64,
+        expected_remote_identity=("test://vault", "test://vault"),
+    )
+    adapters.live_manifest = lambda: {"root_hash": live}
+    adapters.remote_oid = lambda: commit
+    adapters.bind_remote_identity = lambda _value: adapters.calls.append("bind")
+
+    def context(_digest):
+        adapters.calls.append("context")
+    def after_lock(_digest, _lock):
+        adapters.calls.append("context_after_lock")
+        raise SyncError("catalog_context_changed", "late change", EXIT_CONFLICT)
+    context.after_lock = after_lock
+
+    with pytest.raises(SyncError) as caught:
+        subject.execute_selection_plan(plan, registry, context_revalidate=context)
+    assert caught.value.code == "catalog_context_changed"
+    assert caught.value.details["next_command"] == "grim-dawn-sync recover"
+    assert adapters.calls[:5] == ["preflight", "context", "bind", "acquire", "context_after_lock"]
+    assert "bookmark" not in adapters.calls and "align" not in adapters.calls and "prepare" not in adapters.calls
+
+
+def test_acquire_gap_state_race_is_pre_mutation_selection_stale(tmp_path: Path) -> None:
+    adapters = FakeAdapters(); subject, _ = run(tmp_path, adapters)
+    live, commit = "1" * 64, "a" * 40
+    item = SaveCandidate("live", "live", "live", "x", "m", live, None, 0, 0, 0, (), ManifestDiff(0, 0, 0))
+    catalog = VersionCatalog("v" * 32, commit, live, (item,)); registry = SelectionRegistry(); registry.register(catalog)
+    plan = registry.build_plan(
+        catalog_token=catalog.token, candidate_id=item.candidate_id, mode="launch",
+        case=ReconcileCase.LIVE_AHEAD, expected_context_digest="d" * 64,
+        expected_remote_identity=("test://vault", "test://vault"),
+    )
+    adapters.live_manifest = lambda: {"root_hash": live}
+    adapters.remote_oid = lambda: commit
+    adapters.bind_remote_identity = lambda _value: adapters.calls.append("bind")
+    expected_state = object()
+
+    def acquire(_base, *, expected_pre_state=None):
+        assert expected_pre_state is expected_state
+        adapters.calls.append("acquire")
+        raise SyncError("selection_stale", "state changed", EXIT_CONFLICT)
+    adapters.acquire = acquire
+
+    def context(_digest): adapters.calls.append("context")
+    context.expected_pre_state = expected_state
+    context.after_lock = lambda *_args: pytest.fail("no lock was acquired")
+
+    with pytest.raises(SyncError) as caught:
+        subject.execute_selection_plan(plan, registry, context_revalidate=context)
+    assert caught.value.code == "selection_stale" and caught.value.details == {}
     assert adapters.calls[:4] == ["preflight", "context", "bind", "acquire"]
+    assert "bookmark" not in adapters.calls and "align" not in adapters.calls and "prepare" not in adapters.calls
 
 
 def test_promote_only_live_rechecks_selected_root_immediately_before_snapshot(tmp_path: Path) -> None:

@@ -67,7 +67,7 @@ class WorkflowAdapters(Protocol):
     def remote_manifest(self, base: str, session: str) -> dict: ...
     def fetch_and_reconcile(self) -> Any: ...
     def remote_oid(self) -> str | None: ...
-    def acquire(self, base: str) -> Any: ...
+    def acquire(self, base: str, *, expected_pre_state: SyncState | None = None) -> Any: ...
     def prepare_remote_restore(self, base: str, session: str) -> Any: ...
     def archive_before_restore(self, plan: Any) -> Any: ...
     def apply_remote_save(self, plan: Any) -> Any: ...
@@ -121,7 +121,11 @@ class DomainAdapters:
         self.vault.bind_remote_identity(expected)
     def align_selection_base(self, expected_remote_head: str) -> None:
         self.vault.align_head_to_remote(expected_remote_head)
-    def acquire(self, base: str): return acquire_lock(self.vault,self.config.machine_id,base,state_path=self.state_path)
+    def acquire(self, base: str, *, expected_pre_state: SyncState | None = None):
+        return acquire_lock(
+            self.vault, self.config.machine_id, base,
+            state_path=self.state_path, expected_pre_state=expected_pre_state,
+        )
     def prepare_remote_restore(self, base: str, session: str):
         source=self.local_root/"staging"/session
         self.vault.extract_save(base,source,machine_id=self.config.machine_id,retries=self.config.stable_scan_retries,window_seconds=self.config.stable_window_seconds)
@@ -319,8 +323,19 @@ class LaunchWorkflow:
                 binder(canonical.expected_remote_identity)
             self._at(WorkflowState.ACQUIRE_LOCK)
             acquire_started = True
-            lock = self._call("acquire", canonical.expected_remote_head)
+            expected_pre_state = getattr(context_revalidate, "expected_pre_state", None)
+            if expected_pre_state is None:
+                lock = self._call("acquire", canonical.expected_remote_head)
+            else:
+                lock = self.adapters.acquire(
+                    canonical.expected_remote_head, expected_pre_state=expected_pre_state,
+                )
             self.mutated = True; self.session = lock.session.session_id
+            if canonical.expected_context_digest is not None:
+                after_lock = getattr(context_revalidate, "after_lock", None)
+                if not callable(after_lock):
+                    raise SyncError("adapter_contract_invalid", "Post-lock selection context cannot be revalidated.", EXIT_RECOVERY_REQUIRED)
+                after_lock(canonical.expected_context_digest, lock)
             # Close every live-save race before the first post-lock mutation,
             # including remote candidates whose selected root differs by design.
             require_live_root(canonical.expected_live_root_hash, post_lock=True)

@@ -214,6 +214,82 @@ def test_interactive_builds_catalog_once_and_prelock_revalidation_does_not_rebui
     assert builds == ["build"]
 
 
+@pytest.mark.parametrize(
+    "component",
+    ["process", "config", "state", "lock", "identity", "refs", "live", "head"],
+)
+def test_final_lightweight_snapshot_rejects_late_context_change(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, component: str,
+) -> None:
+    live, remote = "1" * 64, "2" * 64
+    config_path, _, _ = _install_context(monkeypatch, tmp_path, live=live, remote=remote, baseline=live)
+    expected_config = cli.load_config(config_path)
+    expected_state = cli.load_state(cli._state_path(config_path))
+    vault = cli._vault(expected_config)
+
+    if component == "process":
+        calls = 0
+        def process(_config):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise SyncError("game_already_running", "running", 5)
+        monkeypatch.setattr(cli, "_process_preflight", process)
+    elif component == "config":
+        changed = SimpleNamespace(**vars(expected_config))
+        changed.public_dict = lambda: {**expected_config.public_dict(), "machine_id": "changed"}
+        values = iter((expected_config, changed))
+        monkeypatch.setattr(cli, "load_config", lambda _path: next(values))
+    elif component == "state":
+        changed = SyncState(last_applied_remote_commit="a" * 40,
+                            last_applied_manifest_root_hash="3" * 64, machine_id="machine")
+        values = iter((expected_state, changed))
+        monkeypatch.setattr(cli, "load_state", lambda _path: next(values))
+    elif component == "lock":
+        values = iter((None, "b" * 40))
+        monkeypatch.setattr(cli, "_remote_lock_snapshot", lambda _vault: next(values))
+    elif component == "identity":
+        values = iter((("test://remote", "test://remote"), ("test://changed", "test://changed")))
+        monkeypatch.setattr(cli, "read_remote_identity", lambda *_args: next(values))
+    elif component == "refs":
+        values = iter(("1" * 64, "2" * 64))
+        monkeypatch.setattr(cli, "_remote_ref_snapshot", lambda _vault: next(values))
+    elif component == "live":
+        values = iter(({"root_hash": live}, {"root_hash": "3" * 64}))
+        monkeypatch.setattr(cli, "stable_manifest", lambda *_args, **_kwargs: next(values))
+    else:
+        values = iter(("a" * 40, "b" * 40))
+        vault.remote_oid = lambda: next(values)
+
+    with pytest.raises(SyncError) as caught:
+        cli._capture_execution_context(config_path, expected_config, expected_state, vault)
+    assert caught.value.code in {
+        "catalog_context_changed", "game_already_running", "lock_held",
+    }
+
+
+def test_post_lock_snapshot_normalizes_only_the_owned_lock_transition(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    live, remote = "1" * 64, "2" * 64
+    config_path, _, _ = _install_context(monkeypatch, tmp_path, live=live, remote=remote, baseline=live)
+    expected_config = cli.load_config(config_path)
+    expected_state = cli.load_state(cli._state_path(config_path))
+    vault = cli._vault(expected_config)
+    lock = SimpleNamespace(
+        session=SimpleNamespace(session_id="11111111-1111-4111-8111-111111111111", base_commit="a" * 40),
+        oid="b" * 40,
+        local_tag="grim-dawn-sync-11111111-1111-4111-8111-111111111111",
+    )
+    monkeypatch.setattr(cli, "load_state", lambda _path: cli._locked_state(expected_config, lock))
+    monkeypatch.setattr(cli, "_remote_lock_snapshot", lambda _vault: lock.oid)
+    context = cli._capture_execution_context(
+        config_path, expected_config, expected_state, vault, acquired_lock=lock,
+    )
+    assert context["state"] == expected_state.as_dict()
+    assert context["lock"] is None
+
+
 def test_single_build_rejects_fetch_or_push_url_change(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     live, remote = "1" * 64, "2" * 64
     config_path, _, _ = _install_context(monkeypatch, tmp_path, live=live, remote=remote, baseline=live)
@@ -474,6 +550,51 @@ def test_interactive_stale_then_reload_rebuilds_fresh_catalog_before_reselection
     assert Presenter.calls == 3 and Workflow.attempts == 2 and mutations == ["promoted"]
     assert len({token for token, _ in seen}) == 3
     assert len({candidate_id for _, candidate_id in seen}) == 3
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "details"),
+    [
+        (6, {}),
+        (4, {"mutated": True}),
+        (4, {"recovery_required": True}),
+        (4, {"next_command": "grim-dawn-sync recover"}),
+    ],
+    ids=["post-lock-exit", "mutated", "recovery-required", "next-command"],
+)
+def test_interactive_post_mutation_stale_fails_without_ui_or_build_retry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, exit_code: int, details: dict[str, object],
+) -> None:
+    live, remote = "1" * 64, "2" * 64
+    config_path, _, _ = _install_context(monkeypatch, tmp_path, live=live, remote=remote, baseline=live)
+    builds: list[str] = []
+    original_fresh = cli._fresh_catalog
+
+    def counted_fresh(*args, **kwargs):
+        builds.append("build")
+        return original_fresh(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "_fresh_catalog", counted_fresh)
+
+    class Workflow:
+        attempts = 0
+        def __init__(self, *_args, **_kwargs): pass
+        def execute_selection_plan(self, *_args, **_kwargs):
+            Workflow.attempts += 1
+            raise SyncError("selection_stale", "changed after mutation", exit_code, details)
+
+    class Presenter:
+        calls = 0
+        def present_builder(self, build, directive):
+            Presenter.calls += 1
+            catalog = build(); directive(catalog)
+            return SelectionRequest("remote-id", "launch")
+
+    monkeypatch.setattr(cli, "LaunchWorkflow", Workflow)
+    with pytest.raises(SyncError) as caught:
+        cli.launch(config_path, presenter=Presenter())
+    assert caught.value.code == "selection_stale"
+    assert Presenter.calls == 1 and Workflow.attempts == 1 and builds == ["build"]
 
 
 @pytest.mark.parametrize("as_json", [True, False], ids=["headless-json", "explicit-select"])

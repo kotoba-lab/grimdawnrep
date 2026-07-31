@@ -369,17 +369,34 @@ def _fresh_catalog(config_path: Path, config: Any, *, supplied_token: str | None
     return vault, catalog, state, projection
 
 
-def _capture_execution_context(config_path: Path, expected_config: Any, expected_state: SyncState,
-                               vault: GitVault) -> dict[str, Any]:
-    """Re-read execution inputs without rebuilding commits or candidates."""
+def _locked_state(expected_config: Any, lock: Any) -> SyncState:
+    try:
+        return SyncState(
+            session_id=lock.session.session_id,
+            machine_id=expected_config.machine_id,
+            base_commit=lock.session.base_commit,
+            lock_oid=lock.oid,
+            local_tag=lock.local_tag,
+            phase="lock_held",
+        )
+    except (AttributeError, TypeError) as error:
+        raise SyncError("adapter_contract_invalid", "Acquired lock context is incomplete.", 4) from error
+
+
+def _capture_execution_context_once(config_path: Path, expected_config: Any, expected_state: SyncState,
+                                    vault: GitVault, *, acquired_lock: Any | None = None) -> dict[str, Any]:
+    """Read one lightweight execution snapshot without rebuilding catalog objects."""
     _process_preflight(expected_config)
     current_config = load_config(config_path)
     current_state = load_state(_state_path(config_path))
-    if current_config.public_dict() != expected_config.public_dict() or current_state.as_dict() != expected_state.as_dict():
+    required_state = expected_state if acquired_lock is None else _locked_state(expected_config, acquired_lock)
+    if current_config.public_dict() != expected_config.public_dict() or current_state.as_dict() != required_state.as_dict():
         raise SyncError("catalog_context_changed", "Selection context changed before lock acquisition.", 3)
-    if current_state.phase is not None:
+    if acquired_lock is None and current_state.phase is not None:
         raise SyncError("recovery_required", "Recovery state exists; run recover before selecting a save.", 6)
-    if _remote_lock_snapshot(vault) is not None:
+    observed_lock = _remote_lock_snapshot(vault)
+    expected_lock_oid = None if acquired_lock is None else str(acquired_lock.oid)
+    if observed_lock != expected_lock_oid:
         raise SyncError("lock_held", "Another save-sync session is active; no selection was made.", 3)
     remote_identity = read_remote_identity(vault, current_config.remote)
     remote_refs = _remote_ref_snapshot(vault)
@@ -388,10 +405,37 @@ def _capture_execution_context(config_path: Path, expected_config: Any, expected
         retries=current_config.stable_scan_retries, window_seconds=current_config.stable_window_seconds,
     )
     return _execution_context_projection(
-        current_config, current_state, remote_identity=remote_identity,
+        current_config, expected_state, remote_identity=remote_identity,
         live_root_hash=str(manifest.get("root_hash")), remote_head=vault.remote_oid(),
         remote_ref_snapshot=remote_refs,
     )
+
+
+def _capture_execution_context(config_path: Path, expected_config: Any, expected_state: SyncState,
+                               vault: GitVault, *, acquired_lock: Any | None = None) -> dict[str, Any]:
+    """Require two equal lightweight snapshots on each side of lock acquisition."""
+    first = _capture_execution_context_once(
+        config_path, expected_config, expected_state, vault, acquired_lock=acquired_lock,
+    )
+    second = _capture_execution_context_once(
+        config_path, expected_config, expected_state, vault, acquired_lock=acquired_lock,
+    )
+    if first != second:
+        raise SyncError("catalog_context_changed", "Selection context changed during final verification.", 3)
+    return second
+
+
+def _may_retry_interactive_stale(error: SyncError) -> bool:
+    """Retry only a proven pre-mutation stale selection."""
+    details = error.details if isinstance(error.details, dict) else {}
+    return (
+        error.code == "selection_stale"
+        and error.exit_code == 4
+        and details.get("mutated", False) is False
+        and not details.get("recovery_required")
+        and not details.get("next_command")
+    )
+
 
 def _assert_capability_boundary(config_path: Path, config: Any, state: SyncState, catalog: Any,
                                 projection: dict[str, Any]) -> None:
@@ -565,12 +609,21 @@ def _execute_selection_command(
             verify_capability(catalog.token, projection)
             if context_digest(fresh_context) != expected:
                 raise SyncError("catalog_context_changed", "Selection context changed before lock acquisition.", 3)
+        def revalidate_after_lock(expected: str, lock: Any) -> None:
+            fresh_context = _capture_execution_context(
+                config_path, config, state, vault, acquired_lock=lock,
+            )
+            verify_capability(catalog.token, projection)
+            if context_digest(fresh_context) != expected:
+                raise SyncError("catalog_context_changed", "Selection context changed across lock acquisition.", 3)
+        setattr(revalidate_context, "after_lock", revalidate_after_lock)
+        setattr(revalidate_context, "expected_pre_state", state)
         try:
             result = LaunchWorkflow(config, config_path.parent).execute_selection_plan(
                 plan, registry, context_revalidate=revalidate_context,
             )
         except SyncError as error:
-            if interactive and error.code == "selection_stale":
+            if interactive and _may_retry_interactive_stale(error):
                 # A stale interactive choice is not a recovery event: no lock
                 # or mutation has begun. Re-enter catalog construction so the
                 # presenter can show fresh candidates and let the user reload,

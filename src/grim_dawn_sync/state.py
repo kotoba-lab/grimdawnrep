@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -11,7 +12,7 @@ import re
 from typing import Any
 import uuid
 
-from grim_dawn_sync.errors import EXIT_RECOVERY_REQUIRED, SyncError
+from grim_dawn_sync.errors import EXIT_CONFLICT, EXIT_RECOVERY_REQUIRED, SyncError
 
 
 STATE_SCHEMA_VERSION = "1.0.0"
@@ -320,8 +321,60 @@ def load_state(path: Path) -> SyncState:
         ) from error
 
 
-def save_state(path: Path, state: SyncState) -> None:
-    """Write a complete state file using a same-directory atomic replacement."""
+@contextmanager
+def _state_write_lock(path: Path):
+    """Serialize every cooperating state writer with an OS-released lock."""
+    _check_existing_ancestors(path.parent)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _check_parent(path)
+    lock_path = path.with_name(f".{path.name}.lock")
+    _check_destination(lock_path, missing_ok=True)
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor: int | None = None
+    locked = False
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+        opened = os.fstat(descriptor)
+        if _is_reparse(opened) or not stat.S_ISREG(opened.st_mode):
+            raise _unsafe_state_path("Recovery state lock is not a safe regular file.")
+        if opened.st_size == 0:
+            os.write(descriptor, b"\0")
+            os.fsync(descriptor)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        try:
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            locked = True
+        except (OSError, BlockingIOError) as error:
+            raise SyncError("state_busy", "Recovery state is being updated by another process.", EXIT_CONFLICT) from error
+        yield
+    except SyncError:
+        raise
+    except OSError as error:
+        raise SyncError("state_write_failed", "Recovery state could not be locked.", EXIT_RECOVERY_REQUIRED) from error
+    finally:
+        if descriptor is not None:
+            if locked:
+                try:
+                    os.lseek(descriptor, 0, os.SEEK_SET)
+                    if os.name == "nt":
+                        import msvcrt
+                        msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(descriptor, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            os.close(descriptor)
+
+
+def _save_state_unlocked(path: Path, state: SyncState) -> None:
     parse_state(state.as_dict())
     temporary: Path | None = None
     try:
@@ -353,3 +406,21 @@ def save_state(path: Path, state: SyncState) -> None:
                 temporary.unlink(missing_ok=True)
             except OSError:
                 pass
+
+
+def save_state(path: Path, state: SyncState) -> None:
+    """Write a complete state file using a locked same-directory replacement."""
+    parse_state(state.as_dict())
+    with _state_write_lock(path):
+        _save_state_unlocked(path, state)
+
+
+def save_state_if_unchanged(path: Path, expected: SyncState, state: SyncState) -> None:
+    """Atomically compare the canonical pre-state and replace it under one lock."""
+    parse_state(expected.as_dict())
+    parse_state(state.as_dict())
+    with _state_write_lock(path):
+        current = load_state(path)
+        if current != expected:
+            raise SyncError("selection_stale", "Recovery state changed before lock acquisition.", EXIT_CONFLICT)
+        _save_state_unlocked(path, state)

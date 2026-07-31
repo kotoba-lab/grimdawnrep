@@ -768,6 +768,101 @@ def test_stale_base_and_state_write_failure_never_create_remote_lock(tmp_path: P
     assert caught.value.code == "state_write_failed" and inspect_remote_lock(vault) is None
 
 
+def test_acquire_gap_state_change_is_never_overwritten_or_published(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import grim_dawn_sync.session_lock as module
+
+    vault, _ = _vaults(tmp_path); base = vault.remote_oid(); assert base
+    state_path = tmp_path / "state.json"
+    expected = SyncState(
+        last_applied_remote_commit=base,
+        last_applied_manifest_root_hash="1" * 64,
+        machine_id="machine-a",
+    )
+    changed = replace(expected, last_applied_manifest_root_hash="2" * 64)
+    save_state(state_path, expected)
+    original = module.save_state_if_unchanged
+
+    def inject(path, required, intent):
+        assert required == expected
+        save_state(path, changed)
+        return original(path, required, intent)
+
+    monkeypatch.setattr(module, "save_state_if_unchanged", inject)
+    with pytest.raises(SyncError) as caught:
+        acquire_lock(
+            vault, "machine-a", base, state_path=state_path,
+            expected_pre_state=expected,
+        )
+    assert caught.value.code == "selection_stale" and caught.value.exit_code == 4
+    assert load_state(state_path) == changed
+    assert inspect_remote_lock(vault) is None
+    assert _git(vault.repo, "tag", "--list", "grim-dawn-sync-*") == ""
+
+
+def test_selection_acquire_remote_main_race_restores_exact_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vault, _ = _vaults(tmp_path); base = vault.remote_oid(); assert base
+    state_path = tmp_path / "state.json"
+    expected = SyncState(
+        last_applied_remote_commit=base,
+        last_applied_manifest_root_hash="1" * 64,
+        machine_id="machine-a",
+    )
+    save_state(state_path, expected)
+    values = iter((base, "0" * 40))
+    monkeypatch.setattr(vault, "remote_oid", lambda: next(values))
+    with pytest.raises(SyncError) as caught:
+        acquire_lock(
+            vault, "machine-a", base, state_path=state_path,
+            expected_pre_state=expected,
+        )
+    assert caught.value.code == "stale_lock_base" and caught.value.exit_code == 4
+    assert load_state(state_path) == expected
+    assert inspect_remote_lock(vault) is None
+    assert _git(vault.repo, "tag", "--list", "grim-dawn-sync-*") == ""
+
+
+def test_selection_acquire_cleanup_never_overwrites_later_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import grim_dawn_sync.session_lock as module
+
+    vault, _ = _vaults(tmp_path); base = vault.remote_oid(); assert base
+    state_path = tmp_path / "state.json"
+    expected = SyncState(
+        last_applied_remote_commit=base,
+        last_applied_manifest_root_hash="1" * 64,
+        machine_id="machine-a",
+    )
+    changed = replace(expected, last_applied_manifest_root_hash="2" * 64)
+    save_state(state_path, expected)
+    original = module.save_state_if_unchanged
+    calls = 0
+
+    def inject(path, required, replacement):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            save_state(path, changed)
+        return original(path, required, replacement)
+
+    monkeypatch.setattr(module, "save_state_if_unchanged", inject)
+    values = iter((base, "0" * 40))
+    monkeypatch.setattr(vault, "remote_oid", lambda: next(values))
+    with pytest.raises(SyncError) as caught:
+        acquire_lock(
+            vault, "machine-a", base, state_path=state_path,
+            expected_pre_state=expected,
+        )
+    assert caught.value.code == "lock_race_cleanup_incomplete" and caught.value.exit_code == 6
+    assert load_state(state_path) == changed
+    assert inspect_remote_lock(vault) is None
+    assert _git(vault.repo, "tag", "--list", "grim-dawn-sync-*").startswith("grim-dawn-sync-")
+
+
 def test_simultaneous_acquire_has_exactly_one_winner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     a, b = _vaults(tmp_path); base = a.remote_oid(); assert base
     import grim_dawn_sync.session_lock as module
