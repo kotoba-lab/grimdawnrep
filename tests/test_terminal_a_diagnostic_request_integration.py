@@ -14,7 +14,6 @@ import tempfile
 import pytest
 
 
-
 ROOT = Path(__file__).resolve().parents[1]
 RUNBOOK = ROOT / "docs" / "operations" / "terminal-a-roundtrip-diagnose.md"
 REQUEST = ROOT / "ops" / "handoff" / "terminal-a-diagnostic-request.v1.json"
@@ -26,7 +25,6 @@ pytestmark = pytest.mark.skipif(
     os.name != "nt" or not POWERSHELL.exists() or REAL_GIT is None,
     reason="the operator block is specifically for Windows PowerShell 5.1",
 )
-
 
 def _run(
     *args: str,
@@ -212,9 +210,18 @@ def _summary_script(base: Path) -> Path:
     return path
 
 
+def _post_failure_probe_script(base: Path) -> Path:
+    section = RUNBOOK.read_text(encoding="utf-8").split("## Post-selector-failure readonly probe", 1)[1]
+    command = section.split("```powershell", 1)[1].split("```", 1)[0]
+    path = base / "post-selector-failure-probe.ps1"
+    path.write_text(command, encoding="utf-8-sig", newline="\n")
+    return path
+
+
 def _invoke(script: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [str(POWERSHELL), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(script)],
+        cwd=env.get("GIT_SHIM_DIR"),
         env=env,
         check=False,
         capture_output=True,
@@ -666,7 +673,7 @@ def _summary_case(base: Path, *, remote_files: dict[str, bytes], corrupt: str | 
     for repo in (seed,):
         _git(repo, "config", "user.name", "Test"); _git(repo, "config", "user.email", "test@example.invalid")
     baseline_files = {"main/Hero/player.gdc": b"base", "main/Hero/quests.gdd": b"quest", "transfer.gst": b"outside"}
-    baseline, live_root = _write_snapshot(seed, baseline_files, "baseline")
+    baseline, _baseline_root = _write_snapshot(seed, baseline_files, "baseline")
     _git(seed, "remote", "add", "origin", str(remote)); _git(seed, "push", "-u", "origin", "main")
     _run(REAL_GIT, "clone", str(remote), str(vault)); _git(vault, "checkout", "main")
     remote_head, remote_root = _write_snapshot(seed, remote_files, "remote"); _git(seed, "push", "origin", "main")
@@ -678,7 +685,25 @@ def _summary_case(base: Path, *, remote_files: dict[str, bytes], corrupt: str | 
         _git(seed, "add", "save", ".sync"); _git(seed, "commit", "-m", "corrupt"); remote_head = _git(seed, "rev-parse", "HEAD"); _git(seed, "push", "origin", "main")
     _run(REAL_GIT, "init", "-b", "master", str(source)); _git(source, "config", "user.name", "Test"); _git(source, "config", "user.email", "test@example.invalid")
     (source / "README").write_text("source\n", encoding="ascii"); _git(source, "add", "README"); _git(source, "commit", "-m", "source")
-    live.mkdir();
+    # The mock doctor reports the baseline snapshot.  Materialize that exact
+    # snapshot at the live root too, so the post-failure probe's independent
+    # installed-package manifest check exercises its success path rather than
+    # relying on the mock doctor's assertion alone.
+    live.mkdir()
+    for name, value in baseline_files.items():
+        target = live / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(value)
+    # The probe independently recomputes the live root with the installed
+    # package.  Keep the mock doctor's value identical to that real result;
+    # the committed baseline manifest remains intentionally independent.
+    source_path = str(ROOT / "src")
+    sys.path.insert(0, source_path)
+    try:
+        from grim_dawn_sync.manifest import build_manifest
+        live_root = str(build_manifest(live, machine_id="desktop-a")["root_hash"])
+    finally:
+        sys.path.remove(source_path)
     # Doctor's root is intentionally supplied by the fixed local test package;
     # no fetched source is imported.
     tool_python = local / "GrimDawnSaveSyncTool" / ".venv" / "Scripts" / "python.exe"; tool_python.parent.mkdir(parents=True); shutil.copy2(sys.executable, tool_python)
@@ -687,19 +712,48 @@ def _summary_case(base: Path, *, remote_files: dict[str, bytes], corrupt: str | 
         candidate = interp / runtime
         if candidate.exists(): shutil.copy2(candidate, tool_python.parent / runtime)
     config = local / "GrimDawnSaveSync" / "config.local.json"; config.parent.mkdir(parents=True)
-    config.write_text(json.dumps({"machine_id":"desktop-a", "vault_repo":str(vault)}) + "\n", encoding="utf-8")
+    config.write_text(json.dumps({"machine_id":"desktop-a", "vault_repo":str(vault), "save_root":str(live)}) + "\n", encoding="utf-8")
     state = config.parent / "state.json"; state.write_text("{}\n", encoding="ascii")
     package = stub / "grim_dawn_sync"; package.mkdir(parents=True)
     (package / "__init__.py").write_text("from pkgutil import extend_path\n__path__=extend_path(__path__,__name__)\n", encoding="ascii")
     (package / "__main__.py").write_text(
-        "import json,sys\ncmd=sys.argv[-1]\n"
+        "import json,os,subprocess,sys\nfrom pathlib import Path\ncmd=sys.argv[-1]\n"
         f"root={live_root!r}\nhead={baseline!r}\n"
+        "hook=os.environ.get('GIT_PROBE_HOOK',''); counter=os.environ.get('GIT_PROBE_COUNTER','')\n"
+        "count=int(open(counter).read()) if counter and os.path.exists(counter) else 0\n"
+        "if cmd in ('status','doctor') and counter: open(counter,'w').write(str(count+1))\n"
+        "trigger=bool(hook) and count==2 and cmd=='status'\n"
         "if cmd=='status': print(json.dumps({'readiness':'blocked','vault_relation':'remote_changed_or_unknown','active_lock':None,'recovery_phase':None,'processes':{'status':'clear'},'last_pushed_commit':head}))\n"
         "elif cmd=='doctor': print(json.dumps({'machine_id':'desktop-a','checks':{'save_root':{'manifest':{'root_hash':root}}}}))\n"
-        "else: raise SystemExit(2)\n", encoding="ascii")
+        "else: raise SystemExit(2)\n"
+        "if trigger:\n"
+        " git=os.environ['REAL_GIT']\n"
+        " if hook=='config': open(os.environ['GIT_PROBE_CONFIG'],'a').write('x')\n"
+        " elif hook=='state': open(os.environ['GIT_PROBE_STATE'],'a').write('x')\n"
+        " elif hook=='live': open(os.path.join(os.environ['GIT_PROBE_LIVE'],'race.bin'),'wb').write(b'x')\n"
+        " elif hook=='source_ref': subprocess.run([git,'-C',os.environ['GIT_PROBE_SOURCE'],'update-ref','refs/heads/probe',os.environ['GIT_PROBE_SOURCE_HEAD']],check=True)\n"
+        " elif hook=='vault_ref': subprocess.run([git,'-C',os.environ['GIT_PROBE_VAULT'],'update-ref','refs/test/probe-race',os.environ['GIT_PROBE_VAULT_HEAD']],check=True); assert subprocess.check_output([git,'-C',os.environ['GIT_PROBE_VAULT'],'for-each-ref','--format=%(refname)','refs/test/probe-race'],text=True).strip() == 'refs/test/probe-race'\n"
+        " elif hook=='source_fetch_head': open(os.environ['GIT_PROBE_SOURCE_FETCH_HEAD'],'w').write('1'*40)\n"
+        " elif hook=='vault_fetch_head': open(os.environ['GIT_PROBE_VAULT_FETCH_HEAD'],'w').write('2'*40)\n"
+        " elif hook=='source_detached': subprocess.run([git,'-C',os.environ['GIT_PROBE_SOURCE'],'checkout','--detach',os.environ['GIT_PROBE_SOURCE_HEAD']],check=True,stdout=subprocess.DEVNULL)\n"
+        " elif hook=='vault_detached': subprocess.run([git,'-C',os.environ['GIT_PROBE_VAULT'],'checkout','--detach',os.environ['GIT_PROBE_VAULT_HEAD']],check=True,stdout=subprocess.DEVNULL)\n"
+        " elif hook=='remote_lock': subprocess.run([git,'-C',os.environ['GIT_PROBE_SEED'],'tag','grim-dawn-sync-active'],check=True); subprocess.run([git,'-C',os.environ['GIT_PROBE_SEED'],'push','origin','refs/tags/grim-dawn-sync-active'],check=True)\n"
+        " elif hook=='remote_main': subprocess.run([git,'-C',os.environ['GIT_PROBE_SEED'],'commit','--allow-empty','-m','race'],check=True); subprocess.run([git,'-C',os.environ['GIT_PROBE_SEED'],'push','origin','main'],check=True)\n", encoding="ascii")
     wrapper = base / "bin"; wrapper.mkdir()
     (wrapper / "git.cmd").write_text(
         "@echo off\r\n"
+        "if \"%~3\"==\"ls-remote\" if \"%GIT_PROBE_HOOK%\"==\"remote_empty\" exit /b 0\r\n"
+        "if \"%~3\"==\"ls-remote\" if \"%GIT_PROBE_HOOK%\"==\"remote_duplicate_main\" (echo %GIT_PROBE_BASELINE%\trefs/heads/main&echo %GIT_PROBE_BASELINE%\trefs/heads/main&exit /b 0)\r\n"
+        "if \"%~3\"==\"ls-remote\" if \"%GIT_PROBE_HOOK%\"==\"remote_lock\" (echo %GIT_PROBE_BASELINE%\trefs/heads/main&echo %GIT_PROBE_BASELINE%\trefs/tags/grim-dawn-sync-active&exit /b 0)\r\n"
+        "if \"%~3\"==\"ls-remote\" if \"%GIT_PROBE_HOOK%\"==\"remote_malformed\" (echo malformed&exit /b 0)\r\n"
+        "if not \"%~3\"==\"ls-remote\" goto show\r\n"
+        f'"{REAL_GIT}" %*\r\n'
+        "if \"%GIT_PROBE_HOOK%\"==\"source_ref\" call \"%GIT_PROBE_GIT%\" -C \"%GIT_PROBE_SOURCE%\" update-ref refs/heads/probe %GIT_PROBE_BASELINE%\r\n"
+        "if \"%GIT_PROBE_HOOK%\"==\"vault_ref\" call \"%GIT_PROBE_GIT%\" -C \"%GIT_PROBE_VAULT%\" update-ref refs/heads/probe %GIT_PROBE_BASELINE%\r\n"
+        "if \"%GIT_PROBE_HOOK%\"==\"source_fetch_head\" echo 1111111111111111111111111111111111111111>\"%GIT_PROBE_SOURCE_FETCH_HEAD%\"\r\n"
+        "if \"%GIT_PROBE_HOOK%\"==\"vault_fetch_head\" echo 2222222222222222222222222222222222222222>\"%GIT_PROBE_VAULT_FETCH_HEAD%\"\r\n"
+        "exit /b 0\r\n"
+        ":show\r\n"
         "if not \"%~3\"==\"show\" goto real\r\n"
         "if \"%GIT_SUMMARY_HOOK%\"==\"\" goto real\r\n"
         f'"{REAL_GIT}" %*\r\n'
@@ -710,7 +764,11 @@ def _summary_case(base: Path, *, remote_files: dict[str, bytes], corrupt: str | 
         "if \"%GIT_SUMMARY_HOOK%\"==\"remote_main\" call \"%GIT_SUMMARY_GIT%\" -C \"%GIT_SUMMARY_SEED%\" commit --allow-empty -m hook 1>nul 2>nul\r\n"
         "if \"%GIT_SUMMARY_HOOK%\"==\"remote_main\" call \"%GIT_SUMMARY_GIT%\" -C \"%GIT_SUMMARY_SEED%\" push origin main 1>nul 2>nul\r\n"
         "exit /b 0\r\n:real\r\n" + f'"{REAL_GIT}" %*\r\nexit /b %errorlevel%\r\n', encoding="ascii", newline="")
-    env=os.environ.copy(); env.update(USERPROFILE=str(profile), LOCALAPPDATA=str(local), PYTHONPATH=str(stub)+os.pathsep+str(ROOT / "src"), PYTHONHOME=str(interp), PATH=str(wrapper)+os.pathsep+env["PATH"], GIT_SUMMARY_HOOK="", GIT_SUMMARY_CONFIG=str(config), GIT_SUMMARY_STATE=str(state), GIT_SUMMARY_GIT=str(REAL_GIT), GIT_SUMMARY_SOURCE=str(source), GIT_SUMMARY_VAULT=str(vault), GIT_SUMMARY_SEED=str(seed))
+    # Use the real Git executable.  Race injection is performed by the fixed
+    # local mock CLI after its second status/doctor reply, so the production
+    # Git invocation path is never intercepted.
+    counter = base / "probe-count"
+    env=os.environ.copy(); env.update(USERPROFILE=str(profile), LOCALAPPDATA=str(local), PYTHONPATH=str(stub)+os.pathsep+str(ROOT / "src"), PYTHONHOME=str(interp), PATH=str(wrapper)+os.pathsep+env["PATH"], GIT_SHIM_DIR=str(wrapper), REAL_GIT=str(REAL_GIT), GIT_SUMMARY_HOOK="", GIT_SUMMARY_CONFIG=str(config), GIT_SUMMARY_STATE=str(state), GIT_SUMMARY_GIT=str(REAL_GIT), GIT_SUMMARY_SOURCE=str(source), GIT_SUMMARY_VAULT=str(vault), GIT_SUMMARY_SEED=str(seed), GIT_PROBE_HOOK="", GIT_PROBE_SOURCE=str(source), GIT_PROBE_VAULT=str(vault), GIT_PROBE_SOURCE_HEAD=_git(source, "rev-parse", "HEAD"), GIT_PROBE_VAULT_HEAD=_git(vault, "rev-parse", "HEAD"), GIT_PROBE_SEED=str(seed), GIT_PROBE_CONFIG=str(config), GIT_PROBE_STATE=str(state), GIT_PROBE_LIVE=str(live), GIT_PROBE_COUNTER=str(counter), GIT_PROBE_SOURCE_FETCH_HEAD=str(source / ".git" / "FETCH_HEAD"), GIT_PROBE_VAULT_FETCH_HEAD=str(vault / ".git" / "FETCH_HEAD"))
     for command in ("status", "doctor"):
         checked = subprocess.run([str(tool_python), "-m", "grim_dawn_sync", "--config", str(config), "--json", command], env=env, capture_output=True, text=True, encoding="utf-8")
         assert checked.returncode == 0, checked.stderr
@@ -718,7 +776,9 @@ def _summary_case(base: Path, *, remote_files: dict[str, bytes], corrupt: str | 
         if command == "status":
             assert payload == {"readiness":"blocked", "vault_relation":"remote_changed_or_unknown", "active_lock":None, "recovery_phase":None, "processes":{"status":"clear"}, "last_pushed_commit":baseline}
         else: assert payload["machine_id"] == "desktop-a" and payload["checks"]["save_root"]["manifest"]["root_hash"] == live_root
-    return env, {"vault":str(vault),"config":str(config),"state":str(state),"source":str(source),"remote":str(remote),"baseline":baseline,"remote_head":remote_head,"remote_root":remote_root}
+    counter.write_text("0", encoding="ascii")
+    env["GIT_PROBE_DOCTOR_ROOT"] = live_root
+    return env, {"vault":str(vault),"config":str(config),"state":str(state),"source":str(source),"remote":str(remote),"baseline":baseline,"remote_head":remote_head,"remote_root":remote_root,"live_root":live_root}
 
 
 def test_remote_diff_summary_runs_ps51_with_real_validated_snapshots_and_exact_categories() -> None:
@@ -749,9 +809,198 @@ def test_remote_diff_summary_fails_closed_when_observation_changes(hook: str) ->
         assert result.returncode == 1 and result.stderr == ""; assert json.loads(result.stdout)["code"] == "observation_changed"
 
 
+def test_post_selector_failure_probe_runs_ps51_against_local_bare_remote_and_mock_cli() -> None:
+    with tempfile.TemporaryDirectory(prefix="terminal-a-postfailure-") as raw:
+        base = Path(raw)
+        env, paths = _summary_case(base, remote_files={"main/Hero/player.gdc": b"next"})
+        tool = base / "localappdata" / "GrimDawnSaveSyncTool" / ".venv"
+        package = tool / "Lib" / "site-packages" / "grim_dawn_sync"
+        package.mkdir(parents=True)
+        shutil.copy2(base / "stub" / "grim_dawn_sync" / "__init__.py", package / "__init__.py")
+        shutil.copy2(base / "stub" / "grim_dawn_sync" / "__main__.py", package / "__main__.py")
+        env["PYTHONPATH"] = str(package.parent) + os.pathsep + str(ROOT / "src")
+        shortcut = base / "profile" / "Desktop" / "Grim Dawn (DPYes + Save Selection).lnk"
+        shortcut.parent.mkdir(parents=True, exist_ok=True); shortcut.write_bytes(b"fixture")
+        before = {name: Path(value).read_bytes() for name, value in paths.items() if name in {"config", "state"}}
+        result = _invoke(_post_failure_probe_script(base), env)
+        assert result.returncode == 0 and result.stderr == ""
+        row = json.loads(result.stdout)
+        assert row["sentinel"] == "TERMINAL_A_POST_SELECTOR_FAILURE_PROBE"
+        assert row["status"] == "complete" and row["code"] == "post_failure_probe_complete"
+        assert row["safe_to_retry"] is True and row["live_unchanged"] is True
+        assert row["selector_window_count_bucket"] == "zero"
+        assert {name: Path(paths[name]).read_bytes() for name in before} == before
+        for secret in (str(base), paths["remote"], paths["baseline"], "stderr"):
+            assert secret not in result.stdout
+
+
+@pytest.mark.parametrize("hook", ["source_ref", "vault_ref", "source_fetch_head", "vault_fetch_head", "source_detached", "vault_detached"])
+def test_post_selector_failure_probe_rejects_source_or_vault_observation_drift(hook: str) -> None:
+    with tempfile.TemporaryDirectory(prefix="terminal-a-postfailure-drift-") as raw:
+        base = Path(raw)
+        env, paths = _summary_case(base, remote_files={"main/Hero/player.gdc": b"next"})
+        tool = base / "localappdata" / "GrimDawnSaveSyncTool" / ".venv"
+        package = tool / "Lib" / "site-packages" / "grim_dawn_sync"
+        package.mkdir(parents=True)
+        shutil.copy2(base / "stub" / "grim_dawn_sync" / "__init__.py", package / "__init__.py")
+        shutil.copy2(base / "stub" / "grim_dawn_sync" / "__main__.py", package / "__main__.py")
+        env["PYTHONPATH"] = str(package.parent) + os.pathsep + str(ROOT / "src")
+        shortcut = base / "profile" / "Desktop" / "Grim Dawn (DPYes + Save Selection).lnk"
+        shortcut.parent.mkdir(parents=True, exist_ok=True)
+        shortcut.write_bytes(b"fixture")
+        env["GIT_PROBE_HOOK"] = hook
+        env["PATH"] = os.environ["PATH"]
+        assert json.loads(Path(paths["config"]).read_text(encoding="utf-8"))["vault_repo"] == env["GIT_PROBE_VAULT"]
+        result = _invoke(_post_failure_probe_script(base), env)
+
+        row = json.loads(result.stdout)
+        assert Path(env["GIT_PROBE_COUNTER"]).read_text() == "5"
+        if hook == "vault_ref":
+            assert "refs/test/probe-race" in _git(Path(paths["vault"]), "for-each-ref", "--format=%(refname)", "refs")
+        assert result.returncode == 1 and result.stderr == ""
+        assert row["code"] == "observation_changed"
+        assert row["safe_to_retry"] is False
+        assert row["live_unchanged"] is False
+        for secret in (str(base), paths["remote"], paths["baseline"], "FETCH_HEAD"):
+            assert secret not in result.stdout
+
+
+@pytest.mark.parametrize("hook", ["config", "state", "live", "remote_lock"])
+def test_post_selector_failure_probe_rejects_real_local_or_remote_mutation(hook: str) -> None:
+    """The fixed local CLI mutates only after its second stable reply."""
+    with tempfile.TemporaryDirectory(prefix="terminal-a-postfailure-real-race-") as raw:
+        base = Path(raw)
+        env, _paths = _summary_case(base, remote_files={"main/Hero/player.gdc": b"next"})
+        tool = base / "localappdata" / "GrimDawnSaveSyncTool" / ".venv"
+        package = tool / "Lib" / "site-packages" / "grim_dawn_sync"
+        package.mkdir(parents=True)
+        shutil.copy2(base / "stub" / "grim_dawn_sync" / "__init__.py", package / "__init__.py")
+        shutil.copy2(base / "stub" / "grim_dawn_sync" / "__main__.py", package / "__main__.py")
+        if hook == "live":
+            package.joinpath("manifest.py").write_text(
+                "import os\nfrom pathlib import Path\n"
+                "def build_manifest(*args, **kwargs):\n"
+                " if os.environ.get('GIT_PROBE_HOOK') == 'live' and Path(os.environ['GIT_PROBE_COUNTER']).read_text() == '4':\n"
+                "  Path(os.environ['GIT_PROBE_LIVE'], 'race.bin').write_bytes(b'x')\n"
+                " return {'root_hash': os.environ['GIT_PROBE_DOCTOR_ROOT']}\n",
+                encoding="ascii",
+            )
+        env["PYTHONPATH"] = str(package.parent) + os.pathsep + str(ROOT / "src")
+        shortcut = base / "profile" / "Desktop" / "Grim Dawn (DPYes + Save Selection).lnk"
+        shortcut.parent.mkdir(parents=True, exist_ok=True); shortcut.write_bytes(b"fixture")
+        env["GIT_PROBE_HOOK"] = hook
+        env["PATH"] = os.environ["PATH"]
+        result = _invoke(_post_failure_probe_script(base), env)
+        row = json.loads(result.stdout)
+        assert result.returncode == 1 and result.stderr == ""
+        assert row["code"] == "observation_changed"
+        assert row["safe_to_retry"] is False and row["live_unchanged"] is False
+
+
+@pytest.mark.parametrize("hook", ["remote_lock"])
+def test_post_selector_failure_probe_rejects_invalid_remote_advertisement(hook: str) -> None:
+    with tempfile.TemporaryDirectory(prefix="terminal-a-postfailure-remote-") as raw:
+        base = Path(raw)
+        env, _paths = _summary_case(base, remote_files={"main/Hero/player.gdc": b"next"})
+        tool = base / "localappdata" / "GrimDawnSaveSyncTool" / ".venv"
+        package = tool / "Lib" / "site-packages" / "grim_dawn_sync"
+        package.mkdir(parents=True)
+        shutil.copy2(base / "stub" / "grim_dawn_sync" / "__init__.py", package / "__init__.py")
+        shutil.copy2(base / "stub" / "grim_dawn_sync" / "__main__.py", package / "__main__.py")
+        env["PYTHONPATH"] = str(package.parent) + os.pathsep + str(ROOT / "src")
+        shortcut = base / "profile" / "Desktop" / "Grim Dawn (DPYes + Save Selection).lnk"
+        shortcut.parent.mkdir(parents=True, exist_ok=True)
+        shortcut.write_bytes(b"fixture")
+        env["GIT_PROBE_HOOK"] = hook
+
+        result = _invoke(_post_failure_probe_script(base), env)
+
+        row = json.loads(result.stdout)
+        assert result.returncode == 1 and result.stderr == ""
+        assert row["code"] in {"precondition_failed", "observation_changed"}
+        assert row["safe_to_retry"] is False
+
+
+@pytest.mark.parametrize("fault", ["doctor_root", "installed_manifest_root"])
+def test_post_selector_failure_probe_requires_doctor_and_installed_manifest_root_to_match(fault: str) -> None:
+    with tempfile.TemporaryDirectory(prefix="terminal-a-postfailure-root-") as raw:
+        base = Path(raw)
+        env, paths = _summary_case(base, remote_files={"main/Hero/player.gdc": b"next"})
+        tool = base / "localappdata" / "GrimDawnSaveSyncTool" / ".venv"
+        package = tool / "Lib" / "site-packages" / "grim_dawn_sync"
+        package.mkdir(parents=True)
+        shutil.copy2(base / "stub" / "grim_dawn_sync" / "__init__.py", package / "__init__.py")
+        main = base / "stub" / "grim_dawn_sync" / "__main__.py"
+        if fault == "doctor_root":
+            main.write_text(main.read_text(encoding="ascii").replace(f"root={paths['live_root']!r}", "root='0' * 64"), encoding="ascii")
+            shutil.copy2(main, package / "__main__.py")
+        else:
+            shutil.copy2(main, package / "__main__.py")
+            (package / "manifest.py").write_text(
+                "def build_manifest(*args, **kwargs): return {'root_hash': 'f' * 64}\n", encoding="ascii"
+            )
+        env["PYTHONPATH"] = str(package.parent) + os.pathsep + str(ROOT / "src")
+        shortcut = base / "profile" / "Desktop" / "Grim Dawn (DPYes + Save Selection).lnk"
+        shortcut.parent.mkdir(parents=True, exist_ok=True)
+        shortcut.write_bytes(b"fixture")
+
+        result = _invoke(_post_failure_probe_script(base), env)
+
+        row = json.loads(result.stdout)
+        assert result.returncode == 1 and result.stderr == ""
+        assert row["code"] == "precondition_failed"
+        assert row["safe_to_retry"] is False
+
+
 def test_remote_diff_summary_block_parses_in_windows_powershell_51() -> None:
     with tempfile.TemporaryDirectory(prefix="terminal-a-summary-parse-") as raw:
         script = _summary_script(Path(raw)); parser = Path(raw) / "parse.ps1"
+        parser.write_text("$tokens=$null;$errors=$null;[void][System.Management.Automation.Language.Parser]::ParseFile($args[0],[ref]$tokens,[ref]$errors);if($errors.Count){exit 1}", encoding="utf-8-sig")
+        result = subprocess.run([str(POWERSHELL), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(parser), str(script)], capture_output=True, text=True, encoding="utf-8")
+        assert result.returncode == 0, result.stderr
+
+
+def test_post_failure_probe_remote_advertisement_detects_real_main_race() -> None:
+    with tempfile.TemporaryDirectory(prefix="terminal-a-postfailure-main-race-") as raw:
+        base = Path(raw)
+        env, paths = _summary_case(base, remote_files={"main/Hero/player.gdc": b"next"})
+        block = RUNBOOK.read_text(encoding="utf-8").split("## Post-selector-failure readonly probe", 1)[1].split("```powershell", 1)[1].split("```", 1)[0]
+        helpers = block[block.index("function Q"):block.index("function Json")]
+        script = base / "remote-main-race.ps1"
+        script.write_text(
+            "$vault=$env:GIT_PROBE_VAULT\n" + helpers + "\n"
+            "$r1=RemoteAdvertisement $vault\n"
+            "& $env:REAL_GIT -C $env:GIT_PROBE_SEED commit --allow-empty -m race 1>$null 2>$null\n"
+            "if($LASTEXITCODE -ne 0){exit 2}\n"
+            "& $env:REAL_GIT -C $env:GIT_PROBE_SEED push origin main 1>$null 2>$null\n"
+            "if($LASTEXITCODE -ne 0){exit 3}\n"
+            "$r2=RemoteAdvertisement $vault\n"
+            "[ordered]@{different=($r1 -cne $r2);one=$true;code=$(if($r1 -cne $r2){'observation_changed'}else{'unexpected_failed'})}|ConvertTo-Json -Compress\n",
+            encoding="utf-8-sig",
+        )
+        result = _invoke(script, env)
+        assert result.returncode == 0 and result.stderr == "", (result.returncode, result.stdout, result.stderr)
+        row = json.loads(result.stdout)
+        assert row == {"different": True, "one": True, "code": "observation_changed"}
+        assert paths["remote"] not in result.stdout
+
+
+def test_selector_dry_run_blocked_output_is_unknown_in_windows_powershell_51() -> None:
+    with tempfile.TemporaryDirectory(prefix="terminal-a-dryrun-out-") as raw:
+        block = RUNBOOK.read_text(encoding="utf-8").split("## Selector cancel/reload dry-run block", 1)[1].split("```powershell", 1)[1].split("```", 1)[0]
+        function = block.split("function Json", 1)[0]
+        script = Path(raw) / "out.ps1"
+        script.write_text("$machineId='desktop-a'\n" + function + "\nOut-DryRun 'blocked' 'selector_failed' $true $true $true 'fake' 'one' $false $false\n", encoding="utf-8-sig")
+        result = subprocess.run([str(POWERSHELL), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(script)], capture_output=True, text=True, encoding="utf-8")
+        row = json.loads(result.stdout)
+        assert result.returncode == 0 and result.stderr == ""
+        assert row == {"sentinel":"TERMINAL_A_SELECTOR_DRY_RUN","status":"blocked","leg":"A1","machine_id":"desktop-a","observations_valid":False,"first_cancelled":None,"reload_completed":None,"second_cancelled":None,"selector_visible_count":None,"default_role":"unknown","candidate_count_bucket":"unknown","game_started":None,"mutations_detected":None,"code":"selector_failed"}
+        assert result.stdout.count("\n") == 1
+
+
+def test_sequence_9_request_block_parses_in_windows_powershell_51() -> None:
+    with tempfile.TemporaryDirectory(prefix="terminal-a-seq9-parse-") as raw:
+        script = _post_failure_probe_script(Path(raw)); parser = Path(raw) / "parse.ps1"
         parser.write_text("$tokens=$null;$errors=$null;[void][System.Management.Automation.Language.Parser]::ParseFile($args[0],[ref]$tokens,[ref]$errors);if($errors.Count){exit 1}", encoding="utf-8-sig")
         result = subprocess.run([str(POWERSHELL), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(parser), str(script)], capture_output=True, text=True, encoding="utf-8")
         assert result.returncode == 0, result.stderr

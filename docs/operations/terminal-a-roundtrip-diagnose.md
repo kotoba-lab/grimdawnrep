@@ -169,19 +169,19 @@ try {
     if (-not ($request.schema_version -is [string]) -or $request.schema_version -cne '1.0.0' -or
         -not ($request.kind -is [string]) -or
         $request.kind -cne 'grim_dawn_terminal_diagnostic_request' -or
-        -not ($request.sequence -is [int]) -or $request.sequence -ne 8 -or
+        -not ($request.sequence -is [int]) -or $request.sequence -ne 9 -or
         -not ($request.target_machine_id -is [string]) -or $request.target_machine_id -cne $machineId -or
         -not ($request.leg -is [string]) -or -not ($request.observed_code -is [string]) -or
         -not ($request.action -is [string]) -or -not ($request.response_sentinel -is [string]) -or
         -not ($request.request_id -is [string]) -or
         $request.leg -cne 'A1' -or $request.observed_code -cne 'remote_changed_or_unknown' -or
-        $request.action -cne 'selector_cancel_reload_dry_run' -or
-        $request.response_sentinel -cne 'TERMINAL_A_SELECTOR_DRY_RUN') { throw 'invalid' }
-    Assert-ExactArray $request.checks @('status_baseline','doctor','current_deployment_contract',
-        'remote_ahead_live_equals_baseline','stable_remote_difference','selector_cancel_reload_invariants')
-    Assert-ExactArray $request.constraints @('shortcut_ui_cancel_reload_only','no_game_or_dpyes_start','no_lock','no_recover',
-        'no_restore_snapshot_bookmark_promote','no_commit_push_merge_rebase_reset_checkout',
-        'no_state_config_save_remote_ref_write','allow_only_designated_catalog_tracking_ref_transition',
+        $request.action -cne 'post_selector_failure_readonly_probe' -or
+        $request.response_sentinel -cne 'TERMINAL_A_POST_SELECTOR_FAILURE_PROBE') { throw 'invalid' }
+    Assert-ExactArray $request.checks @('double_status_doctor','deployment_fingerprints','vault_source_live_state_invariants',
+        'stable_remote_main_and_lock','residual_selector_and_process_observation')
+    Assert-ExactArray $request.constraints @('installed_local_fixed_block_only','no_shortcut_ui_input_close_kill_or_game_start',
+        'no_fetch_or_vault_ref_write','no_lock_recover_restore_snapshot_bookmark_promote','no_commit_push_merge_rebase_reset_checkout',
+        'no_state_config_save_remote_ref_write',
         'no_fetched_code_execution')
     $requestGuid = [Guid]::Empty
     if (-not [Guid]::TryParse([string]$request.request_id, [ref]$requestGuid) -or
@@ -239,8 +239,8 @@ public static class SelectorWindow {
 }
 '@
 function Out-DryRun($Status,$Code,$First,$Reload,$Second,$Default,$Count,$Game,$Mutated){
-  if($Status -ne 'complete'){$Status='blocked';if($Code -notin @('precondition_failed','selector_failed','game_started_unexpectedly','observation_changed','unexpected_failed')){$Code='unexpected_failed'};$First=$false;$Reload=$false;$Second=$false;$Default='unknown';$Count='one';$Game=$false;$Mutated=$false}
-  [ordered]@{sentinel='TERMINAL_A_SELECTOR_DRY_RUN';status=$Status;leg='A1';machine_id=$machineId;first_cancelled=[bool]$First;reload_completed=[bool]$Reload;second_cancelled=[bool]$Second;selector_visible_count=2;default_role=$Default;candidate_count_bucket=$Count;game_started=[bool]$Game;mutations_detected=[bool]$Mutated;code=$Code}|ConvertTo-Json -Compress
+  $valid=$Status -eq 'complete';if(!$valid){$Status='blocked';if($Code -notin @('precondition_failed','selector_failed','game_started_unexpectedly','observation_changed','unexpected_failed')){$Code='unexpected_failed'};$First=$null;$Reload=$null;$Second=$null;$Default='unknown';$Count='unknown';$Game=$null;$Mutated=$null}
+  [ordered]@{sentinel='TERMINAL_A_SELECTOR_DRY_RUN';status=$Status;leg='A1';machine_id=$machineId;observations_valid=$valid;first_cancelled=$First;reload_completed=$Reload;second_cancelled=$Second;selector_visible_count=$(if($valid){2}else{$null});default_role=$Default;candidate_count_bucket=$Count;game_started=$Game;mutations_detected=$Mutated;code=$Code}|ConvertTo-Json -Compress
 }
 function Json([string[]]$Args){$x=@(& $python -m grim_dawn_sync --config $config --json @Args 2>$null);if($LASTEXITCODE -ne 0){throw 'precondition_failed'};try{return (($x -join [Environment]::NewLine)|ConvertFrom-Json -ErrorAction Stop)}catch{throw 'precondition_failed'}}
 function Git([string]$Repo,[string[]]$Args){$x=@(& git -C $Repo @Args 2>$null);if($LASTEXITCODE -ne 0){throw 'observation_changed'};return @($x)}
@@ -633,3 +633,81 @@ exit $(if ($statusOut -eq 'diagnosed') { 0 } else { 1 })
 
 Report exactly the one JSON line printed by the block.  Do not add raw output
 or a proposed recovery command.
+
+## Post-selector-failure readonly probe
+
+Run this **installed local block only** after the sequence 9 request block
+exits zero.  It neither opens the shortcut nor sends input.  It never fetches,
+closes or kills a process, and it does not write any source, Vault, state,
+configuration, save, or remote ref.  A residual selector is reported and left
+untouched.  The sole output is aggregate buckets and booleans.
+
+```powershell
+$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue'
+$toolRoot=Join-Path $env:LOCALAPPDATA 'GrimDawnSaveSyncTool';$python=Join-Path $toolRoot '.venv\Scripts\python.exe'
+$config=Join-Path $env:LOCALAPPDATA 'GrimDawnSaveSync\config.local.json';$source=Join-Path $env:USERPROFILE 'grimdawnrep';$machineId='desktop-a';$selectorTitle='Grim Dawn Save Selection'
+Add-Type @'
+using System;using System.Text;using System.Collections.Generic;using System.Runtime.InteropServices;
+public static class ProbeWindow { delegate bool WndProc(IntPtr h,IntPtr l); [DllImport("user32.dll")] static extern bool EnumWindows(WndProc f,IntPtr l); [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h); [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern int GetWindowText(IntPtr h,StringBuilder b,int n); [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h,out uint p); public static uint[] Matching(string title){var rows=new List<uint>();EnumWindows(delegate(IntPtr h,IntPtr l){if(IsWindowVisible(h)){var b=new StringBuilder(512);GetWindowText(h,b,b.Capacity);if(String.Equals(b.ToString(),title,StringComparison.Ordinal)){uint p;GetWindowThreadProcessId(h,out p);rows.Add(p);}}return true;},IntPtr.Zero);return rows.ToArray();} }
+'@
+function Bucket($n){if($null -eq $n){return 'unknown'};if($n -eq 0){return 'zero'};if($n -eq 1){return 'one'};return 'two_or_more'}
+function FileDigest([string]$p){if(!(Test-Path -LiteralPath $p -PathType Leaf)){throw 'precondition_failed'};$h=[Security.Cryptography.SHA256]::Create();try{return ([BitConverter]::ToString($h.ComputeHash([IO.File]::ReadAllBytes($p)))).Replace('-','')}finally{$h.Dispose()}}
+function TreeDigest([string]$root){
+  if(!(Test-Path -LiteralPath $root -PathType Container)){throw 'precondition_failed'}
+  $base=[IO.Path]::GetFullPath($root).TrimEnd([char[]]'\')+'\'
+  $rows=@()
+  foreach($item in @(Get-ChildItem -LiteralPath $root -Recurse -File -Force -ErrorAction Stop|Sort-Object FullName)){
+    $full=[IO.Path]::GetFullPath($item.FullName)
+    if(!$full.StartsWith($base,[StringComparison]::OrdinalIgnoreCase)){throw 'precondition_failed'}
+    $rows += $full.Substring($base.Length)+'='+$item.Length+'='+(FileDigest $full)
+  }
+  $h=[Security.Cryptography.SHA256]::Create()
+  try{$bytes=[Text.Encoding]::UTF8.GetBytes(($rows -join "`n"));$digest=$h.ComputeHash($bytes);return [BitConverter]::ToString($digest).Replace('-','')}
+  finally{$h.Dispose()}
+}
+function Q($s){return '"'+([string]$s).Replace('"','\"')+'"'}
+function StopTree($pid){$psi=New-Object Diagnostics.ProcessStartInfo;$psi.FileName=(Join-Path $env:SystemRoot 'System32\taskkill.exe');$psi.Arguments='/PID '+[int]$pid+' /T /F';$psi.UseShellExecute=$false;$psi.CreateNoWindow=$true;$psi.RedirectStandardOutput=$true;$psi.RedirectStandardError=$true;$p=New-Object Diagnostics.Process;$p.StartInfo=$psi;if($p.Start()){[void]$p.WaitForExit(5000);if(!$p.HasExited){$p.Kill()}}}
+function Native($file,[string[]]$argv,$failure,$timeoutMs){$out=[IO.Path]::GetTempFileName();$err=[IO.Path]::GetTempFileName();try{$psi=New-Object Diagnostics.ProcessStartInfo;$psi.FileName=$file;$psi.Arguments=(($argv|ForEach-Object{Q $_}) -join ' ');$psi.UseShellExecute=$false;$psi.CreateNoWindow=$true;$psi.RedirectStandardOutput=$true;$psi.RedirectStandardError=$true;$psi.EnvironmentVariables['GIT_TERMINAL_PROMPT']='0';$psi.EnvironmentVariables['GCM_INTERACTIVE']='Never';$p=New-Object Diagnostics.Process;$p.StartInfo=$psi;if(!$p.Start()){throw $failure};$ot=$p.StandardOutput.ReadToEndAsync();$et=$p.StandardError.ReadToEndAsync();if(!$p.WaitForExit($timeoutMs)){StopTree $p.Id;throw $failure};$o=$ot.GetAwaiter().GetResult();$e=$et.GetAwaiter().GetResult();[IO.File]::WriteAllText($out,$o);[IO.File]::WriteAllText($err,$e);if($p.ExitCode -ne 0){throw $failure};return @($o -split "`r?`n"|Where-Object{$_ -ne ''})}finally{Remove-Item -LiteralPath $out,$err -Force -ErrorAction SilentlyContinue}}
+function Git($r,[string[]]$a){$timeout=15000;if($a -contains 'ls-remote'){$timeout=60000};return @(Native 'git' (@('-C',$r)+$a) 'observation_changed' $timeout)}
+function One($r,[string[]]$a){$v=@(Git $r $a);if($v.Count -ne 1){throw 'observation_changed'};return ([string]$v[0]).Trim()}
+function RepoFingerprint($r){
+  $head=One $r @('rev-parse','HEAD')
+  $headName=One $r @('rev-parse','--symbolic-full-name','HEAD')
+  if($headName -eq 'HEAD'){$headState='DETACHED'}elseif($headName -match '^refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]*$'){$headState='BRANCH='+$headName}else{throw 'observation_changed'}
+  $status=(Git $r @('status','--porcelain=v1','--untracked-files=all')-join "`n")
+   $refs=(Git $r @('for-each-ref','--sort=refname','--format=%(refname) %(objectname)')-join "`n")
+  $fetch=Join-Path (Join-Path $r '.git') 'FETCH_HEAD'
+  $fetchState=if(Test-Path -LiteralPath $fetch -PathType Leaf){'present='+((Get-Content -LiteralPath $fetch -Raw -Encoding utf8))}else{'absent'}
+   [string[]]$parts=@($head,$headState,$status,$refs,$fetchState);return [string]::Join([char]0,$parts)
+}
+function RemoteAdvertisement($r){
+  $rows=@(Git $r @('ls-remote','--refs','origin','refs/heads/main','refs/tags/grim-dawn-sync-active'))
+  $main=@($rows|Where-Object{$_ -match '^[0-9a-f]{40}\trefs/heads/main$'})
+  $lock=@($rows|Where-Object{$_ -match '^[0-9a-f]{40}\trefs/tags/grim-dawn-sync-active$'})
+  if($main.Count -ne 1 -or $lock.Count -ne 0 -or $rows.Count -ne 1){throw 'observation_changed'}
+  return ($rows -join "`n")
+}
+function Json($command){$v=@(Native $python @('-m','grim_dawn_sync','--config',$config,'--json',$command) 'precondition_failed' 60000);return (($v -join "`n")|ConvertFrom-Json -ErrorAction Stop)}
+function InstalledManifestRoot($root){
+  # This invokes the fixed installed package, never public source code.
+  $probe='from pathlib import Path; import re,sys; from grim_dawn_sync.manifest import build_manifest; v=build_manifest(Path(sys.argv[1]),machine_id=sys.argv[2]).get("root_hash"); sys.exit(2) if not isinstance(v,str) or re.fullmatch(r"[0-9a-f]{64}",v) is None else print(v)'
+  $v=@(Native $python @('-c',$probe,$root,$machineId) 'precondition_failed' 60000)
+  if($v.Count -ne 1 -or $v[0] -notmatch '^[0-9a-f]{64}$'){throw 'precondition_failed'}
+  return [string]$v[0]
+}
+function ToolIdentity($p){if(!(Test-Path -LiteralPath $p -PathType Leaf)){throw 'precondition_failed'};$pkg=Join-Path ([IO.Path]::GetDirectoryName([IO.Path]::GetDirectoryName($p))) 'Lib\site-packages\grim_dawn_sync';if(!(Test-Path -LiteralPath $pkg -PathType Container)){throw 'precondition_failed'};$py=@(Get-ChildItem -LiteralPath $pkg -Recurse -File -Filter *.py|Sort-Object FullName);if($py.Count -eq 0){throw 'precondition_failed'};$rows=@($py|ForEach-Object{$rel=$_.FullName.Substring($pkg.Length);$rel+'='+(FileDigest -p $_.FullName)});$meta=Get-Item -LiteralPath $p;return @([IO.Path]::GetFullPath($p),$meta.Length,$meta.LastWriteTimeUtc.Ticks,($rows -join "`n")) -join "`0"}
+function Windows(){try{return @([ProbeWindow]::Matching($selectorTitle)|ForEach-Object{[pscustomobject]@{pid=$_}})}catch{throw 'process_observation_inconclusive'}}
+function Processes(){try{return @(Get-CimInstance Win32_Process -ErrorAction Stop)}catch{throw 'process_observation_inconclusive'}}
+function Out($status,$code,$safe,$selector,$owned,$py,$ps,$unchanged){[ordered]@{sentinel='TERMINAL_A_POST_SELECTOR_FAILURE_PROBE';status=$status;leg='A1';machine_id=$machineId;status_expected=($code -ne 'precondition_failed');lock_clear=($code -ne 'precondition_failed');recovery_clear=($code -ne 'precondition_failed');game_processes_clear=($code -ne 'process_observation_inconclusive');remote_lock_clear=($code -ne 'observation_changed');remote_stable=($code -ne 'observation_changed');live_unchanged=$unchanged;state_unchanged=$unchanged;vault_unchanged=$unchanged;source_unchanged=$unchanged;selector_window_count_bucket=(Bucket $selector);selector_owned_python_count_bucket=(Bucket $owned);all_python_count_bucket=(Bucket $py);non_operator_powershell_count_bucket=(Bucket $ps);safe_to_retry=$safe;code=$code}|ConvertTo-Json -Compress}
+try {
+ $stage='paths';if(!(Test-Path $python -PathType Leaf) -or !(Test-Path $config -PathType Leaf)){throw 'precondition_failed'};$cfg=Get-Content $config -Raw -Encoding utf8|ConvertFrom-Json -ErrorAction Stop;if($cfg.machine_id -cne $machineId -or !($cfg.vault_repo -is [string]) -or !($cfg.save_root -is [string])){throw 'precondition_failed'};$vault=[string]$cfg.vault_repo;$live=[string]$cfg.save_root;$state=Join-Path ([IO.Path]::GetDirectoryName($config)) 'state.json';$shortcut=Join-Path (Join-Path $env:USERPROFILE 'Desktop') 'Grim Dawn (DPYes + Save Selection).lnk'
+ $stage='before';
+ [string]$beforeSource=RepoFingerprint $source;[string]$beforeVault=RepoFingerprint $vault;$before=@((ToolIdentity $python),(FileDigest $config),(FileDigest $state),(FileDigest $shortcut),(TreeDigest $live),$beforeSource,$beforeVault)
+ $stage='cli';$s1=Json 'status';$d1=Json 'doctor';$installedRoot1=InstalledManifestRoot $live;$s2=Json 'status';$d2=Json 'doctor';$installedRoot2=InstalledManifestRoot $live;$liveRoot=[string]$d1.checks.save_root.manifest.root_hash;if($liveRoot -notmatch '^[0-9a-f]{64}$' -or $liveRoot -cne $installedRoot1 -or $liveRoot -cne [string]$d2.checks.save_root.manifest.root_hash -or $liveRoot -cne $installedRoot2 -or ($s1|ConvertTo-Json -Depth 16 -Compress) -cne ($s2|ConvertTo-Json -Depth 16 -Compress) -or ($d1|ConvertTo-Json -Depth 16 -Compress) -cne ($d2|ConvertTo-Json -Depth 16 -Compress) -or $s1.readiness -ne 'blocked' -or $s1.vault_relation -ne 'remote_changed_or_unknown' -or $s1.active_lock -ne $null -or $s1.recovery_phase -ne $null -or $s1.processes.status -ne 'clear' -or $d1.machine_id -cne $machineId -or $d2.machine_id -cne $machineId){throw 'precondition_failed'}
+ $r1=RemoteAdvertisement $vault;$r2=RemoteAdvertisement $vault;if($r1 -cne $r2){throw 'observation_changed'}
+ $stage='processes';$proc=Processes;$game=@($proc|Where-Object{$_.Name -in @('Grim Dawn.exe','DPYes.exe')});$wins=@(Windows);$pys=@($proc|Where-Object{$_.Name -in @('python.exe','pythonw.exe')});$owned=@($wins|Where-Object{$pys.ProcessId -contains $_.pid});$otherPs=@($proc|Where-Object{$_.Name -in @('powershell.exe','pwsh.exe') -and $_.CommandLine -notmatch 'terminal-a-roundtrip-diagnose'})
+ $stage='after';
+ [string]$afterSource=RepoFingerprint $source;[string]$afterVault=RepoFingerprint $vault;$after=@((ToolIdentity $python),(FileDigest $config),(FileDigest $state),(FileDigest $shortcut),(TreeDigest $live),$afterSource,$afterVault);$afterDoctor=Json 'doctor';$installedRoot3=InstalledManifestRoot $live;$beforeMark=[string]::Join([char]0,@($before|ForEach-Object{[string]$_}));$afterMark=[string]::Join([char]0,@($after|ForEach-Object{[string]$_}));if(($beforeVault -cne $afterVault) -or ($beforeSource -cne $afterSource) -or ([string]$afterDoctor.checks.save_root.manifest.root_hash -cne $liveRoot) -or ($installedRoot3 -cne $liveRoot) -or ((TreeDigest $live) -cne $before[4]) -or ($beforeMark -cne $afterMark)){throw 'observation_changed'}
+ if($game.Count -ne 0){throw 'precondition_failed'};if($wins.Count -ne 0){Write-Output (Out 'blocked' 'selector_residual_detected' $false $wins.Count $owned.Count $pys.Count $otherPs.Count $true);exit 1};Write-Output (Out 'complete' 'post_failure_probe_complete' $true 0 0 $pys.Count $otherPs.Count $true);exit 0
+} catch { $code=$_.Exception.Message;if($code -notin @('precondition_failed','observation_changed','process_observation_inconclusive')){$code='unexpected_failed'};Write-Output (Out 'blocked' $code $false $null $null $null $null $false);exit 1 }
+```

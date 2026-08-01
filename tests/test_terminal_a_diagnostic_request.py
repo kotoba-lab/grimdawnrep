@@ -28,19 +28,17 @@ EXPECTED_KEYS = {
     "expires_at",
 }
 EXPECTED_CHECKS = [
-    "status_baseline", "doctor", "current_deployment_contract",
-    "remote_ahead_live_equals_baseline", "stable_remote_difference",
-    "selector_cancel_reload_invariants",
+    "double_status_doctor", "deployment_fingerprints",
+    "vault_source_live_state_invariants", "stable_remote_main_and_lock",
+    "residual_selector_and_process_observation",
 ]
 EXPECTED_CONSTRAINTS = [
-    "shortcut_ui_cancel_reload_only",
-    "no_game_or_dpyes_start",
-    "no_lock",
-    "no_recover",
-    "no_restore_snapshot_bookmark_promote",
+    "installed_local_fixed_block_only",
+    "no_shortcut_ui_input_close_kill_or_game_start",
+    "no_fetch_or_vault_ref_write",
+    "no_lock_recover_restore_snapshot_bookmark_promote",
     "no_commit_push_merge_rebase_reset_checkout",
     "no_state_config_save_remote_ref_write",
-    "allow_only_designated_catalog_tracking_ref_transition",
     "no_fetched_code_execution",
 ]
 FORBIDDEN_FIELDS = {
@@ -84,12 +82,12 @@ def test_terminal_a_request_has_exact_schema_identity_and_readonly_action() -> N
     assert set(payload) == EXPECTED_KEYS
     assert payload["schema_version"] == "1.0.0"
     assert payload["kind"] == "grim_dawn_terminal_diagnostic_request"
-    assert payload["sequence"] == 8
+    assert payload["sequence"] == 9
     assert payload["target_machine_id"] == "desktop-a"
     assert payload["leg"] == "A1" and payload["observed_code"] == "remote_changed_or_unknown"
-    assert payload["action"] == "selector_cancel_reload_dry_run"
-    assert payload["response_sentinel"] == "TERMINAL_A_SELECTOR_DRY_RUN"
-    assert payload["request_id"] == "7c41ca11-8075-4236-b361-caec323095d2"
+    assert payload["action"] == "post_selector_failure_readonly_probe"
+    assert payload["response_sentinel"] == "TERMINAL_A_POST_SELECTOR_FAILURE_PROBE"
+    assert payload["request_id"] == "c4de6a93-1493-4bb6-b2c0-8f9ea406e2fd"
     parsed_id = uuid.UUID(str(payload["request_id"]))
     assert str(parsed_id) == payload["request_id"]
 
@@ -116,8 +114,8 @@ def test_terminal_a_request_has_strict_utc_window_of_at_most_seventy_five_minute
         values[field] = parsed
     assert values["issued_at"] <= values["not_before"] < values["expires_at"]
     assert (values["expires_at"] - values["not_before"]).total_seconds() <= 4500
-    assert payload["issued_at"] == payload["not_before"] == "2026-08-01T21:57:35Z"
-    assert payload["expires_at"] == "2026-08-01T23:12:35Z"
+    assert payload["issued_at"] == payload["not_before"] == "2026-08-02T00:50:37Z"
+    assert payload["expires_at"] == "2026-08-02T02:05:37Z"
     assert (values["expires_at"] - values["not_before"]).total_seconds() == 4500
 
 
@@ -247,7 +245,7 @@ def test_remote_classification_block_is_read_only_and_sanitized() -> None:
     assert "Get-LocalFingerprint" in block
     assert "Get-FetchHeadFingerprint" in block
     assert "Get-FileFingerprint $State" in block
-    assert "'for-each-ref','--sort=refname','--format=%(refname) %(objectname)','refs'" in block
+    assert "'for-each-ref','--sort=refname','--format=%(refname) %(objectname)'" in block
     assert "refs/tags/grim-dawn-sync-active" in block
     assert "$classification = if ($remoteHead -ceq $localHead)" in block
     assert "'remote_ahead'" in block and "'remote_behind'" in block and "'diverged'" in block
@@ -341,3 +339,63 @@ def test_selector_dry_run_ref_and_output_boundaries_are_privacy_safe() -> None:
     assert "ConvertTo-Json -Compress" in block
     assert "2>$null" in block
     assert "Write-Output (Out-DryRun" in block
+    assert "$valid=$Status -eq 'complete'" in block
+    assert "$First=$null" in block and "$Count='unknown'" in block
+    assert "observations_valid=$valid" in block
+    # A blocked run must not leak the catch's placeholder values as observed
+    # selector facts.  This is the sequence-8 low-severity reporting guard.
+    assert "$Game=$null;$Mutated=$null" in block
+    assert "selector_visible_count=$(if($valid){2}else{$null})" in block
+
+
+def test_post_selector_failure_probe_is_readonly_and_reports_only_aggregate_buckets() -> None:
+    runbook = RUNBOOK_PATH.read_text(encoding="utf-8")
+    block = runbook.split("## Post-selector-failure readonly probe", 1)[1].split("```powershell", 1)[1].split("```", 1)[0]
+
+    assert "TERMINAL_A_POST_SELECTOR_FAILURE_PROBE" in block
+    assert "Json 'status'" in block and "Json 'doctor'" in block
+    assert "ls-remote','--refs','origin','refs/heads/main','refs/tags/grim-dawn-sync-active" in block
+    assert "function Windows()" in block and "Get-CimInstance Win32_Process" in block
+    assert "selector_residual_detected" in block and "process_observation_inconclusive" in block
+    assert "Write-Output (Out 'blocked' 'selector_residual_detected'" in block
+    # A failed title enumeration is an inconclusive process observation, not a
+    # reason to claim the selector is absent and retryable.
+    assert "function Windows(){try{" in block
+    assert "catch{throw 'process_observation_inconclusive'}" in block
+    assert "function TreeDigest([string]$root)" in block
+    assert "(TreeDigest $live)" in block
+    assert "function RepoFingerprint($r)" in block
+    assert "'status','--porcelain=v1','--untracked-files=all'" in block
+    assert "'for-each-ref','--sort=refname','--format=%(refname) %(objectname)'" in block
+    assert "'FETCH_HEAD'" in block and "'present='" in block and "'absent'" in block
+    assert "function RemoteAdvertisement($r)" in block
+    assert "$main.Count -ne 1 -or $lock.Count -ne 0 -or $rows.Count -ne 1" in block
+    assert "$r1=RemoteAdvertisement $vault;$r2=RemoteAdvertisement $vault" in block
+    assert "$liveRoot=[string]$d1.checks.save_root.manifest.root_hash" in block
+    assert "$liveRoot -notmatch '^[0-9a-f]{64}$'" in block
+    assert "function InstalledManifestRoot($root)" in block
+    assert "from grim_dawn_sync.manifest import build_manifest" in block
+    assert "Native $python @('-c',$probe,$root,$machineId)" in block
+    assert "$liveRoot -cne $installedRoot1" in block
+    assert "$liveRoot -cne $installedRoot2" in block
+    assert "$installedRoot3 -cne $liveRoot" in block
+    assert "[string]$afterDoctor.checks.save_root.manifest.root_hash -cne $liveRoot" in block
+    assert "($s1|ConvertTo-Json -Depth 16 -Compress) -cne ($s2|ConvertTo-Json -Depth 16 -Compress)" in block
+    assert "($d1|ConvertTo-Json -Depth 16 -Compress) -cne ($d2|ConvertTo-Json -Depth 16 -Compress)" in block
+    for forbidden in ("Start-Process", "PostMessage", "SetForegroundWindow", " fetch", " recover", " restore", " snapshot", " bookmark", " promote", " commit", " push", " kill", " stop-process"):
+        assert forbidden.lower() not in block.lower()
+
+
+def test_post_selector_failure_probe_failure_contract_is_closed_and_sanitized() -> None:
+    runbook = RUNBOOK_PATH.read_text(encoding="utf-8")
+    block = runbook.split("## Post-selector-failure readonly probe", 1)[1].split("```powershell", 1)[1].split("```", 1)[0]
+
+    # The only retryable completion is the all-clear path.  A residual exact
+    # title (one or many) is explicitly non-retryable, while native/git races,
+    # state drift, and CIM/window failures are all mapped to the allowlist.
+    assert "if($wins.Count -ne 0)" in block
+    assert "'selector_residual_detected' $false" in block
+    assert "$code -notin @('precondition_failed','observation_changed','process_observation_inconclusive')" in block
+    assert "throw 'observation_changed'" in block
+    assert "function StopTree($pid)" in block and "WaitForExit($timeoutMs)" in block
+    assert "ConvertTo-Json -Compress" in block
