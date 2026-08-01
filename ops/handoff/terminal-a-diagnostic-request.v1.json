@@ -1,0 +1,32 @@
+{
+  "action": "diagnose_readonly",
+  "checks": [
+    "status",
+    "doctor",
+    "latest_launch_failure"
+  ],
+  "constraints": [
+    "no_launch_retry",
+    "no_recover",
+    "no_save_mutation",
+    "no_push",
+    "no_pull",
+    "no_checkout",
+    "no_merge",
+    "no_reset",
+    "source_fetch_only",
+    "source_git_show_only",
+    "no_fetched_code_execution"
+  ],
+  "expires_at": "2026-08-01T09:59:54Z",
+  "issued_at": "2026-08-01T08:59:54Z",
+  "kind": "grim_dawn_terminal_diagnostic_request",
+  "leg": "A1",
+  "not_before": "2026-08-01T08:59:54Z",
+  "observed_code": "launch_failed",
+  "request_id": "c16c34d7-b087-4ecb-b111-a1325f6c1978",
+  "response_sentinel": "TERMINAL_A_DIAGNOSIS",
+  "schema_version": "1.0.0",
+  "sequence": 1,
+  "target_machine_id": "desktop-a"
+}

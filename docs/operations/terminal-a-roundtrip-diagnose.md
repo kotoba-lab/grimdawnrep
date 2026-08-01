@@ -5,6 +5,171 @@ read-only diagnosis of the already enrolled Terminal A (`desktop-a`).  It
 does not pull public source first: even a fast-forward pull changes local
 state and is unnecessary for this diagnosis.
 
+## Operator-mediated public remote request
+
+The request at `ops/handoff/terminal-a-diagnostic-request.v1.json` is inert
+coordination data, not a command, script, configuration, or authorization to
+run fetched source. An operator may retrieve it only from the canonical
+public `origin/master`; no other remote or branch is accepted. Run this block
+in **Windows PowerShell 5.1**. It emits nothing on success. On any failure it
+emits one fixed blocked sentinel and stops without disclosing the request,
+remote URL, object IDs, local paths, or Git output.
+
+```powershell
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$source = Join-Path $env:USERPROFILE 'grimdawnrep'
+$toolRoot = Join-Path $env:LOCALAPPDATA 'GrimDawnSaveSyncTool'
+$python = Join-Path $toolRoot '.venv\Scripts\python.exe'
+$config = Join-Path $env:LOCALAPPDATA 'GrimDawnSaveSync\config.local.json'
+$machineId = 'desktop-a'
+$publicUrl = 'https://github.com/kotoba-lab/grimdawnrep.git'
+$requestObjectPath = 'ops/handoff/terminal-a-diagnostic-request.v1.json'
+$oidPattern = '^[0-9a-f]{40}(?:[0-9a-f]{24})?$'
+
+function Write-RequestBlocked {
+    [ordered]@{
+        sentinel = 'TERMINAL_A_DIAGNOSIS'
+        status = 'blocked'
+        leg = 'A1'
+        machine_id = $machineId
+        code = 'remote_request_invalid'
+    } | ConvertTo-Json -Compress
+}
+
+function Invoke-GitLines([string[]]$GitArgs) {
+    $lines = @(& git -C $source @GitArgs 2>$null)
+    if ($LASTEXITCODE -ne 0) { throw 'invalid' }
+    return @($lines)
+}
+
+function Get-OneGitLine([string[]]$GitArgs) {
+    $lines = @(Invoke-GitLines $GitArgs)
+    if ($lines.Count -ne 1) { throw 'invalid' }
+    return ([string]$lines[0]).Trim()
+}
+
+function Invoke-GitQuiet([string[]]$GitArgs) {
+    $priorErrorAction = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        & git -C $source @GitArgs 1>$null 2>$null
+        $gitExitCode = $LASTEXITCODE
+    }
+    finally { $ErrorActionPreference = $priorErrorAction }
+    if ($gitExitCode -ne 0) { throw 'invalid' }
+}
+
+function Assert-ExactArray($Actual, [string[]]$Expected) {
+    $values = @($Actual)
+    if ($values.Count -ne $Expected.Count) { throw 'invalid' }
+    for ($index = 0; $index -lt $Expected.Count; $index++) {
+        if (-not ($values[$index] -is [string]) -or $values[$index] -cne $Expected[$index]) { throw 'invalid' }
+    }
+}
+
+function Get-StrictUtc([string]$Value) {
+    if ($Value -cnotmatch '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$') { throw 'invalid' }
+    $parsed = [DateTimeOffset]::MinValue
+    $style = [Globalization.DateTimeStyles]::AssumeUniversal -bor [Globalization.DateTimeStyles]::AdjustToUniversal
+    if (-not [DateTimeOffset]::TryParseExact($Value, 'yyyy-MM-ddTHH:mm:ssZ',
+        [Globalization.CultureInfo]::InvariantCulture, $style, [ref]$parsed)) { throw 'invalid' }
+    return $parsed
+}
+
+function Get-FileSha256([string]$Path) {
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($sha.ComputeHash($stream))).Replace('-', '') }
+    finally { $sha.Dispose(); $stream.Dispose() }
+}
+
+try {
+    if (-not (Test-Path -LiteralPath $source -PathType Container) -or
+        -not (Test-Path -LiteralPath $python -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $config -PathType Leaf)) { throw 'invalid' }
+
+    $fetchUrls = @(Invoke-GitLines @('remote','get-url','--all','origin'))
+    $pushUrls = @(Invoke-GitLines @('remote','get-url','--push','--all','origin'))
+    if ($fetchUrls.Count -ne 1 -or $pushUrls.Count -ne 1 -or
+        ([string]$fetchUrls[0]).Trim() -cne $publicUrl -or
+        ([string]$pushUrls[0]).Trim() -cne $publicUrl) { throw 'invalid' }
+
+    $beforeBranch = Get-OneGitLine @('symbolic-ref','--quiet','HEAD')
+    $beforeHead = Get-OneGitLine @('rev-parse','HEAD')
+    $beforeStatus = @(Invoke-GitLines @('status','--porcelain=v1','--untracked-files=all'))
+    if ($beforeBranch -cne 'refs/heads/master' -or $beforeHead -cnotmatch $oidPattern -or $beforeStatus.Count -ne 0) { throw 'invalid' }
+    $beforePython = Get-FileSha256 $python
+    $beforeConfig = Get-FileSha256 $config
+
+    Invoke-GitQuiet @('fetch','--no-tags','origin','master:refs/remotes/origin/master')
+    $originMaster = Get-OneGitLine @('rev-parse','origin/master')
+    $fetchHead = Get-OneGitLine @('rev-parse','FETCH_HEAD')
+    if ($originMaster -cnotmatch $oidPattern -or $fetchHead -cnotmatch $oidPattern -or $originMaster -cne $fetchHead) { throw 'invalid' }
+    Invoke-GitQuiet @('merge-base','--is-ancestor',$beforeHead,$fetchHead)
+    $requestCommit = $fetchHead
+
+    $requestLines = @(& git -C $source show "$requestCommit`:$requestObjectPath" 2>$null)
+    if ($LASTEXITCODE -ne 0 -or $requestLines.Count -eq 0) { throw 'invalid' }
+    $requestRaw = @($requestLines) -join "`n"
+    $requestBytes = [Text.Encoding]::UTF8.GetByteCount($requestRaw + "`n")
+    if ($requestBytes -gt 4096 -or $requestRaw.Length -eq 0 -or
+        $requestRaw[0] -eq [char]0xFEFF -or $requestRaw.Contains([char]0xFFFD) -or
+        $requestRaw -match '[^\x09\x0A\x0D\x20-\x7E]') { throw 'invalid' }
+    try { $request = $requestRaw | ConvertFrom-Json -ErrorAction Stop }
+    catch { throw 'invalid' }
+
+    $expectedKeys = @('action','checks','constraints','expires_at','issued_at','kind','leg','not_before',
+        'observed_code','request_id','response_sentinel','schema_version','sequence','target_machine_id')
+    $actualKeys = @($request.PSObject.Properties.Name | Sort-Object)
+    Assert-ExactArray $actualKeys $expectedKeys
+    if (-not ($request.schema_version -is [string]) -or $request.schema_version -cne '1.0.0' -or
+        -not ($request.kind -is [string]) -or
+        $request.kind -cne 'grim_dawn_terminal_diagnostic_request' -or
+        -not ($request.sequence -is [int]) -or $request.sequence -ne 1 -or
+        -not ($request.target_machine_id -is [string]) -or $request.target_machine_id -cne $machineId -or
+        -not ($request.leg -is [string]) -or -not ($request.observed_code -is [string]) -or
+        -not ($request.action -is [string]) -or -not ($request.response_sentinel -is [string]) -or
+        -not ($request.request_id -is [string]) -or
+        $request.leg -cne 'A1' -or $request.observed_code -cne 'launch_failed' -or
+        $request.action -cne 'diagnose_readonly' -or
+        $request.response_sentinel -cne 'TERMINAL_A_DIAGNOSIS') { throw 'invalid' }
+    Assert-ExactArray $request.checks @('status','doctor','latest_launch_failure')
+    Assert-ExactArray $request.constraints @('no_launch_retry','no_recover','no_save_mutation','no_push',
+        'no_pull','no_checkout','no_merge','no_reset','source_fetch_only','source_git_show_only','no_fetched_code_execution')
+    $requestGuid = [Guid]::Empty
+    if (-not [Guid]::TryParse([string]$request.request_id, [ref]$requestGuid) -or
+        $requestGuid.ToString() -cne [string]$request.request_id) { throw 'invalid' }
+
+    $issued = Get-StrictUtc ([string]$request.issued_at)
+    $notBefore = Get-StrictUtc ([string]$request.not_before)
+    $expires = Get-StrictUtc ([string]$request.expires_at)
+    $now = [DateTimeOffset]::UtcNow
+    if ($issued -gt $notBefore -or $notBefore -ge $expires -or
+        ($expires - $notBefore).TotalSeconds -gt 3600 -or $now -lt $notBefore -or $now -ge $expires) { throw 'invalid' }
+
+    $afterBranch = Get-OneGitLine @('symbolic-ref','--quiet','HEAD')
+    $afterHead = Get-OneGitLine @('rev-parse','HEAD')
+    $afterStatus = @(Invoke-GitLines @('status','--porcelain=v1','--untracked-files=all'))
+    $afterPython = Get-FileSha256 $python
+    $afterConfig = Get-FileSha256 $config
+    if ($afterBranch -cne $beforeBranch -or $afterHead -cne $beforeHead -or
+        $afterStatus.Count -ne 0 -or $afterPython -cne $beforePython -or $afterConfig -cne $beforeConfig) { throw 'invalid' }
+    exit 0
+}
+catch {
+    Write-Output (Write-RequestBlocked)
+    exit 1
+}
+```
+
+Continue only when the block exits zero and prints no output. Then run only
+the already deployed local diagnosis block below. Do not execute or import
+fetched code and do not replace the local block with code from the fetched
+commit. If the request block prints its sentinel, relay exactly that one line
+and stop. The original A1 contract remains in force: no pull, checkout, reset,
+merge, rebase, push, launch retry, recovery, or save mutation.
+
 ## Boundaries
 
 - Run the block in **Windows PowerShell 5.1**, not PowerShell 7.

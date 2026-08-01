@@ -182,7 +182,11 @@ def test_terminal_a_roundtrip_diagnosis_is_ps51_read_only_and_sanitized() -> Non
 
 
 def test_terminal_a_roundtrip_diagnosis_parses_known_schema_and_allowlists_output() -> None:
-    command = ROUNDTRIP_DIAGNOSE_DOC.split("```powershell", 1)[1].split("```", 1)[0]
+    command = next(
+        block.split("```", 1)[0]
+        for block in ROUNDTRIP_DIAGNOSE_DOC.split("```powershell")[1:]
+        if "function Get-StatusOrThrow" in block
+    )
     assert "$existingConfig.machine_id -ne $machineId" in command
     assert "function Get-StatusOrThrow" in command
     assert "throw 'status_command_failed'" in command
