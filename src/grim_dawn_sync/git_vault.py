@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import hashlib
 import json
+import time
 from pathlib import Path, PurePosixPath
 import shutil
 import subprocess
@@ -429,6 +430,23 @@ class GitRunner:
             raise SyncError("git_command_failed", "Git command failed.", EXIT_CONFLICT, {"command": args[0] if args else "git"})
         return stdout
 
+    def run_bytes_input_result(self, *args: str, input_bytes: bytes) -> GitResult:
+        """Run Git with byte-exact stdin and retain a non-raising result.
+
+        Windows text pipes translate LF to CRLF.  Object-building plumbing such
+        as ``mktag`` must receive the canonical bytes, so it cannot use
+        :meth:`run`'s text-mode stdin.
+        """
+        argv = (self.executable, *args); self.commands.append(argv)
+        stdout, stderr, returncode = self._communicate(argv, input_data=input_bytes, text=False)
+        assert isinstance(stdout, bytes) and isinstance(stderr, bytes)
+        return GitResult(
+            tuple(args),
+            stdout.decode("utf-8", errors="replace"),
+            stderr.decode("utf-8", errors="replace"),
+            returncode,
+        )
+
 
 @dataclass(frozen=True)
 class VaultStatus:
@@ -826,36 +844,31 @@ class GitVault:
             raise SyncError("bookmark_exists", "Managed bookmark ref already exists.", EXIT_CONFLICT)
         if publication_guard is not None:
             publication_guard()
-        made = self.runner.run("tag", "-a", name, commit, "-F", "-", input_text=annotation, check=False)
-        if made.returncode:
-            raise SyncError("bookmark_create_failed", "Managed bookmark could not be created.", EXIT_RECOVERY_REQUIRED)
-        local_tag_oid = self.runner.run("rev-parse", "--verify", "--quiet", ref, check=False).stdout.strip()
-        if not _OID.fullmatch(local_tag_oid):
+        # Build the annotated tag object without creating a ref.  A hard crash
+        # before publication intent persistence can therefore leave only an
+        # unreachable object, never an untracked UUID-named local ref.
+        tag_object = (
+            f"object {commit}\n"
+            "type commit\n"
+            f"tag {name}\n"
+            f"tagger Grim Dawn Save Sync <grim-dawn-sync@localhost> {int(time.time())} +0000\n"
+            f"\n{annotation}\n"
+        )
+        made = self.runner.run_bytes_input_result("mktag", input_bytes=tag_object.encode("utf-8"))
+        local_tag_oid = made.stdout.strip()
+        if (
+            made.returncode
+            or not _OID.fullmatch(local_tag_oid)
+            or self.runner.run("cat-file", "-t", local_tag_oid, check=False).stdout.strip() != "tag"
+        ):
             raise SyncError("bookmark_create_failed", "Managed bookmark tag object was not created.", EXIT_RECOVERY_REQUIRED)
         if publication_intent is not None:
-            try:
-                publication_intent(name, local_tag_oid, commit)
-            except Exception:
-                # The recoverable intent was not persisted, so this generated
-                # tag must not survive as an untracked local ref.  Cleanup is
-                # allowed only while the exact lock/state guard still holds,
-                # the remote tag is absent, and the local ref still names the
-                # exact annotated-tag object and peeled commit we just made.
-                if publication_guard is not None:
-                    publication_guard()
-                remote_rows = {item[0]: item for item in self._managed_bookmark_rows(remote=True)}
-                if name in remote_rows:
-                    raise SyncError("bookmark_intent_incomplete", "Bookmark intent failed after remote publication; recovery is required.", EXIT_RECOVERY_REQUIRED)
-                actual_tag = self.runner.run("rev-parse", "--verify", "--quiet", ref, check=False).stdout.strip()
-                actual_target = self.runner.run("rev-parse", "--verify", "--quiet", f"{ref}^{{}}", check=False).stdout.strip()
-                actual_type = self.runner.run("cat-file", "-t", ref, check=False).stdout.strip()
-                if actual_tag != local_tag_oid or actual_target != commit or actual_type != "tag":
-                    raise SyncError("bookmark_intent_cleanup_unsafe", "Unpersisted bookmark tag no longer matches its exact object.", EXIT_RECOVERY_REQUIRED)
-                deleted = self.runner.run("tag", "-d", name, check=False)
-                remaining = self.runner.run("rev-parse", "--verify", "--quiet", ref, check=False).stdout.strip()
-                if deleted.returncode or remaining:
-                    raise SyncError("bookmark_intent_cleanup_incomplete", "Unpersisted local bookmark cleanup is incomplete.", EXIT_RECOVERY_REQUIRED)
-                raise
+            publication_intent(name, local_tag_oid, commit)
+        created = self.runner.run("update-ref", ref, local_tag_oid, "0" * len(local_tag_oid), check=False)
+        actual_tag = self.runner.run("rev-parse", "--verify", "--quiet", ref, check=False).stdout.strip()
+        actual_target = self.runner.run("rev-parse", "--verify", "--quiet", f"{ref}^{{}}", check=False).stdout.strip()
+        if created.returncode or actual_tag != local_tag_oid or actual_target != commit:
+            raise SyncError("bookmark_create_failed", "Managed bookmark ref was not created from its persisted object.", EXIT_RECOVERY_REQUIRED)
         self.assert_remote_identity()
         if publication_guard is not None:
             publication_guard()
@@ -904,9 +917,33 @@ class GitVault:
         expected_remote_head = _oid_value(expected_remote_head); ref = f"refs/tags/{name}"
         if not re.fullmatch(r"[0-9a-f]{64}", root_hash):
             raise SyncError("invalid_bookmark_intent", "Managed bookmark intent root is invalid.", EXIT_RECOVERY_REQUIRED)
+        object_type = self.runner.run("cat-file", "-t", tag_oid, check=False).stdout.strip()
+        object_target = self.runner.run("rev-parse", "--verify", "--quiet", f"{tag_oid}^{{}}", check=False).stdout.strip()
+        object_annotation = self.runner.run("cat-file", "tag", tag_oid, check=False)
+        if (
+            object_type != "tag"
+            or object_target != commit
+            or object_annotation.returncode
+            or "\n\n" not in object_annotation.stdout
+            or self.validate_commit_snapshot(commit).get("root_hash") != root_hash
+        ):
+            raise SyncError("invalid_bookmark_intent", "Persisted managed bookmark object is invalid.", EXIT_RECOVERY_REQUIRED)
         local_tag = self.runner.run("rev-parse", "--verify", "--quiet", ref, check=False).stdout.strip()
+        if not local_tag:
+            created = self.runner.run("update-ref", ref, tag_oid, "0" * len(tag_oid), check=False)
+            local_tag = self.runner.run("rev-parse", "--verify", "--quiet", ref, check=False).stdout.strip()
+            if created.returncode or local_tag != tag_oid:
+                raise SyncError("invalid_bookmark_intent", "Persisted managed bookmark ref could not be created exactly.", EXIT_RECOVERY_REQUIRED)
         local_target = self.runner.run("rev-parse", "--verify", "--quiet", f"{ref}^{{}}", check=False).stdout.strip()
-        if local_tag != tag_oid or local_target != commit or self.validate_commit_snapshot(commit).get("root_hash") != root_hash:
+        local_type = self.runner.run("cat-file", "-t", ref, check=False).stdout.strip()
+        local_annotation = self.runner.run("cat-file", "tag", ref, check=False)
+        if (
+            local_tag != tag_oid
+            or local_target != commit
+            or local_type != "tag"
+            or local_annotation.returncode
+            or "\n\n" not in local_annotation.stdout
+        ):
             raise SyncError("invalid_bookmark_intent", "Local managed bookmark intent does not match its objects.", EXIT_RECOVERY_REQUIRED)
         publication_guard()
         self.runner.run(

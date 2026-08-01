@@ -196,9 +196,9 @@ def _validate_current_transition(
         raise SyncError("invalid_state", "Release-pending state must identify the pushed commit.")
     if phase == "bookmark_release_pending" and (
         local_commit is not None or pushed_commit != values["base_commit"]
-        or values["last_applied_remote_commit"] is None or values["last_applied_manifest_root_hash"] is None
+        or ((values["last_applied_remote_commit"] is None) != (values["last_applied_manifest_root_hash"] is None))
     ):
-        raise SyncError("invalid_state", "Bookmark release state must preserve the prior baseline and unchanged main.")
+        raise SyncError("invalid_state", "Bookmark release state must preserve the exact prior baseline and unchanged main.")
     bookmark_fields = (values["bookmark_ref"], values["bookmark_tag_oid"], values["bookmark_root_hash"])
     if phase == "bookmark_publish_pending":
         if (
@@ -416,11 +416,15 @@ def save_state(path: Path, state: SyncState) -> None:
 
 
 def save_state_if_unchanged(path: Path, expected: SyncState, state: SyncState) -> None:
-    """Atomically compare the canonical pre-state and replace it under one lock."""
+    """Atomically compare the canonical pre-state and replace it under one lock.
+
+    A missing file is the canonical empty pre-state.  This permits the first
+    session intent to use the same semantic CAS as every later transition.
+    """
     parse_state(expected.as_dict())
     parse_state(state.as_dict())
     with _state_write_lock(path):
-        current = load_state(path)
+        current = SyncState() if _lstat(path) is None else load_state(path)
         if current != expected:
             raise SyncError("selection_stale", "Recovery state changed before lock acquisition.", EXIT_CONFLICT)
         _save_state_unlocked(path, state)

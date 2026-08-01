@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import inspect
+from dataclasses import replace
 from pathlib import Path
 import stat
 from types import SimpleNamespace
@@ -10,8 +11,10 @@ import pytest
 
 from grim_dawn_sync.config import parse_config
 from grim_dawn_sync.errors import EXIT_CONFLICT, EXIT_RECOVERY_REQUIRED, EXIT_VALIDATION, SyncError
+from grim_dawn_sync.session_lock import Lock, Session
 from grim_dawn_sync.workflow import DomainAdapters, LaunchWorkflow, WorkflowAdapters, WorkflowState
 from grim_dawn_sync.selection import ReconcileCase, SelectionRegistry
+from grim_dawn_sync.state import SyncState, load_state, save_state
 from grim_dawn_sync.version_catalog import ManifestDiff, SaveCandidate, VersionCatalog
 
 
@@ -94,12 +97,55 @@ def test_domain_remote_manifest_reads_commit_without_creating_staging(tmp_path: 
     assert not (tmp_path / "local").exists()
 
 
+def test_domain_automatic_bookmark_uses_the_acquired_lock_and_original_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    subject = DomainAdapters(config(tmp_path), tmp_path / "local")
+    lock = object()
+    original = SyncState(
+        last_applied_remote_commit="a" * 40,
+        last_applied_manifest_root_hash="b" * 64,
+        machine_id="test-machine",
+    )
+    subject._selection_lock = lock
+    subject._selection_original_state = original
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        "grim_dawn_sync.workflow.create_displaced_head_bookmark_locked",
+        lambda vault, passed_lock, passed_original, commit, **kwargs: captured.update(
+            vault=vault, lock=passed_lock, original=passed_original, commit=commit, **kwargs,
+        ),
+    )
+
+    subject.bookmark_displaced_remote("a" * 40, object())  # type: ignore[arg-type]
+
+    assert captured == {
+        "vault": subject.vault,
+        "lock": lock,
+        "original": original,
+        "commit": "a" * 40,
+        "state_path": tmp_path / "local" / "state.json",
+        "created_by": "test-machine",
+    }
+
+
 def test_domain_release_passes_manifest_root_into_atomic_release(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     subject = DomainAdapters(config(tmp_path), tmp_path / "local")
     lock = object()
     commit, root_hash = "a" * 40, "b" * 64
+    committed = SyncState(
+        session_id="00000000-0000-4000-8000-000000000001",
+        machine_id="test-machine",
+        base_commit="c" * 40,
+        lock_oid="d" * 40,
+        local_tag="grim-dawn-sync-00000000-0000-4000-8000-000000000001",
+        phase="committed",
+        local_commit="e" * 40,
+        last_applied_manifest_root_hash=root_hash,
+    )
+    subject._committed_state = committed
     captured: dict[str, object] = {}
 
     def fake_release(vault, passed_lock, pushed_commit, **kwargs):
@@ -119,7 +165,83 @@ def test_domain_release_passes_manifest_root_into_atomic_release(
         "commit": commit,
         "state_path": tmp_path / "local" / "state.json",
         "confirmed_root_hash": root_hash,
+        "expected_state": committed,
     }
+    assert subject._committed_state is None
+
+
+def test_domain_mark_committed_semantic_cas_retains_foreign_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import grim_dawn_sync.workflow as module
+
+    subject = DomainAdapters(config(tmp_path), tmp_path / "local")
+    session_id = "00000000-0000-4000-8000-000000000001"
+    session = Session(session_id, "test-machine", "a" * 40, "2026-08-01T00:00:00Z")
+    lock = Lock(session, "b" * 40, f"grim-dawn-sync-{session_id}")
+    locked = SyncState(
+        last_applied_remote_commit=session.base_commit,
+        last_applied_manifest_root_hash="c" * 64,
+        session_id=session_id,
+        machine_id=session.machine_id,
+        base_commit=session.base_commit,
+        lock_oid=lock.oid,
+        local_tag=lock.local_tag,
+        phase="lock_held",
+    )
+    foreign = replace(locked, last_applied_manifest_root_hash="d" * 64)
+    save_state(subject.state_path, locked)
+    actual_cas = module.save_state_if_unchanged
+
+    def inject_race(path: Path, expected: SyncState, replacement: SyncState) -> None:
+        assert expected == locked
+        save_state(path, foreign)
+        actual_cas(path, expected, replacement)
+
+    monkeypatch.setattr(module, "save_state_if_unchanged", inject_race)
+    with pytest.raises(SyncError) as caught:
+        subject.mark_committed(lock, "e" * 40, "f" * 64)
+
+    assert caught.value.code == "recovery_state_changed"
+    assert caught.value.exit_code == EXIT_RECOVERY_REQUIRED
+    assert load_state(subject.state_path) == foreign
+    assert subject._committed_state is None
+
+
+def test_domain_mark_committed_binds_exact_release_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    subject = DomainAdapters(config(tmp_path), tmp_path / "local")
+    session_id = "00000000-0000-4000-8000-000000000001"
+    session = Session(session_id, "test-machine", "a" * 40, "2026-08-01T00:00:00Z")
+    lock = Lock(session, "b" * 40, f"grim-dawn-sync-{session_id}")
+    locked = SyncState(
+        last_applied_remote_commit=session.base_commit,
+        last_applied_manifest_root_hash="c" * 64,
+        session_id=session_id,
+        machine_id=session.machine_id,
+        base_commit=session.base_commit,
+        lock_oid=lock.oid,
+        local_tag=lock.local_tag,
+        phase="lock_held",
+    )
+    save_state(subject.state_path, locked)
+    subject.mark_committed(lock, "d" * 40, "e" * 64)
+    committed = load_state(subject.state_path)
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        "grim_dawn_sync.workflow.release_lock",
+        lambda vault, passed_lock, oid, **kwargs: captured.update(
+            vault=vault, lock=passed_lock, oid=oid, **kwargs,
+        ),
+    )
+
+    subject.release(lock, "d" * 40, {"root_hash": "e" * 64})
+
+    assert committed.phase == "committed"
+    assert committed.local_commit == "d" * 40
+    assert captured["expected_state"] == committed
+    assert subject._committed_state is None
 
 
 def test_domain_snapshot_binds_the_exact_validated_manifest(tmp_path: Path) -> None:
@@ -425,10 +547,39 @@ def test_context_digest_and_remote_identity_revalidate_immediately_before_lock(t
     def after_lock(digest, lock):
         assert digest == "d" * 64 and lock is adapters.lock
         adapters.calls.append("context_after_lock")
+        return {"live_root_hash": live}
     context.after_lock = after_lock
     with pytest.raises(SyncError):
         subject.execute_selection_plan(plan, registry, context_revalidate=context)
     assert adapters.calls[:5] == ["preflight", "context", "bind", "acquire", "context_after_lock"]
+
+
+def test_post_lock_attestation_reuses_fresh_live_root_before_first_mutation(tmp_path: Path) -> None:
+    adapters = FakeAdapters(); subject, _ = run(tmp_path, adapters)
+    live, commit = "1" * 64, "a" * 40
+    item = SaveCandidate("live", "live", "live", "x", "m", live, None, 0, 0, 0, (), ManifestDiff(0, 0, 0))
+    catalog = VersionCatalog("v" * 32, commit, live, (item,)); registry = SelectionRegistry(); registry.register(catalog)
+    plan = registry.build_plan(
+        catalog_token=catalog.token, candidate_id=item.candidate_id, mode="launch",
+        case=ReconcileCase.LIVE_AHEAD, expected_context_digest="d" * 64,
+        expected_remote_identity=("test://vault", "test://vault"),
+    )
+    live_calls: list[str] = []
+    adapters.live_manifest = lambda: live_calls.append("hash") or {"root_hash": live}
+    adapters.remote_oid = lambda: commit
+    adapters.bind_remote_identity = lambda _value: None
+    adapters.bookmark_displaced_remote = lambda *_args: (_ for _ in ()).throw(
+        SyncError("stop_after_attestation", "x", EXIT_RECOVERY_REQUIRED)
+    )
+    def context(_digest): pass
+    def after_lock(_digest, _lock): return {"live_root_hash": live}
+    context.after_lock = after_lock
+
+    with pytest.raises(SyncError) as caught:
+        subject.execute_selection_plan(plan, registry, context_revalidate=context)
+
+    assert caught.value.code == "stop_after_attestation"
+    assert live_calls == ["hash", "hash"]
 
 
 def test_context_change_across_lock_stops_before_plan_execution(tmp_path: Path) -> None:
@@ -454,7 +605,7 @@ def test_context_change_across_lock_stops_before_plan_execution(tmp_path: Path) 
 
     with pytest.raises(SyncError) as caught:
         subject.execute_selection_plan(plan, registry, context_revalidate=context)
-    assert caught.value.code == "catalog_context_changed"
+    assert (caught.value.code, caught.value.exit_code) == ("catalog_context_changed", EXIT_RECOVERY_REQUIRED)
     assert caught.value.details["next_command"] == "grim-dawn-sync recover"
     assert adapters.calls[:5] == ["preflight", "context", "bind", "acquire", "context_after_lock"]
     assert "bookmark" not in adapters.calls and "align" not in adapters.calls and "prepare" not in adapters.calls

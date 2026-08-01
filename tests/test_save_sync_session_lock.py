@@ -445,25 +445,20 @@ def test_bootstrap_final_state_failure_remains_pending_and_recovers(
     state_path = tmp_path / "state.json"
     root_hash = "d" * 64
     _prepare_applied(vault, commit, state_path, root_hash)
-    actual_save = module.save_state
-    writes = 0
+    actual_save = module.save_state_if_unchanged
 
-    def fail_final(path: Path, state: SyncState) -> None:
-        nonlocal writes
-        writes += 1
-        if writes == 1:
-            raise SyncError("state_write_failed", "injected failure", 6)
-        actual_save(path, state)
+    def fail_final(path: Path, expected: SyncState, state: SyncState) -> None:
+        raise SyncError("state_write_failed", "injected failure", 6)
 
-    monkeypatch.setattr(module, "save_state", fail_final)
+    monkeypatch.setattr(module, "save_state_if_unchanged", fail_final)
     with pytest.raises(SyncError) as caught:
         push_bootstrap(vault, "machine-a", commit, root_hash, state_path=state_path)
     pending = load_state(state_path)
-    assert caught.value.code == "state_write_failed"
+    assert caught.value.code == "recovery_state_changed"
     assert pending.phase == "bootstrap_pending"
     assert vault.remote_oid() == commit
 
-    monkeypatch.setattr(module, "save_state", actual_save)
+    monkeypatch.setattr(module, "save_state_if_unchanged", actual_save)
     assert recover_session(vault, pending, "machine-a", state_path=state_path) == "bootstrap_complete"
     assert load_state(state_path) == SyncState(
         last_applied_remote_commit=commit,
@@ -512,8 +507,7 @@ def test_recovery_releases_exact_abandoned_lock_without_changing_main_or_live(
     vault, state_path, lock, base = _abandoned_lock_at_verified_base(tmp_path)
     source = tmp_path / "live" / "main" / "a"
     # Live data may have advanced after the failed launch.  Recovery verifies
-    # the base snapshot and records it as the last-applied baseline, rather
-    # than claiming the current live tree is equal to it.
+    # the lock base but restores the exact pre-lock applied baseline.
     original = SyncState(
         last_applied_remote_commit="a" * 40,
         last_applied_manifest_root_hash="b" * 64,
@@ -536,8 +530,8 @@ def test_recovery_releases_exact_abandoned_lock_without_changing_main_or_live(
     assert (source / "profile.dat").read_bytes() == before_live
     assert inspect_remote_lock_readonly(vault) is None
     assert load_state(state_path) == SyncState(
-        last_applied_remote_commit=base,
-        last_applied_manifest_root_hash=vault.validate_commit_snapshot(base)["root_hash"],
+        last_applied_remote_commit="a" * 40,
+        last_applied_manifest_root_hash="b" * 64,
         machine_id="machine-a",
     )
 
@@ -620,14 +614,15 @@ def test_abandoned_lock_release_delete_failure_resumes_without_changing_main(
     with pytest.raises(SyncError) as caught:
         recover_session(vault, load_state(state_path), "machine-a", state_path=state_path)
     assert caught.value.code == "release_incomplete"
-    assert load_state(state_path).phase == "release_pending"
+    assert load_state(state_path).phase == "bookmark_release_pending"
     assert inspect_remote_lock_readonly(vault).oid == lock.oid  # type: ignore[union-attr]
     assert vault.remote_oid() == base
 
     monkeypatch.setattr(vault.runner, "run", original)
-    assert recover_session(vault, load_state(state_path), "machine-a", state_path=state_path) == "released"
+    assert recover_session(vault, load_state(state_path), "machine-a", state_path=state_path) == "bookmark_released"
     assert vault.remote_oid() == base
     assert inspect_remote_lock_readonly(vault) is None
+    assert load_state(state_path) == SyncState()
 
 
 def test_recovery_adopts_snapshot_when_remote_already_has_exact_head(tmp_path: Path) -> None:
@@ -726,10 +721,10 @@ def test_recovery_adoption_state_failure_keeps_lock_state_and_never_pushes(
     lock = acquire_lock(vault, "machine-a", base, state_path=state_path)
     commit, root_hash = _commit_session_snapshot(vault, lock)
     previous = state_path.read_bytes()
-    actual_save = module.save_state
+    actual_save = module.save_state_if_unchanged
     monkeypatch.setattr(
         module,
-        "save_state",
+        "save_state_if_unchanged",
         lambda *_: (_ for _ in ()).throw(
             SyncError("state_write_failed", "injected adoption failure", 6)
         ),
@@ -738,12 +733,12 @@ def test_recovery_adoption_state_failure_keeps_lock_state_and_never_pushes(
     with pytest.raises(SyncError) as caught:
         recover_session(vault, load_state(state_path), "machine-a", state_path=state_path)
 
-    assert caught.value.code == "state_write_failed"
+    assert caught.value.code == "recovery_state_changed"
     assert vault.remote_oid() == base
     assert inspect_remote_lock_readonly(vault).oid == lock.oid  # type: ignore[union-attr]
     assert state_path.read_bytes() == previous
 
-    monkeypatch.setattr(module, "save_state", actual_save)
+    monkeypatch.setattr(module, "save_state_if_unchanged", actual_save)
     assert recover_session(
         vault,
         load_state(state_path),
@@ -762,7 +757,7 @@ def test_stale_base_and_state_write_failure_never_create_remote_lock(tmp_path: P
     with pytest.raises(SyncError) as caught:
         acquire_lock(vault, "machine-a", "0" * 40, state_path=tmp_path / "stale.json")
     assert caught.value.code == "stale_lock_base" and inspect_remote_lock(vault) is None
-    monkeypatch.setattr("grim_dawn_sync.session_lock.save_state", lambda *_: (_ for _ in ()).throw(SyncError("state_write_failed", "x", 6)))
+    monkeypatch.setattr("grim_dawn_sync.session_lock.save_state_if_unchanged", lambda *_: (_ for _ in ()).throw(SyncError("state_write_failed", "x", 6)))
     with pytest.raises(SyncError) as caught:
         acquire_lock(vault, "machine-a", base, state_path=tmp_path / "broken.json")
     assert caught.value.code == "state_write_failed" and inspect_remote_lock(vault) is None
@@ -860,7 +855,9 @@ def test_selection_acquire_cleanup_never_overwrites_later_state(
     assert caught.value.code == "lock_race_cleanup_incomplete" and caught.value.exit_code == 6
     assert load_state(state_path) == changed
     assert inspect_remote_lock(vault) is None
-    assert _git(vault.repo, "tag", "--list", "grim-dawn-sync-*").startswith("grim-dawn-sync-")
+    # Exact ref cleanup happens before the semantic state CAS, so a competing
+    # state is retained without leaving an untracked local session ref.
+    assert _git(vault.repo, "tag", "--list", "grim-dawn-sync-*") == ""
 
 
 def test_simultaneous_acquire_has_exactly_one_winner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1110,6 +1107,114 @@ def test_recovery_handles_already_pushed_commit_for_both_state_phases(
     assert inspect_remote_lock(vault) is None
 
 
+@pytest.mark.parametrize("remote_already_updated", [False, True])
+def test_recovery_push_transition_cas_never_overwrites_foreign_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, remote_already_updated: bool,
+) -> None:
+    import grim_dawn_sync.session_lock as module
+
+    vault, _ = _vaults(tmp_path)
+    base = vault.remote_oid()
+    assert base
+    state_path = tmp_path / "state.json"
+    lock = acquire_lock(vault, "machine-a", base, state_path=state_path)
+    (vault.repo / "cas-race").write_text("new", encoding="utf-8")
+    _git(vault.repo, "add", "cas-race")
+    _git(vault.repo, "commit", "-m", "cas race")
+    local = _git(vault.repo, "rev-parse", "HEAD")
+    state = SyncState(
+        session_id=lock.session.session_id,
+        machine_id="machine-a",
+        base_commit=base,
+        lock_oid=lock.oid,
+        local_tag=lock.local_tag,
+        local_commit=local,
+        phase="committed",
+    )
+    foreign = replace(state, last_applied_manifest_root_hash="f" * 64)
+    save_state(state_path, state)
+    if remote_already_updated:
+        _git(vault.repo, "push", "origin", f"{local}:refs/heads/main")
+    actual_cas = module.save_state_if_unchanged
+    injected = False
+
+    def inject(path: Path, expected: SyncState, replacement: SyncState) -> None:
+        nonlocal injected
+        if replacement.phase == "pushed" and not injected:
+            injected = True
+            save_state(path, foreign)
+        actual_cas(path, expected, replacement)
+
+    monkeypatch.setattr(module, "save_state_if_unchanged", inject)
+    with pytest.raises(SyncError) as caught:
+        recover_session(vault, state, "machine-a", state_path=state_path)
+
+    assert injected
+    assert (caught.value.code, caught.value.exit_code) == ("recovery_state_changed", 6)
+    assert load_state(state_path) == foreign
+    assert vault.remote_oid() == local
+    assert inspect_remote_lock_readonly(vault).oid == lock.oid  # type: ignore[union-attr]
+    assert _git(vault.repo, "rev-parse", f"refs/tags/{lock.local_tag}") == lock.oid
+
+
+def test_missing_remote_lock_completion_cas_retains_foreign_state_and_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import grim_dawn_sync.session_lock as module
+
+    vault, _ = _vaults(tmp_path)
+    base = vault.remote_oid()
+    assert base
+    state_path = tmp_path / "state.json"
+    lock = acquire_lock(vault, "machine-a", base, state_path=state_path)
+    real_run = vault.runner.run
+    deleted = False
+    failed_confirmation = False
+
+    def lose_confirmation(*args, **kwargs):
+        nonlocal deleted, failed_confirmation
+        result = real_run(*args, **kwargs)
+        if args and args[0] == "push" and len(args) > 1 and str(args[1]).startswith("--force-with-lease="):
+            deleted = True
+            return result
+        if deleted and not failed_confirmation and args and args[0] == "ls-remote" and args[-1] == "refs/tags/grim-dawn-sync-active":
+            failed_confirmation = True
+            raise SyncError("git_command_failed", "injected ls-remote failure", 4)
+        return result
+
+    monkeypatch.setattr(vault.runner, "run", lose_confirmation)
+    with pytest.raises(SyncError):
+        release_lock(vault, lock, base, state_path=state_path, confirmed_root_hash="a" * 64)
+    pending = load_state(state_path)
+    assert pending.phase == "release_pending"
+    monkeypatch.setattr(vault.runner, "run", real_run)
+    foreign = replace(pending, last_applied_manifest_root_hash="b" * 64)
+    actual_cas = module.save_state_if_unchanged
+
+    def inject(path: Path, expected: SyncState, replacement: SyncState) -> None:
+        save_state(path, foreign)
+        actual_cas(path, expected, replacement)
+
+    monkeypatch.setattr(module, "save_state_if_unchanged", inject)
+    with pytest.raises(SyncError) as caught:
+        recover_session(vault, pending, "machine-a", state_path=state_path)
+
+    assert (caught.value.code, caught.value.exit_code) == ("recovery_state_changed", 6)
+    assert load_state(state_path) == foreign
+    assert inspect_remote_lock_readonly(vault) is None
+    assert not real_run(
+        "rev-parse", "--verify", "--quiet", f"refs/tags/{lock.local_tag}", check=False,
+    ).stdout.strip()
+
+    monkeypatch.setattr(module, "save_state_if_unchanged", actual_cas)
+    assert recover_session(vault, foreign, "machine-a", state_path=state_path) == "complete"
+    assert load_state(state_path) == SyncState(
+        last_applied_remote_commit=base,
+        last_applied_manifest_root_hash="b" * 64,
+        machine_id="machine-a",
+    )
+
+
 def test_recovery_remote_main_diverged_does_not_mutate_any_ref_or_state(tmp_path: Path) -> None:
     vault, other = _vaults(tmp_path)
     base = vault.remote_oid()
@@ -1179,6 +1284,127 @@ def test_acquire_confirmation_failure_retains_intent_local_tag_and_remote_lock(
     assert inspect_remote_lock(vault).oid == intent.lock_oid  # type: ignore[union-attr]
 
 
+def test_acquire_hard_crash_before_state_persistence_leaves_no_session_ref(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import grim_dawn_sync.session_lock as module
+
+    vault, _ = _vaults(tmp_path); base = vault.remote_oid(); assert base
+    state_path = tmp_path / "state.json"
+    original = SyncState(
+        last_applied_remote_commit="a" * 40,
+        last_applied_manifest_root_hash="b" * 64,
+        machine_id="machine-a",
+    )
+    save_state(state_path, original)
+
+    class HardCrash(BaseException):
+        pass
+
+    monkeypatch.setattr(module, "save_state_if_unchanged", lambda *_args, **_kwargs: (_ for _ in ()).throw(HardCrash()))
+    with pytest.raises(HardCrash):
+        acquire_lock(
+            vault, "machine-a", base, state_path=state_path, expected_pre_state=original,
+        )
+
+    assert load_state(state_path) == original
+    assert not _git(vault.repo, "tag", "--list", "grim-dawn-sync-*")
+    assert inspect_remote_lock(vault) is None
+
+
+@pytest.mark.parametrize("known_baseline", [True, False])
+@pytest.mark.parametrize("cut", ["after_state_before_ref", "push_unapplied"])
+def test_recover_local_only_lock_intent_restores_exact_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, known_baseline: bool, cut: str,
+) -> None:
+    vault, _ = _vaults(tmp_path); base = vault.remote_oid(); assert base
+    state_path = tmp_path / "state.json"
+    original = SyncState(
+        last_applied_remote_commit="a" * 40,
+        last_applied_manifest_root_hash="b" * 64,
+        machine_id="machine-a",
+    ) if known_baseline else SyncState()
+    save_state(state_path, original)
+    real_run = vault.runner.run
+
+    class HardCrash(BaseException):
+        pass
+
+    def fault(*args, **kwargs):
+        if (cut == "after_state_before_ref" and args and args[0] == "update-ref"
+                and len(args) > 1 and str(args[1]).startswith("refs/tags/grim-dawn-sync-")):
+            raise HardCrash()
+        if (cut == "push_unapplied" and args and args[0] == "push"
+                and str(args[-1]).endswith(":refs/tags/grim-dawn-sync-active")):
+            return GitResult(tuple(args), "", "injected unapplied lock push", 1)
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(vault.runner, "run", fault)
+    if cut == "after_state_before_ref":
+        with pytest.raises(HardCrash):
+            acquire_lock(vault, "machine-a", base, state_path=state_path, expected_pre_state=original)
+    else:
+        with pytest.raises(SyncError) as caught:
+            acquire_lock(vault, "machine-a", base, state_path=state_path, expected_pre_state=original)
+        assert caught.value.code == "lock_push_unknown" and caught.value.exit_code == 6
+    pending = load_state(state_path)
+    assert pending.phase == "lock_held"
+    assert pending.last_applied_remote_commit == original.last_applied_remote_commit
+    assert pending.last_applied_manifest_root_hash == original.last_applied_manifest_root_hash
+    local_ref = f"refs/tags/{pending.local_tag}"
+    if cut == "after_state_before_ref":
+        assert not real_run("rev-parse", "--verify", "--quiet", local_ref, check=False).stdout.strip()
+    else:
+        assert real_run("rev-parse", local_ref).stdout.strip() == pending.lock_oid
+    monkeypatch.setattr(vault.runner, "run", real_run)
+
+    assert inspect_remote_lock(vault) is None
+    assert recover_session(vault, pending, "machine-a", state_path=state_path) == "lock_not_acquired"
+    assert load_state(state_path) == original
+    assert vault.remote_oid() == base
+    assert _git(vault.repo, "rev-parse", "HEAD") == base
+    assert not real_run("rev-parse", "--verify", "--quiet", local_ref, check=False).stdout.strip()
+
+
+def test_local_only_lock_cleanup_delete_cas_refuses_post_validation_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vault, _ = _vaults(tmp_path); base = vault.remote_oid(); assert base
+    state_path = tmp_path / "state.json"; original = SyncState(); save_state(state_path, original)
+    real_run = vault.runner.run
+
+    def suppress_push(*args, **kwargs):
+        if args and args[0] == "push" and str(args[-1]).endswith(":refs/tags/grim-dawn-sync-active"):
+            return GitResult(tuple(args), "", "injected", 1)
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(vault.runner, "run", suppress_push)
+    with pytest.raises(SyncError):
+        acquire_lock(vault, "machine-a", base, state_path=state_path, expected_pre_state=original)
+    pending = load_state(state_path); ref = f"refs/tags/{pending.local_tag}"
+    monkeypatch.setattr(vault.runner, "run", real_run)
+    foreign_oid = ""; swapped = False
+
+    def swap_at_delete(*args, **kwargs):
+        nonlocal foreign_oid, swapped
+        if args[:3] == ("update-ref", "-d", ref) and not swapped:
+            swapped = True
+            _git(vault.repo, "tag", "-d", pending.local_tag)
+            _git(vault.repo, "tag", "-a", pending.local_tag, base, "-m", "foreign lock")
+            foreign_oid = _git(vault.repo, "rev-parse", ref)
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(vault.runner, "run", swap_at_delete)
+    with pytest.raises(SyncError) as caught:
+        recover_session(vault, pending, "machine-a", state_path=state_path)
+
+    assert swapped and foreign_oid != pending.lock_oid
+    assert (caught.value.code, caught.value.exit_code) == ("recovery_local_tag_mismatch", 6)
+    assert load_state(state_path) == pending
+    assert _git(vault.repo, "rev-parse", ref) == foreign_oid
+    assert inspect_remote_lock(vault) is None
+
+
 def test_release_local_tag_cleanup_failure_is_exit6_and_keeps_pending_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1188,9 +1414,10 @@ def test_release_local_tag_cleanup_failure_is_exit6_and_keeps_pending_state(
     state_path = tmp_path / "state.json"
     lock = acquire_lock(vault, "machine-a", base, state_path=state_path)
     original = vault.runner.run
+    ref = f"refs/tags/{lock.local_tag}"
 
     def fail_local_delete(*args, **kwargs):
-        if args[:2] == ("tag", "-d"):
+        if args[:3] == ("update-ref", "-d", ref):
             return GitResult(tuple(args), "", "injected local cleanup failure", 1)
         return original(*args, **kwargs)
 
@@ -1206,6 +1433,39 @@ def test_release_local_tag_cleanup_failure_is_exit6_and_keeps_pending_state(
     assert _git(vault.repo, "rev-parse", "--verify", f"refs/tags/{lock.local_tag}") == lock.oid
 
 
+def test_release_local_tag_cleanup_cas_refuses_post_validation_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vault, _ = _vaults(tmp_path)
+    base = vault.remote_oid()
+    assert base
+    state_path = tmp_path / "state.json"
+    lock = acquire_lock(vault, "machine-a", base, state_path=state_path)
+    real_run = vault.runner.run
+    ref = f"refs/tags/{lock.local_tag}"
+    swapped = False
+    foreign_oid = ""
+
+    def swap_at_delete(*args, **kwargs):
+        nonlocal swapped, foreign_oid
+        if args[:3] == ("update-ref", "-d", ref) and not swapped:
+            swapped = True
+            _git(vault.repo, "tag", "-d", lock.local_tag)
+            _git(vault.repo, "tag", "-a", lock.local_tag, base, "-m", "foreign lock")
+            foreign_oid = _git(vault.repo, "rev-parse", ref)
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(vault.runner, "run", swap_at_delete)
+    with pytest.raises(SyncError) as caught:
+        release_lock(vault, lock, base, state_path=state_path)
+
+    assert swapped and foreign_oid != lock.oid
+    assert (caught.value.code, caught.value.exit_code) == ("recovery_local_tag_mismatch", 6)
+    assert load_state(state_path).phase == "release_pending"
+    assert inspect_remote_lock_readonly(vault) is None
+    assert _git(vault.repo, "rev-parse", ref) == foreign_oid
+
+
 def test_release_final_state_failure_retains_root_hash_and_recovers_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1217,17 +1477,17 @@ def test_release_final_state_failure_retains_root_hash_and_recovers_once(
     root_hash = "f" * 64
     state_path = tmp_path / "state.json"
     lock = acquire_lock(vault, "machine-a", base, state_path=state_path)
-    actual_save_state = module.save_state
+    actual_save_state = module.save_state_if_unchanged
     writes = 0
 
-    def fail_final_write(path: Path, state: SyncState) -> None:
+    def fail_final_write(path: Path, expected: SyncState, state: SyncState) -> None:
         nonlocal writes
         writes += 1
         if writes == 2:
             raise SyncError("state_write_failed", "injected final write failure", 6)
-        actual_save_state(path, state)
+        actual_save_state(path, expected, state)
 
-    monkeypatch.setattr(module, "save_state", fail_final_write)
+    monkeypatch.setattr(module, "save_state_if_unchanged", fail_final_write)
     with pytest.raises(SyncError) as caught:
         release_lock(
             vault,
@@ -1238,13 +1498,13 @@ def test_release_final_state_failure_retains_root_hash_and_recovers_once(
         )
 
     pending = load_state(state_path)
-    assert caught.value.code == "state_write_failed"
+    assert caught.value.code == "recovery_state_changed"
     assert pending.phase == "release_pending"
     assert pending.pushed_commit == base
     assert pending.last_applied_manifest_root_hash == root_hash
     assert inspect_remote_lock(vault) is None
 
-    monkeypatch.setattr(module, "save_state", actual_save_state)
+    monkeypatch.setattr(module, "save_state_if_unchanged", actual_save_state)
     assert recover_session(vault, pending, "machine-a", state_path=state_path) == "complete"
     complete = load_state(state_path)
     assert complete.phase is None

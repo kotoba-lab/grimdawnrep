@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from grim_dawn_sync.config import parse_config
-from grim_dawn_sync.bookmarks import create_bookmark
+from grim_dawn_sync.bookmarks import _create_bookmark_test_only
 from grim_dawn_sync.errors import EXIT_RECOVERY_REQUIRED, SyncError
 from grim_dawn_sync.git_vault import GitVault
 from grim_dawn_sync.manifest import stable_manifest
@@ -160,7 +160,7 @@ def test_stale_live_remote_and_lock_stop_before_workflow_mutation(tmp_path: Path
 
 def test_history_and_managed_bookmark_targets_pass_isolated_restore_inspection(tmp_path: Path) -> None:
     publisher, adapters, config, local, base = _environment(tmp_path)
-    create_bookmark(publisher, base, display_name="Known old save", note="restore drill", created_by="publisher")
+    _create_bookmark_test_only(publisher, base, display_name="Known old save", note="restore drill", created_by="publisher")
     changed = save(tmp_path / "remote-new", b"remote")
     remote = publisher.snapshot(changed, machine_id="publisher", session_id="remote", validator=valid); publisher.push(remote)
     catalog = VersionCatalogBuilder(adapters.vault, config.save_root, machine_id=config.machine_id).build()
@@ -182,7 +182,7 @@ def test_history_or_managed_bookmark_promote_preserves_losers_and_reaches_clean_
     tmp_path: Path, selected_kind: str,
 ) -> None:
     publisher, adapters, config, local, base = _environment(tmp_path)
-    create_bookmark(publisher, base, display_name="Selected retained base", note=None, created_by="publisher")
+    _create_bookmark_test_only(publisher, base, display_name="Selected retained base", note=None, created_by="publisher")
     remote_source = save(tmp_path / "remote-new", b"remote-loser")
     displaced_remote = publisher.snapshot(remote_source, machine_id="publisher", session_id="remote", validator=valid)
     publisher.push(displaced_remote)
@@ -285,7 +285,20 @@ def test_real_recover_after_apply_failure_keeps_selected_live_and_clean_state(tm
         LaunchWorkflow(config, local, adapters=adapters).execute_selection_plan(plan, registry)
     assert caught.value.code == "restore_apply_failed" and caught.value.exit_code == EXIT_RECOVERY_REQUIRED
     assert (config.save_root / "main/a/player.gdc").read_bytes() == b"remote"
-    assert _recover_real(adapters, local) == "abandoned_lock_released"
+    pending = load_state(local / "state.json")
+    original = SyncState(
+        last_applied_remote_commit=pending.last_applied_remote_commit,
+        last_applied_manifest_root_hash=pending.last_applied_manifest_root_hash,
+        machine_id=pending.machine_id,
+    )
+    assert recover_session(
+        adapters.vault, pending, adapters.config.machine_id, state_path=local / "state.json",
+    ) == "abandoned_lock_released"
+    assert load_state(local / "state.json") == original
+    assert inspect_remote_lock_readonly(adapters.vault) is None
+    adapters.vault.fetch()
+    assert adapters.vault.reconcile().relation == "equal"
+    assert (config.save_root / "main/a/player.gdc").read_bytes() == b"remote"
 
 
 def test_real_recover_confirms_ambiguous_snapshot_push_and_clears_lock(tmp_path: Path) -> None:

@@ -9,7 +9,7 @@ import time
 
 import pytest
 
-from grim_dawn_sync.bookmarks import create_bookmark
+from grim_dawn_sync.bookmarks import _create_bookmark_test_only
 from grim_dawn_sync.errors import SyncError
 from grim_dawn_sync.git_vault import GitResult, GitRunner, GitVault
 from grim_dawn_sync.version_catalog import VersionCatalogBuilder
@@ -87,7 +87,7 @@ def test_catalog_validates_each_commit_and_shared_blob_once(tmp_path: Path) -> N
     vault.push(first)
     second = vault.snapshot(source, machine_id="a", session_id="second", validator=valid)
     vault.push(second)
-    create_bookmark(vault, first, display_name="same commit", note=None, created_by="a")
+    _create_bookmark_test_only(vault, first, display_name="same commit", note=None, created_by="a")
     git(clone, "tag", "-a", "archive/same-commit", first, "-m", "legacy")
 
     vault.runner.commands.clear()

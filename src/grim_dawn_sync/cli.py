@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import os
@@ -23,6 +23,7 @@ from grim_dawn_sync.workflow import LaunchWorkflow
 from grim_dawn_sync.shortcut import install_shortcut, migrate_shortcut
 from grim_dawn_sync.git_vault import GitVault
 from grim_dawn_sync.session_lock import (
+    LOCK_REF,
     acquire_lock,
     inspect_remote_lock_readonly,
     mark_bootstrap_live_applied,
@@ -32,11 +33,11 @@ from grim_dawn_sync.session_lock import (
     release_lock,
 )
 from grim_dawn_sync.snapshot import _copy_verified, restore_from_directory
-from grim_dawn_sync.state import SyncState, load_state, save_state
+from grim_dawn_sync.state import SyncState, load_state, save_state_if_unchanged
 from grim_dawn_sync.process_monitor import ProcessMonitor, WindowsProcessMonitor
 from grim_dawn_sync.validation import validate_players
 from grim_dawn_sync.version_catalog import VersionCatalogBuilder
-from grim_dawn_sync.bookmarks import create_bookmark, create_live_bookmark_locked, make_bookmark_annotation
+from grim_dawn_sync.bookmarks import create_commit_bookmark_locked, create_live_bookmark_locked, make_bookmark_annotation
 from grim_dawn_sync.selection import (
     CancelledSelection,
     ReconcileCase,
@@ -233,7 +234,23 @@ def bookmark(config_path: Path, candidate_id: str, name: str, note: str | None, 
             validator=validate_players, before_lock=before_lock, after_lock=after_lock,
         )
     else:
-        create_bookmark(vault, candidate.commit, display_name=name, note=note, created_by=config.machine_id)
+        if catalog.remote_head is None:
+            raise SyncError("remote_main_missing", "Remote main is missing; no bookmark was created.", 3)
+
+        def before_lock() -> None:
+            _assert_capability_boundary(config_path, config, state, catalog, projection)
+
+        def after_lock() -> None:
+            _process_preflight(config)
+            if load_config(config_path).public_dict() != config.public_dict():
+                raise SyncError("catalog_context_changed", "Configuration changed during bookmark creation.", 3)
+
+        create_commit_bookmark_locked(
+            vault, candidate.commit, candidate.root_hash,
+            state_path=_state_path(config_path), expected_remote_head=catalog.remote_head,
+            display_name=name, note=note, created_by=config.machine_id,
+            before_lock=before_lock, after_lock=after_lock,
+        )
     return {"schema_version": "1.0.0", "command": "bookmark", "dry_run": False, "created": True}
 
 
@@ -241,10 +258,18 @@ _REMOTE_REF_SNAPSHOT_MAX_BYTES = 256 * 1024
 _REMOTE_REF_SNAPSHOT_MAX_ROWS = 500
 
 
-def _remote_ref_snapshot(vault: GitVault) -> str:
-    """Hash the bounded remote refs that can affect selection semantics."""
+@dataclass(frozen=True)
+class _ExecutionRefSnapshot:
+    remote_head: str | None
+    lock_oid: str | None
+    remote_ref_snapshot: str
+
+
+def _execution_ref_snapshot(vault: GitVault) -> _ExecutionRefSnapshot:
+    """Read every execution-sensitive remote ref in one bounded exact query."""
     result = vault.runner.run(
         "ls-remote", vault.remote, vault.remote_head,
+        LOCK_REF,
         "refs/tags/grim-dawn-save-*", "refs/tags/archive/*", "refs/tags/milestone/*",
         check=False,
     )
@@ -261,6 +286,7 @@ def _remote_ref_snapshot(vault: GitVault) -> str:
         base = ref[:-3] if ref.endswith("^{}") else ref
         allowed = (
             ref == vault.remote_head
+            or base == LOCK_REF
             or re.fullmatch(r"refs/tags/grim-dawn-save-[0-9a-f]{32}", base) is not None
             or re.fullmatch(r"refs/tags/(?:archive|milestone)/[^\x00-\x1f]+", base) is not None
         )
@@ -275,8 +301,14 @@ def _remote_ref_snapshot(vault: GitVault) -> str:
         rows.append((ref, oid))
         if len(rows) > _REMOTE_REF_SNAPSHOT_MAX_ROWS:
             raise SyncError("catalog_ref_snapshot_failed", "Remote save-version ref count exceeded its safe bound.", 4)
-    canonical = "".join(f"{ref}\t{oid}\n" for ref, oid in sorted(rows))
-    return hashlib.sha256(canonical.encode("utf-8", "surrogatepass")).hexdigest()
+    if any(ref.endswith("^{}") and ref[:-3] not in seen for ref in seen):
+        raise SyncError("catalog_ref_snapshot_invalid", "Remote save-version refs were malformed.", 4)
+    remote_head = next((oid for ref, oid in rows if ref == vault.remote_head), None)
+    lock_oid = next((oid for ref, oid in rows if ref == LOCK_REF), None)
+    semantic_rows = ((ref, oid) for ref, oid in rows if ref not in {LOCK_REF, f"{LOCK_REF}^{{}}"})
+    canonical = "".join(f"{ref}\t{oid}\n" for ref, oid in sorted(semantic_rows))
+    digest = hashlib.sha256(canonical.encode("utf-8", "surrogatepass")).hexdigest()
+    return _ExecutionRefSnapshot(remote_head, lock_oid, digest)
 
 
 def _execution_context_projection(config: Any, state: SyncState, *, remote_identity: tuple[str, str],
@@ -295,21 +327,6 @@ def _execution_context_projection(config: Any, state: SyncState, *, remote_ident
     }
 
 
-def _remote_lock_snapshot(vault: GitVault) -> str | None:
-    """Read only the active-lock ref; the annotated OID binds its full payload."""
-    lock_ref = "refs/tags/grim-dawn-sync-active"
-    result = vault.runner.run("ls-remote", "--refs", vault.remote, lock_ref, check=False)
-    rows = [row.split("\t") for row in result.stdout.splitlines() if row]
-    if (
-        result.returncode
-        or len(rows) > 1
-        or (rows and (len(rows[0]) != 2 or rows[0][1] != lock_ref
-                      or re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", rows[0][0]) is None))
-    ):
-        raise SyncError("catalog_lock_snapshot_invalid", "Remote save-sync lock could not be verified.", 4)
-    return rows[0][0] if rows else None
-
-
 def _capture_catalog(config_path: Path, expected_config: Any) -> tuple[GitVault, Any, SyncState, dict[str, Any]]:
     _process_preflight(expected_config)
     current_config = load_config(config_path)
@@ -319,10 +336,10 @@ def _capture_catalog(config_path: Path, expected_config: Any) -> tuple[GitVault,
     if state.phase is not None:
         raise SyncError("recovery_required", "Recovery state exists; run recover before selecting a save.", 6)
     vault = _vault(current_config)
-    if inspect_remote_lock_readonly(vault) is not None:
+    remote_snapshot = _execution_ref_snapshot(vault)
+    if remote_snapshot.lock_oid is not None:
         raise SyncError("lock_held", "Another save-sync session is active; no selection was made.", 3)
     remote_identity = read_remote_identity(vault, current_config.remote)
-    remote_refs = _remote_ref_snapshot(vault)
     catalog = VersionCatalogBuilder(
         vault, current_config.save_root, machine_id=current_config.machine_id,
         retries=current_config.stable_scan_retries, window_seconds=current_config.stable_window_seconds,
@@ -333,27 +350,28 @@ def _capture_catalog(config_path: Path, expected_config: Any) -> tuple[GitVault,
     _process_preflight(expected_config)
     after_config = load_config(config_path)
     after_state = load_state(_state_path(config_path))
+    after_remote_snapshot = _execution_ref_snapshot(vault)
     if (
         after_config.public_dict() != current_config.public_dict()
         or after_state.as_dict() != state.as_dict()
-        or inspect_remote_lock_readonly(vault) is not None
+        or after_remote_snapshot.lock_oid is not None
     ):
         raise SyncError("catalog_context_changed", "Save selection context changed during verification; reload versions.", 3)
     if read_remote_identity(vault, current_config.remote) != remote_identity:
         raise SyncError("catalog_context_changed", "Remote identity changed during verification; reload versions.", 3)
-    if _remote_ref_snapshot(vault) != remote_refs:
+    if after_remote_snapshot != remote_snapshot:
         raise SyncError("catalog_context_changed", "Remote save-version refs changed during verification; reload versions.", 3)
     manifest = stable_manifest(
         current_config.save_root, machine_id=current_config.machine_id,
         retries=current_config.stable_scan_retries, window_seconds=current_config.stable_window_seconds,
     )
-    if manifest.get("root_hash") != catalog.live_root_hash or vault.remote_oid() != catalog.remote_head:
+    if manifest.get("root_hash") != catalog.live_root_hash or after_remote_snapshot.remote_head != catalog.remote_head:
         raise SyncError("catalog_context_changed", "Live or remote save data changed during verification; reload versions.", 3)
     projection = safety_projection(current_config, state, catalog, remote_identity=remote_identity)
     projection["execution_context"] = _execution_context_projection(
         current_config, state, remote_identity=remote_identity,
         live_root_hash=catalog.live_root_hash, remote_head=catalog.remote_head,
-        remote_ref_snapshot=remote_refs,
+        remote_ref_snapshot=remote_snapshot.remote_ref_snapshot,
     )
     return vault, catalog, state, projection
 
@@ -369,9 +387,11 @@ def _fresh_catalog(config_path: Path, config: Any, *, supplied_token: str | None
     return vault, catalog, state, projection
 
 
-def _locked_state(expected_config: Any, lock: Any) -> SyncState:
+def _locked_state(expected_config: Any, lock: Any, expected_state: SyncState) -> SyncState:
     try:
         return SyncState(
+            last_applied_remote_commit=expected_state.last_applied_remote_commit,
+            last_applied_manifest_root_hash=expected_state.last_applied_manifest_root_hash,
             session_id=lock.session.session_id,
             machine_id=expected_config.machine_id,
             base_commit=lock.session.base_commit,
@@ -389,25 +409,25 @@ def _capture_execution_context_once(config_path: Path, expected_config: Any, exp
     _process_preflight(expected_config)
     current_config = load_config(config_path)
     current_state = load_state(_state_path(config_path))
-    required_state = expected_state if acquired_lock is None else _locked_state(expected_config, acquired_lock)
+    required_state = expected_state if acquired_lock is None else _locked_state(expected_config, acquired_lock, expected_state)
     if current_config.public_dict() != expected_config.public_dict() or current_state.as_dict() != required_state.as_dict():
         raise SyncError("catalog_context_changed", "Selection context changed before lock acquisition.", 3)
     if acquired_lock is None and current_state.phase is not None:
         raise SyncError("recovery_required", "Recovery state exists; run recover before selecting a save.", 6)
-    observed_lock = _remote_lock_snapshot(vault)
+    remote_snapshot = _execution_ref_snapshot(vault)
+    observed_lock = remote_snapshot.lock_oid
     expected_lock_oid = None if acquired_lock is None else str(acquired_lock.oid)
     if observed_lock != expected_lock_oid:
         raise SyncError("lock_held", "Another save-sync session is active; no selection was made.", 3)
     remote_identity = read_remote_identity(vault, current_config.remote)
-    remote_refs = _remote_ref_snapshot(vault)
     manifest = stable_manifest(
         current_config.save_root, machine_id=current_config.machine_id,
         retries=current_config.stable_scan_retries, window_seconds=current_config.stable_window_seconds,
     )
     return _execution_context_projection(
         current_config, expected_state, remote_identity=remote_identity,
-        live_root_hash=str(manifest.get("root_hash")), remote_head=vault.remote_oid(),
-        remote_ref_snapshot=remote_refs,
+        live_root_hash=str(manifest.get("root_hash")), remote_head=remote_snapshot.remote_head,
+        remote_ref_snapshot=remote_snapshot.remote_ref_snapshot,
     )
 
 
@@ -591,8 +611,23 @@ def _execute_selection_command(
                     validator=validate_players, before_lock=before_lock, after_lock=after_lock,
                 )
             else:
-                create_bookmark(vault, candidate.commit, display_name=request.display_name,
-                                note=request.note, created_by=config.machine_id)
+                if catalog.remote_head is None:
+                    raise SyncError("remote_main_missing", "Remote main is missing; no bookmark was created.", 3)
+
+                def before_lock() -> None:
+                    _assert_capability_boundary(config_path, config, state, catalog, projection)
+
+                def after_lock() -> None:
+                    _process_preflight(config)
+                    if load_config(config_path).public_dict() != config.public_dict():
+                        raise SyncError("catalog_context_changed", "Configuration changed during bookmark creation.", 3)
+
+                create_commit_bookmark_locked(
+                    vault, candidate.commit, candidate.root_hash,
+                    state_path=_state_path(config_path), expected_remote_head=catalog.remote_head,
+                    display_name=request.display_name, note=request.note, created_by=config.machine_id,
+                    before_lock=before_lock, after_lock=after_lock,
+                )
             return {"schema_version": "1.0.0", "command": command, "result": {"state": "BOOKMARKED"}}
         remote_identity = (
             str(projection["config"]["remote_fetch_url"]),
@@ -609,13 +644,14 @@ def _execute_selection_command(
             verify_capability(catalog.token, projection)
             if context_digest(fresh_context) != expected:
                 raise SyncError("catalog_context_changed", "Selection context changed before lock acquisition.", 3)
-        def revalidate_after_lock(expected: str, lock: Any) -> None:
+        def revalidate_after_lock(expected: str, lock: Any) -> dict[str, Any]:
             fresh_context = _capture_execution_context(
                 config_path, config, state, vault, acquired_lock=lock,
             )
             verify_capability(catalog.token, projection)
             if context_digest(fresh_context) != expected:
                 raise SyncError("catalog_context_changed", "Selection context changed across lock acquisition.", 3)
+            return fresh_context
         setattr(revalidate_context, "after_lock", revalidate_after_lock)
         setattr(revalidate_context, "expected_pre_state", state)
         try:
@@ -795,6 +831,14 @@ def restore(config_path: Path, commit: str, *, apply: bool, drill: bool = False)
 def snapshot(config_path: Path) -> dict[str, Any]:
     config = load_config(config_path); vault = _vault(config); state_path = _state_path(config_path)
     _process_preflight(config)
+    original = load_state(state_path)
+    if (
+        original.phase is not None
+        or original.machine_id != config.machine_id
+        or original.last_applied_remote_commit is None
+        or original.last_applied_manifest_root_hash is None
+    ):
+        raise SyncError("snapshot_state_invalid", "Snapshot requires an inactive enrolled baseline.", 6)
     # Preserve the exact live tree before Git/lock operations.  A later push or
     # release failure therefore always leaves a local, verified recovery copy.
     manifest = stable_manifest(config.save_root, machine_id=config.machine_id, retries=config.stable_scan_retries, window_seconds=config.stable_window_seconds)
@@ -809,10 +853,15 @@ def snapshot(config_path: Path) -> dict[str, Any]:
     if status_value.relation in {"ahead", "diverged", "unborn"}: raise SyncError("vault_not_reconciled", "Vault must be synchronized before snapshot.", 4)
     base = vault.remote_oid()
     if not base: raise SyncError("remote_main_missing", "Remote main is missing; run bootstrap first.", 4)
-    lock = acquire_lock(vault, config.machine_id, base, state_path=state_path)
+    lock = acquire_lock(
+        vault, config.machine_id, base,
+        state_path=state_path, expected_pre_state=original,
+    )
+    locked = load_state(state_path)
     oid = vault.snapshot(config.save_root, machine_id=config.machine_id, session_id=lock.session.session_id, expected_manifest=manifest, retries=config.stable_scan_retries, window_seconds=config.stable_window_seconds)
-    save_state(state_path, SyncState(last_applied_manifest_root_hash=manifest["root_hash"], session_id=lock.session.session_id, machine_id=lock.session.machine_id, base_commit=lock.session.base_commit, lock_oid=lock.oid, local_tag=lock.local_tag, phase="committed", local_commit=oid))
-    pushed = vault.push(oid); release_lock(vault, lock, pushed, state_path=state_path, confirmed_root_hash=manifest["root_hash"])
+    committed = SyncState(last_applied_manifest_root_hash=manifest["root_hash"], session_id=lock.session.session_id, machine_id=lock.session.machine_id, base_commit=lock.session.base_commit, lock_oid=lock.oid, local_tag=lock.local_tag, phase="committed", local_commit=oid)
+    save_state_if_unchanged(state_path, locked, committed)
+    pushed = vault.push(oid); release_lock(vault, lock, pushed, state_path=state_path, confirmed_root_hash=manifest["root_hash"], expected_state=committed)
     return {"schema_version":"1.0.0", "command":"snapshot", "commit":pushed, "root_hash": manifest["root_hash"]}
 
 
@@ -1026,9 +1075,15 @@ def enroll(config_path: Path, *, apply: bool) -> dict[str, Any]:
         raise SyncError("enroll_live_mismatch", "Live save did not match remote snapshot.", 6)
     if vault.remote_oid() != remote or inspect_remote_lock_readonly(vault) is not None:
         raise SyncError("enroll_remote_changed", "Remote changed or became locked before state was saved.", 4)
-    save_state(state_path, SyncState(last_applied_remote_commit=remote,
-                                     last_applied_manifest_root_hash=root_hash,
-                                     machine_id=config.machine_id))
+    # First enrollment is a create-only semantic transition from the canonical
+    # missing/empty state, so a concurrent local writer cannot be overwritten.
+    save_state_if_unchanged(
+        state_path,
+        SyncState(),
+        SyncState(last_applied_remote_commit=remote,
+                  last_applied_manifest_root_hash=root_hash,
+                  machine_id=config.machine_id),
+    )
     return {"schema_version": "1.0.0", "command": "enroll", "dry_run": False,
             "commit": remote, "root_hash": root_hash, "idempotent": False}
 

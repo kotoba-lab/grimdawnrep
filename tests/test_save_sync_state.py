@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from grim_dawn_sync.errors import EXIT_RECOVERY_REQUIRED, SyncError
-from grim_dawn_sync.state import SyncState, load_state, parse_state, save_state
+from grim_dawn_sync.state import SyncState, load_state, parse_state, save_state, save_state_if_unchanged
 
 
 def _active(**changes: str | None) -> SyncState:
@@ -41,6 +41,24 @@ def test_legacy_state_loads_and_is_upgraded_on_next_save(tmp_path: Path) -> None
     )
     save_state(path, loaded)
     assert set(json.loads(path.read_text(encoding="utf-8"))) == set(loaded.as_dict())
+
+
+def test_missing_state_is_empty_only_for_semantic_cas(tmp_path: Path) -> None:
+    path = tmp_path / "state.json"
+    active = _active()
+    save_state_if_unchanged(path, SyncState(), active)
+    assert load_state(path) == active
+
+    other = tmp_path / "other.json"
+    known = SyncState(
+        last_applied_remote_commit="a" * 40,
+        last_applied_manifest_root_hash="b" * 64,
+        machine_id="machine",
+    )
+    with pytest.raises(SyncError) as caught:
+        save_state_if_unchanged(other, known, active)
+    assert caught.value.code == "selection_stale"
+    assert not other.exists()
 
 
 @pytest.mark.parametrize(

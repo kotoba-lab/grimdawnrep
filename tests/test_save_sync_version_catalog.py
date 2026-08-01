@@ -51,8 +51,8 @@ def test_catalog_lists_distinct_legacy_annotated_tag_read_only(tmp_path: Path) -
 def test_same_root_keeps_remote_and_named_bookmark_as_selectable_aliases(tmp_path: Path) -> None:
     _, one, _ = clone_pair(tmp_path); source = save(tmp_path / "source", b"same"); vault = GitVault(one)
     commit = vault.snapshot(source, machine_id="a", session_id="same", validator=valid); vault.push(commit)
-    from grim_dawn_sync.bookmarks import create_bookmark
-    made = create_bookmark(vault, commit, display_name="Named immediately", note="keep this", created_by="a")
+    from grim_dawn_sync.bookmarks import _create_bookmark_test_only
+    made = _create_bookmark_test_only(vault, commit, display_name="Named immediately", note="keep this", created_by="a")
     catalog = VersionCatalogBuilder(vault, source, machine_id="a").build()
     assert len(catalog.candidates) == 1 and catalog.candidates[0].kind == "live"
     aliases = catalog.candidates[0].aliases

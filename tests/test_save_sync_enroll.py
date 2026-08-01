@@ -50,21 +50,27 @@ def test_enroll_apply_existing_different_live_never_extract_or_write_state(monke
     monkeypatch.setattr(cli, "load_state", lambda _: (_ for _ in ()).throw(SyncError("state_missing", "x", 6)))
     monkeypatch.setattr(cli, "stable_manifest", lambda *_a, **_k: {"root_hash": "c" * 64})
     monkeypatch.setattr(cli, "validate_players", lambda *_a: {"ok": True})
-    monkeypatch.setattr(cli, "save_state", lambda *_a: saved.append(True))
+    monkeypatch.setattr(cli, "save_state_if_unchanged", lambda *_a: saved.append(True))
     with pytest.raises(SyncError) as caught: cli.enroll(tmp_path / "config.local.json", apply=True)
     assert caught.value.code == "enroll_live_conflict" and "extract" not in vault.calls and saved == []
 
 
 def test_enroll_existing_matching_live_persists_complete_baseline(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    vault = Vault(); config = _config(tmp_path); config.save_root.mkdir(); saved: list[SyncState] = []
+    vault = Vault(); config = _config(tmp_path); config.save_root.mkdir(); saved: list[tuple[SyncState, SyncState]] = []
     monkeypatch.setattr(cli, "load_config", lambda _: config); monkeypatch.setattr(cli, "_vault", lambda _: vault)
     monkeypatch.setattr(cli, "inspect_remote_lock_readonly", lambda _: None); monkeypatch.setattr(cli, "_process_preflight", lambda _: None)
     monkeypatch.setattr(cli, "load_state", lambda _: (_ for _ in ()).throw(SyncError("state_missing", "x", 6)))
     monkeypatch.setattr(cli, "stable_manifest", lambda *_a, **_k: {"root_hash": ROOT, "file_count": 1})
     monkeypatch.setattr(cli, "validate_players", lambda *_a: {"ok": True})
-    monkeypatch.setattr(cli, "save_state", lambda _p, state: saved.append(state))
+    monkeypatch.setattr(
+        cli, "save_state_if_unchanged",
+        lambda _p, expected, state: saved.append((expected, state)),
+    )
     assert cli.enroll(tmp_path / "config.local.json", apply=True)["idempotent"] is False
-    assert saved == [SyncState(last_applied_remote_commit=OID, last_applied_manifest_root_hash=ROOT, machine_id="terminal-b")]
+    assert saved == [(
+        SyncState(),
+        SyncState(last_applied_remote_commit=OID, last_applied_manifest_root_hash=ROOT, machine_id="terminal-b"),
+    )]
 
 
 def test_enroll_idempotent_requires_matching_live_and_never_writes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -74,7 +80,7 @@ def test_enroll_idempotent_requires_matching_live_and_never_writes(monkeypatch: 
     monkeypatch.setattr(cli, "load_state", lambda _: SyncState(last_applied_remote_commit=OID, last_applied_manifest_root_hash=ROOT, machine_id="terminal-b"))
     monkeypatch.setattr(cli, "stable_manifest", lambda *_a, **_k: {"root_hash": ROOT, "file_count": 1})
     monkeypatch.setattr(cli, "validate_players", lambda *_a: {"ok": True})
-    monkeypatch.setattr(cli, "save_state", lambda *_a: writes.append(True))
+    monkeypatch.setattr(cli, "save_state_if_unchanged", lambda *_a: writes.append(True))
     assert cli.enroll(tmp_path / "config.local.json", apply=True)["idempotent"] is True
     assert writes == [] and "extract" not in vault.calls
 
@@ -116,7 +122,7 @@ def test_enroll_remote_race_before_state_save_leaves_state_unwritten(monkeypatch
     monkeypatch.setattr(cli, "inspect_remote_lock_readonly", lambda _: None); monkeypatch.setattr(cli, "_process_preflight", lambda _: None)
     monkeypatch.setattr(cli, "load_state", lambda _: (_ for _ in ()).throw(SyncError("state_missing", "x", 6)))
     monkeypatch.setattr(cli, "stable_manifest", lambda *_a, **_k: {"root_hash": ROOT, "file_count": 1})
-    monkeypatch.setattr(cli, "validate_players", lambda *_a: {"ok": True}); monkeypatch.setattr(cli, "save_state", lambda *_a: writes.append(True))
+    monkeypatch.setattr(cli, "validate_players", lambda *_a: {"ok": True}); monkeypatch.setattr(cli, "save_state_if_unchanged", lambda *_a: writes.append(True))
     with pytest.raises(SyncError) as caught: cli.enroll(tmp_path / "config.local.json", apply=True)
     assert caught.value.code == "enroll_remote_changed" and writes == []
 
@@ -132,7 +138,7 @@ def test_enroll_apply_requires_local_head_after_fast_forward(monkeypatch: pytest
 
 
 def test_enroll_missing_live_extracts_restores_then_saves_baseline(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    vault = Vault(); config = _config(tmp_path); saved: list[SyncState] = []
+    vault = Vault(); config = _config(tmp_path); saved: list[tuple[SyncState, SyncState]] = []
     def extract(_commit: str, destination: Path, **_kw: object) -> None:
         vault.calls.append("extract"); destination.mkdir()
     vault.extract_save = extract  # type: ignore[method-assign]
@@ -142,14 +148,20 @@ def test_enroll_missing_live_extracts_restores_then_saves_baseline(monkeypatch: 
     monkeypatch.setattr(cli, "stable_manifest", lambda *_a, **_k: {"root_hash": ROOT, "file_count": 1})
     monkeypatch.setattr(cli, "validate_players", lambda *_a: {"ok": True})
     monkeypatch.setattr(cli, "restore_from_directory", lambda _src, live, *_a, **_k: (live.mkdir(), {"root_hash": ROOT})[1])
-    monkeypatch.setattr(cli, "save_state", lambda _p, state: saved.append(state))
+    monkeypatch.setattr(
+        cli, "save_state_if_unchanged",
+        lambda _p, expected, state: saved.append((expected, state)),
+    )
     result = cli.enroll(tmp_path / "state" / "config.local.json", apply=True)
     assert result["idempotent"] is False and vault.calls.count("extract") == 1
-    assert saved == [SyncState(last_applied_remote_commit=OID, last_applied_manifest_root_hash=ROOT, machine_id="terminal-b")]
+    assert saved == [(
+        SyncState(),
+        SyncState(last_applied_remote_commit=OID, last_applied_manifest_root_hash=ROOT, machine_id="terminal-b"),
+    )]
 
 
-def test_enroll_save_failure_retries_without_second_restore(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    vault = Vault(); config = _config(tmp_path); saves: list[SyncState] = []; extracts: list[Path] = []
+def test_enroll_foreign_state_cas_failure_retries_without_second_restore(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    vault = Vault(); config = _config(tmp_path); saves: list[tuple[SyncState, SyncState]] = []; extracts: list[Path] = []
     vault.extract_save = lambda _c, destination, **_kw: (extracts.append(destination), destination.mkdir())  # type: ignore[method-assign]
     monkeypatch.setattr(cli, "load_config", lambda _: config); monkeypatch.setattr(cli, "_vault", lambda _: vault)
     monkeypatch.setattr(cli, "inspect_remote_lock_readonly", lambda _: None); monkeypatch.setattr(cli, "_process_preflight", lambda *_: None)
@@ -157,11 +169,22 @@ def test_enroll_save_failure_retries_without_second_restore(monkeypatch: pytest.
     monkeypatch.setattr(cli, "stable_manifest", lambda *_a, **_k: {"root_hash": ROOT, "file_count": 1})
     monkeypatch.setattr(cli, "validate_players", lambda *_a: {"ok": True})
     monkeypatch.setattr(cli, "restore_from_directory", lambda _src, live, *_a, **_k: (live.mkdir(), {"root_hash": ROOT})[1])
-    monkeypatch.setattr(cli, "save_state", lambda *_a: (_ for _ in ()).throw(SyncError("state_write_failed", "x", 6)))
-    with pytest.raises(SyncError): cli.enroll(tmp_path / "state" / "config.local.json", apply=True)
-    monkeypatch.setattr(cli, "save_state", lambda _p, state: saves.append(state))
+    monkeypatch.setattr(
+        cli, "save_state_if_unchanged",
+        lambda *_a: (_ for _ in ()).throw(SyncError("selection_stale", "foreign state", 4)),
+    )
+    with pytest.raises(SyncError) as caught:
+        cli.enroll(tmp_path / "state" / "config.local.json", apply=True)
+    assert caught.value.code == "selection_stale"
+    monkeypatch.setattr(
+        cli, "save_state_if_unchanged",
+        lambda _p, expected, state: saves.append((expected, state)),
+    )
     assert cli.enroll(tmp_path / "state" / "config.local.json", apply=True)["idempotent"] is False
-    assert len(extracts) == 1 and len(saves) == 1
+    assert len(extracts) == 1 and saves == [(
+        SyncState(),
+        SyncState(last_applied_remote_commit=OID, last_applied_manifest_root_hash=ROOT, machine_id="terminal-b"),
+    )]
 
 
 def test_enroll_dry_run_rejects_head_mismatch(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -201,7 +224,7 @@ def test_enroll_final_lock_race_does_not_save_state(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(cli, "load_config", lambda _: config); monkeypatch.setattr(cli, "_vault", lambda _: vault)
     monkeypatch.setattr(cli, "inspect_remote_lock_readonly", lambda _: next(locks)); monkeypatch.setattr(cli, "_process_preflight", lambda *_: None)
     monkeypatch.setattr(cli, "load_state", lambda _: (_ for _ in ()).throw(SyncError("state_missing", "x", 6)))
-    monkeypatch.setattr(cli, "stable_manifest", lambda *_a, **_k: {"root_hash": ROOT, "file_count": 1}); monkeypatch.setattr(cli, "validate_players", lambda *_a: {"ok": True}); monkeypatch.setattr(cli, "save_state", lambda *_a: writes.append(True))
+    monkeypatch.setattr(cli, "stable_manifest", lambda *_a, **_k: {"root_hash": ROOT, "file_count": 1}); monkeypatch.setattr(cli, "validate_players", lambda *_a: {"ok": True}); monkeypatch.setattr(cli, "save_state_if_unchanged", lambda *_a: writes.append(True))
     with pytest.raises(SyncError) as caught: cli.enroll(tmp_path / "config.local.json", apply=True)
     assert caught.value.code == "enroll_remote_changed" and writes == []
 
@@ -222,7 +245,7 @@ def test_enroll_accepts_behind_after_fast_forward_head_proof(monkeypatch: pytest
     vault = Vault(); config = _config(tmp_path); config.save_root.mkdir()
     vault.update_fast_forward = lambda: SimpleNamespace(relation="behind")  # type: ignore[method-assign]
     monkeypatch.setattr(cli, "load_config", lambda _: config); monkeypatch.setattr(cli, "_vault", lambda _: vault); monkeypatch.setattr(cli, "inspect_remote_lock_readonly", lambda _: None); monkeypatch.setattr(cli, "_process_preflight", lambda *_: None)
-    monkeypatch.setattr(cli, "load_state", lambda _: (_ for _ in ()).throw(SyncError("state_missing", "x", 6))); monkeypatch.setattr(cli, "stable_manifest", lambda *_a, **_k: {"root_hash": ROOT, "file_count": 1}); monkeypatch.setattr(cli, "validate_players", lambda *_a: {"ok": True}); monkeypatch.setattr(cli, "save_state", lambda *_a: None)
+    monkeypatch.setattr(cli, "load_state", lambda _: (_ for _ in ()).throw(SyncError("state_missing", "x", 6))); monkeypatch.setattr(cli, "stable_manifest", lambda *_a, **_k: {"root_hash": ROOT, "file_count": 1}); monkeypatch.setattr(cli, "validate_players", lambda *_a: {"ok": True}); monkeypatch.setattr(cli, "save_state_if_unchanged", lambda *_a: None)
     assert cli.enroll(tmp_path / "config.local.json", apply=True)["commit"] == OID
 
 

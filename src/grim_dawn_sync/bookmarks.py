@@ -13,8 +13,8 @@ from pathlib import Path
 from grim_dawn_sync.errors import EXIT_RECOVERY_REQUIRED, EXIT_VALIDATION, SyncError
 from grim_dawn_sync.git_vault import GitVault
 from grim_dawn_sync.manifest import stable_manifest
-from grim_dawn_sync.session_lock import acquire_lock, inspect_remote_lock_readonly, release_bookmark_lock
-from grim_dawn_sync.state import SyncState, load_state, save_state
+from grim_dawn_sync.session_lock import Lock, acquire_lock, inspect_remote_lock_readonly, release_bookmark_lock
+from grim_dawn_sync.state import SyncState, load_state, save_state_if_unchanged
 
 
 BOOKMARK_SCHEMA_VERSION = "1.0.0"
@@ -88,13 +88,245 @@ def make_bookmark_annotation(display_name: str, note: str | None, *, created_by:
     }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
-def create_bookmark(vault: GitVault, commit: str, *, display_name: str, note: str | None, created_by: str) -> ManagedBookmark:
+def _create_bookmark_test_only(vault: GitVault, commit: str, *, display_name: str, note: str | None, created_by: str) -> ManagedBookmark:
+    """Seed a lockless bookmark only in isolated test repositories.
+
+    Production entry points must use the locked helpers below so publication
+    intent and recovery state are durable before any managed ref is exposed.
+    """
     annotation = make_bookmark_annotation(display_name, note, created_by=created_by)
     ref, target, remote_annotation = vault.create_managed_bookmark(commit, annotation)
     metadata = parse_bookmark_annotation(remote_annotation)
     if metadata != parse_bookmark_annotation(annotation):
         raise SyncError("bookmark_remote_mismatch", "Remote bookmark annotation could not be verified.", EXIT_VALIDATION)
     return ManagedBookmark(ref, target, str(metadata["display_name"]), metadata["note"], str(metadata["created_at"]), str(metadata["created_by"]))
+
+
+def _inactive_bookmark_baseline(state: SyncState, machine_id: str) -> None:
+    if (
+        state.phase is not None
+        or state.machine_id != machine_id
+        or state.last_applied_remote_commit is None
+        or state.last_applied_manifest_root_hash is None
+    ):
+        raise SyncError("bookmark_state_invalid", "Bookmark publication requires an inactive enrolled baseline.", EXIT_VALIDATION)
+
+
+def _bookmark_lock_state(lock: Lock, original: SyncState) -> SyncState:
+    return SyncState(
+        last_applied_remote_commit=original.last_applied_remote_commit,
+        last_applied_manifest_root_hash=original.last_applied_manifest_root_hash,
+        session_id=lock.session.session_id,
+        machine_id=lock.session.machine_id,
+        base_commit=lock.session.base_commit,
+        lock_oid=lock.oid,
+        local_tag=lock.local_tag,
+        phase="lock_held",
+    )
+
+
+def _publish_commit_bookmark_under_lock(
+    vault: GitVault,
+    lock: Lock,
+    original: SyncState,
+    commit: str,
+    root_hash: str,
+    annotation: str,
+    *,
+    state_path: Path,
+    expected_remote_head: str,
+    continuation_state: SyncState | None,
+    publication_guard: Callable[[], None] | None = None,
+) -> ManagedBookmark:
+    """Publish one exact commit tag with a recoverable intent under an owned lock."""
+    expected_lock_state = _bookmark_lock_state(lock, original)
+    if load_state(state_path) != expected_lock_state:
+        raise SyncError("bookmark_state_changed", "Bookmark session state does not match its lock.", EXIT_RECOVERY_REQUIRED)
+    expected_state = [expected_lock_state]
+
+    def guard() -> None:
+        vault.assert_remote_identity()
+        if vault.remote_oid() != expected_remote_head:
+            raise SyncError("bookmark_main_changed", "Remote main changed before bookmark publication.", EXIT_RECOVERY_REQUIRED)
+        owned = inspect_remote_lock_readonly(vault)
+        if owned is None or owned.oid != lock.oid or owned.session != lock.session:
+            raise SyncError("bookmark_lock_changed", "Bookmark session lock ownership changed before publication.", EXIT_RECOVERY_REQUIRED)
+        if load_state(state_path) != expected_state[0]:
+            raise SyncError("bookmark_state_changed", "Bookmark recovery state changed before publication.", EXIT_RECOVERY_REQUIRED)
+        manifest = vault.validate_commit_snapshot(commit)
+        if manifest.get("root_hash") != root_hash:
+            raise SyncError("bookmark_commit_changed", "Bookmark commit no longer matches its verified save root.", EXIT_RECOVERY_REQUIRED)
+        if publication_guard is not None:
+            publication_guard()
+
+    def persist_intent(ref: str, tag_oid: str, target: str) -> None:
+        guard()
+        pending = SyncState(
+            last_applied_remote_commit=original.last_applied_remote_commit,
+            last_applied_manifest_root_hash=original.last_applied_manifest_root_hash,
+            session_id=lock.session.session_id,
+            machine_id=lock.session.machine_id,
+            base_commit=lock.session.base_commit,
+            lock_oid=lock.oid,
+            local_tag=lock.local_tag,
+            phase="bookmark_publish_pending",
+            local_commit=target,
+            bookmark_ref=ref,
+            bookmark_tag_oid=tag_oid,
+            bookmark_root_hash=root_hash,
+        )
+        save_state_if_unchanged(state_path, expected_state[0], pending)
+        expected_state[0] = pending
+
+    def persist_confirmed(ref: str, tag_oid: str, target: str) -> None:
+        guard()
+        current = expected_state[0]
+        if current.bookmark_ref != ref or current.bookmark_tag_oid != tag_oid or current.local_commit != target:
+            raise SyncError("bookmark_state_changed", "Bookmark publication result did not match its intent.", EXIT_RECOVERY_REQUIRED)
+        confirmed = SyncState(
+            last_applied_remote_commit=original.last_applied_remote_commit,
+            last_applied_manifest_root_hash=original.last_applied_manifest_root_hash,
+            session_id=lock.session.session_id,
+            machine_id=lock.session.machine_id,
+            base_commit=lock.session.base_commit,
+            lock_oid=lock.oid,
+            local_tag=lock.local_tag,
+            phase="bookmark_release_pending",
+            pushed_commit=lock.session.base_commit,
+            bookmark_ref=ref,
+            bookmark_tag_oid=tag_oid,
+            bookmark_root_hash=root_hash,
+        )
+        save_state_if_unchanged(state_path, current, confirmed)
+        expected_state[0] = confirmed
+
+    try:
+        guard()
+        ref, target, remote_annotation = vault.create_managed_bookmark(
+            commit,
+            annotation,
+            expected_remote_head=expected_remote_head,
+            expected_lock_oid=lock.oid,
+            publication_guard=guard,
+            publication_intent=persist_intent,
+            publication_confirmed=persist_confirmed,
+        )
+        metadata = parse_bookmark_annotation(remote_annotation)
+        if metadata != parse_bookmark_annotation(annotation):
+            raise SyncError("bookmark_remote_mismatch", "Remote bookmark annotation could not be verified.", EXIT_RECOVERY_REQUIRED)
+        if continuation_state is None:
+            release_bookmark_lock(vault, lock, original, state_path=state_path)
+        else:
+            guard()
+            save_state_if_unchanged(state_path, expected_state[0], continuation_state)
+            expected_state[0] = continuation_state
+        return ManagedBookmark(
+            ref,
+            target,
+            str(metadata["display_name"]),
+            metadata["note"],
+            str(metadata["created_at"]),
+            str(metadata["created_by"]),
+        )
+    except SyncError as error:
+        if error.exit_code == EXIT_RECOVERY_REQUIRED:
+            raise
+        raise SyncError(
+            error.code,
+            f"{error.message} The bookmark lock was retained; run recover.",
+            EXIT_RECOVERY_REQUIRED,
+            {**error.details, "session_id": lock.session.session_id},
+        ) from error
+    except Exception as error:
+        raise SyncError(
+            "bookmark_incomplete",
+            "Bookmark publication was interrupted; the bookmark lock was retained. Run recover.",
+            EXIT_RECOVERY_REQUIRED,
+            {"session_id": lock.session.session_id},
+        ) from error
+
+
+def create_commit_bookmark_locked(
+    vault: GitVault,
+    commit: str,
+    root_hash: str,
+    *,
+    state_path: Path,
+    expected_remote_head: str,
+    display_name: str,
+    note: str | None,
+    created_by: str,
+    before_lock: Callable[[], None] | None = None,
+    after_lock: Callable[[], None] | None = None,
+) -> ManagedBookmark:
+    """Publish a verified commit candidate under a recoverable tag-only session."""
+    original = load_state(state_path)
+    _inactive_bookmark_baseline(original, created_by)
+    annotation = make_bookmark_annotation(display_name, note, created_by=created_by)
+
+    def verify_target() -> None:
+        vault.assert_remote_identity()
+        if vault.remote_oid() != expected_remote_head:
+            raise SyncError("selection_stale", "Remote main changed during bookmark creation.", EXIT_VALIDATION)
+        if vault.validate_commit_snapshot(commit).get("root_hash") != root_hash:
+            raise SyncError("selection_stale", "Bookmark candidate changed during verification.", EXIT_VALIDATION)
+
+    if before_lock is not None:
+        before_lock()
+    verify_target()
+    lock = acquire_lock(
+        vault,
+        created_by,
+        expected_remote_head,
+        state_path=state_path,
+        expected_pre_state=original,
+    )
+    return _publish_commit_bookmark_under_lock(
+        vault,
+        lock,
+        original,
+        commit,
+        root_hash,
+        annotation,
+        state_path=state_path,
+        expected_remote_head=expected_remote_head,
+        continuation_state=None,
+        publication_guard=after_lock,
+    )
+
+
+def create_displaced_head_bookmark_locked(
+    vault: GitVault,
+    lock: Lock,
+    original: SyncState,
+    commit: str,
+    *,
+    state_path: Path,
+    created_by: str,
+) -> ManagedBookmark:
+    """Publish the displaced remote head, then return to the same workflow lock."""
+    _inactive_bookmark_baseline(original, created_by)
+    current = _bookmark_lock_state(lock, original)
+    manifest = vault.validate_commit_snapshot(commit)
+    root_hash = str(manifest.get("root_hash", ""))
+    if re.fullmatch(r"[0-9a-f]{64}", root_hash) is None:
+        raise SyncError("bookmark_commit_changed", "Displaced remote head has no verified save root.", EXIT_RECOVERY_REQUIRED)
+    annotation = make_bookmark_annotation(
+        "Automatic pre-selection remote backup",
+        None,
+        created_by=created_by,
+    )
+    return _publish_commit_bookmark_under_lock(
+        vault,
+        lock,
+        original,
+        commit,
+        root_hash,
+        annotation,
+        state_path=state_path,
+        expected_remote_head=commit,
+        continuation_state=current,
+    )
 
 
 def create_live_bookmark(vault: GitVault, live_root: Path, manifest: dict, *, expected_remote_head: str,
@@ -165,16 +397,12 @@ def create_live_bookmark_locked(
     if before_lock is not None:
         before_lock()
     assert_current()
-    lock = acquire_lock(vault, created_by, expected_remote_head, state_path=state_path)
+    lock = acquire_lock(
+        vault, created_by, expected_remote_head,
+        state_path=state_path, expected_pre_state=original,
+    )
     try:
-        expected_lock_state = SyncState(
-            session_id=lock.session.session_id,
-            machine_id=lock.session.machine_id,
-            base_commit=lock.session.base_commit,
-            lock_oid=lock.oid,
-            local_tag=lock.local_tag,
-            phase="lock_held",
-        )
+        expected_lock_state = _bookmark_lock_state(lock, original)
         expected_publication_state = [expected_lock_state]
 
         def before_publish() -> None:
@@ -197,7 +425,7 @@ def create_live_bookmark_locked(
                 phase="bookmark_publish_pending", local_commit=commit,
                 bookmark_ref=ref, bookmark_tag_oid=tag_oid, bookmark_root_hash=expected_root,
             )
-            save_state(state_path, pending)
+            save_state_if_unchanged(state_path, expected_publication_state[0], pending)
             expected_publication_state[0] = pending
 
         def publication_confirmed(ref: str, tag_oid: str, commit: str) -> None:
@@ -213,7 +441,7 @@ def create_live_bookmark_locked(
                 phase="bookmark_release_pending", pushed_commit=lock.session.base_commit,
                 bookmark_ref=ref, bookmark_tag_oid=tag_oid, bookmark_root_hash=expected_root,
             )
-            save_state(state_path, confirmed)
+            save_state_if_unchanged(state_path, current, confirmed)
             expected_publication_state[0] = confirmed
 
         if after_lock is not None:

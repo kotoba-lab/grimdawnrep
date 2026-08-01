@@ -20,9 +20,9 @@ from grim_dawn_sync.launcher import DPYesLauncher
 from grim_dawn_sync.manifest import _reject_unsafe, build_manifest, stable_manifest
 from grim_dawn_sync.session_lock import acquire_lock, release_lock
 from grim_dawn_sync.snapshot import _copy_verified, _manifest, apply_restore, archive_before_restore, plan_restore
-from grim_dawn_sync.state import SyncState, load_state, save_state
+from grim_dawn_sync.state import SyncState, load_state, save_state_if_unchanged
 from grim_dawn_sync.validation import destructive_change, validate_players
-from grim_dawn_sync.bookmarks import create_bookmark
+from grim_dawn_sync.bookmarks import create_displaced_head_bookmark_locked
 from grim_dawn_sync.selection import SelectionPlan, SelectionRegistry
 
 
@@ -90,6 +90,9 @@ class DomainAdapters:
         self.last_quarantine_destination: str | None = None
         self.last_archive_root: str | None = None
         self.last_quarantine_root: str | None = None
+        self._selection_lock: Any | None = None
+        self._selection_original_state: SyncState | None = None
+        self._committed_state: SyncState | None = None
     @property
     def state_path(self) -> Path: return self.local_root / "state.json"
     def preflight(self) -> None:
@@ -109,12 +112,14 @@ class DomainAdapters:
         """Preserve the exact old remote head before any restore or main push."""
         if not commit:
             raise SyncError("remote_main_missing", "Remote main is missing; no selection was applied.", EXIT_CONFLICT)
-        # The generated tag ref is opaque; only this fixed, plain-text label is
-        # used for an automatic safety bookmark.
-        create_bookmark(
-            self.vault, commit,
-            display_name="Automatic pre-selection remote backup",
-            note=None,
+        if self._selection_lock is None or self._selection_original_state is None:
+            raise SyncError("adapter_contract_invalid", "Selection bookmark has no recoverable lock context.", EXIT_RECOVERY_REQUIRED)
+        create_displaced_head_bookmark_locked(
+            self.vault,
+            self._selection_lock,
+            self._selection_original_state,
+            commit,
+            state_path=self.state_path,
             created_by=self.config.machine_id,
         )
     def bind_remote_identity(self, expected: tuple[str, str]) -> None:
@@ -122,10 +127,14 @@ class DomainAdapters:
     def align_selection_base(self, expected_remote_head: str) -> None:
         self.vault.align_head_to_remote(expected_remote_head)
     def acquire(self, base: str, *, expected_pre_state: SyncState | None = None):
-        return acquire_lock(
+        original = expected_pre_state if expected_pre_state is not None else self.state()
+        lock = acquire_lock(
             self.vault, self.config.machine_id, base,
-            state_path=self.state_path, expected_pre_state=expected_pre_state,
+            state_path=self.state_path, expected_pre_state=original,
         )
+        self._selection_lock = lock
+        self._selection_original_state = original
+        return lock
     def prepare_remote_restore(self, base: str, session: str):
         source=self.local_root/"staging"/session
         self.vault.extract_save(base,source,machine_id=self.config.machine_id,retries=self.config.stable_scan_retries,window_seconds=self.config.stable_window_seconds)
@@ -207,16 +216,44 @@ class DomainAdapters:
         # Requiring the already-validated manifest prevents an unbound snapshot.
         return self.vault.snapshot(self.config.save_root,machine_id=self.config.machine_id,session_id=session,retries=self.config.stable_scan_retries,window_seconds=self.config.stable_window_seconds,expected_manifest=manifest,state_hook=hook)
     def mark_committed(self, lock: object, oid: str, root_hash: str) -> None:
-        s=lock.session; save_state(self.state_path,SyncState(last_applied_manifest_root_hash=root_hash,session_id=s.session_id,machine_id=s.machine_id,base_commit=s.base_commit,lock_oid=lock.oid,local_tag=lock.local_tag,phase="committed",local_commit=oid))
+        s = lock.session
+        current = load_state(self.state_path)
+        if (
+            current.phase != "lock_held"
+            or current.session_id != s.session_id
+            or current.machine_id != s.machine_id
+            or current.base_commit != s.base_commit
+            or current.lock_oid != lock.oid
+            or current.local_tag != lock.local_tag
+        ):
+            raise SyncError("recovery_state_changed", "Lock state changed before commit persistence.", EXIT_RECOVERY_REQUIRED)
+        committed = SyncState(
+            last_applied_manifest_root_hash=root_hash,
+            session_id=s.session_id, machine_id=s.machine_id, base_commit=s.base_commit,
+            lock_oid=lock.oid, local_tag=lock.local_tag, phase="committed", local_commit=oid,
+        )
+        try:
+            save_state_if_unchanged(self.state_path, current, committed)
+        except SyncError as error:
+            raise SyncError(
+                "recovery_state_changed", "Lock state changed before commit persistence.",
+                EXIT_RECOVERY_REQUIRED, {**error.details, "session_id": s.session_id},
+            ) from error
+        self._committed_state = committed
     def push(self, oid: str) -> str: return self.vault.push(oid)
     def release(self, lock: object, oid: str, manifest: dict) -> None:
+        expected = self._committed_state
+        if expected is None:
+            raise SyncError("adapter_contract_invalid", "Committed state was not bound before release.", EXIT_RECOVERY_REQUIRED)
         release_lock(
             self.vault,
             lock,
             oid,
             state_path=self.state_path,
             confirmed_root_hash=manifest["root_hash"],
+            expected_state=expected,
         )
+        self._committed_state = None
 
 
 class LaunchWorkflow:
@@ -331,14 +368,24 @@ class LaunchWorkflow:
                     canonical.expected_remote_head, expected_pre_state=expected_pre_state,
                 )
             self.mutated = True; self.session = lock.session.session_id
+            post_lock_live_root: str | None = None
             if canonical.expected_context_digest is not None:
                 after_lock = getattr(context_revalidate, "after_lock", None)
                 if not callable(after_lock):
                     raise SyncError("adapter_contract_invalid", "Post-lock selection context cannot be revalidated.", EXIT_RECOVERY_REQUIRED)
-                after_lock(canonical.expected_context_digest, lock)
+                attestation = after_lock(canonical.expected_context_digest, lock)
+                if not isinstance(attestation, dict) or not isinstance(attestation.get("live_root_hash"), str):
+                    raise SyncError("adapter_contract_invalid", "Post-lock selection context is incomplete.", EXIT_RECOVERY_REQUIRED)
+                post_lock_live_root = attestation["live_root_hash"]
             # Close every live-save race before the first post-lock mutation,
             # including remote candidates whose selected root differs by design.
-            require_live_root(canonical.expected_live_root_hash, post_lock=True)
+            if canonical.expected_context_digest is None:
+                require_live_root(canonical.expected_live_root_hash, post_lock=True)
+            elif post_lock_live_root != canonical.expected_live_root_hash:
+                raise SyncError(
+                    "selection_stale", "Live save changed after lock acquisition; run recover.",
+                    EXIT_RECOVERY_REQUIRED,
+                )
             if canonical.bookmark_displaced_remote:
                 self._at(WorkflowState.BOOKMARK_DISPLACED_REMOTE)
                 bookmark = getattr(self.adapters, "bookmark_displaced_remote", None)

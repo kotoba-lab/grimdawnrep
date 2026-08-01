@@ -9,7 +9,12 @@ import pytest
 
 from grim_dawn_sync import cli
 from grim_dawn_sync.errors import EXIT_CONFIGURATION, EXIT_RECOVERY_REQUIRED, SyncError
+from grim_dawn_sync.git_vault import GitVault
+from grim_dawn_sync.manifest import stable_manifest
 from grim_dawn_sync.process_monitor import ProcessInfo, ProcessScan
+from grim_dawn_sync.session_lock import inspect_remote_lock_readonly
+from grim_dawn_sync.state import SyncState, load_state, save_state
+from test_save_sync_git_vault import checkout_remote_main, clone_pair, save, valid
 
 
 def test_parser_exposes_full_t6_command_contract() -> None:
@@ -468,7 +473,14 @@ def test_bootstrap_apply_refuses_existing_live_before_restore(monkeypatch: pytes
 def test_snapshot_archives_before_lock_and_retains_state_on_push_failure(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     live = tmp_path / "live"; live.mkdir(); config = SimpleNamespace(save_root=live, vault_repo=tmp_path / "vault", machine_id="t6", stable_scan_retries=1, stable_window_seconds=0, game_process_names=("Grim Dawn.exe",))
     calls: list[str] = []; saved: list[object] = []
-    class Lock: oid="lock"; local_tag="tag"; session=SimpleNamespace(session_id="session", machine_id="t6", base_commit="b" * 40)
+    original = cli.SyncState(last_applied_remote_commit="b" * 40,
+                             last_applied_manifest_root_hash="a" * 64, machine_id="t6")
+    locked = cli.SyncState(last_applied_remote_commit="b" * 40,
+                           last_applied_manifest_root_hash="a" * 64,
+                           session_id="00000000-0000-4000-8000-000000000001", machine_id="t6",
+                           base_commit="b" * 40, lock_oid="d" * 40,
+                           local_tag="grim-dawn-sync-00000000-0000-4000-8000-000000000001", phase="lock_held")
+    class Lock: oid="d" * 40; local_tag=locked.local_tag; session=SimpleNamespace(session_id=locked.session_id, machine_id="t6", base_commit="b" * 40)
     class Vault:
         def update_fast_forward(self): return SimpleNamespace(relation="equal")
         def remote_oid(self): return "b" * 40
@@ -479,11 +491,64 @@ def test_snapshot_archives_before_lock_and_retains_state_on_push_failure(monkeyp
     monkeypatch.setattr(cli, "stable_manifest", lambda *a, **k: {"root_hash":"a" * 64})
     monkeypatch.setattr(cli, "validate_players", lambda *a: {"ok": True})
     monkeypatch.setattr(cli, "_copy_verified", lambda *a: calls.append("archive"))
-    monkeypatch.setattr(cli, "acquire_lock", lambda *a, **k: calls.append("lock") or Lock())
-    monkeypatch.setattr(cli, "save_state", lambda *a: saved.append(a[1]))
+    states = iter((original, locked))
+    monkeypatch.setattr(cli, "load_state", lambda *_: next(states))
+    def acquire(*args, **kwargs):
+        assert kwargs["expected_pre_state"] == original
+        calls.append("lock")
+        return Lock()
+    monkeypatch.setattr(cli, "acquire_lock", acquire)
+    monkeypatch.setattr(cli, "save_state_if_unchanged", lambda _p, expected, state: saved.append((expected, state)))
     with pytest.raises(SyncError, match="safe"): cli.snapshot(tmp_path / "config.local.json")
     assert calls == ["process", "archive", "lock", "snapshot", "push"]
-    assert saved and saved[-1].local_commit == "c" * 40
+    assert saved and saved[-1][0] == locked and saved[-1][1].local_commit == "c" * 40
+
+
+def test_snapshot_with_enrolled_baseline_uses_real_lock_and_releases_cleanly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    _bare, publisher_repo, terminal_repo = clone_pair(tmp_path)
+    publisher = GitVault(publisher_repo)
+    seed = save(tmp_path / "seed", b"baseline")
+    original_snapshot = GitVault.snapshot
+
+    def snapshot_with_test_validator(self, *args, **kwargs):
+        kwargs["validator"] = valid
+        return original_snapshot(self, *args, **kwargs)
+
+    monkeypatch.setattr(GitVault, "snapshot", snapshot_with_test_validator)
+    base = publisher.snapshot(seed, machine_id="terminal", session_id="base")
+    publisher.push(base)
+    checkout_remote_main(terminal_repo)
+    live = save(tmp_path / "live", b"updated")
+    manifest = stable_manifest(live, machine_id="terminal", retries=1)
+    config_path = tmp_path / "config.local.json"
+    config_path.write_text(json.dumps({
+        "schema_version": "1.0.0", "machine_id": "terminal", "save_root": str(live),
+        "vault_repo": str(terminal_repo), "remote": "origin", "branch": "main",
+        "game_install": str(tmp_path / "game"), "launcher_mode": "dpyes",
+        "launcher_path": str(tmp_path / "game" / "DPYes.exe"),
+        "game_process_names": ["Grim Dawn.exe"], "launch_timeout_seconds": 1,
+        "stable_window_seconds": 1, "stable_scan_retries": 1, "offline_policy": "deny",
+    }), encoding="utf-8")
+    state_path = tmp_path / "state.json"
+    enrolled = SyncState(
+        last_applied_remote_commit=base,
+        last_applied_manifest_root_hash="e" * 64,
+        machine_id="terminal",
+    )
+    save_state(state_path, enrolled)
+    monkeypatch.setattr(cli, "_process_preflight", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(cli, "validate_players", valid)
+
+    result = cli.snapshot(config_path)
+
+    final = load_state(state_path)
+    assert result["command"] == "snapshot" and result["commit"] != base
+    assert final.phase is None and final.last_applied_remote_commit == result["commit"]
+    assert final.last_applied_manifest_root_hash == manifest["root_hash"]
+    assert final.machine_id == "terminal"
+    assert inspect_remote_lock_readonly(GitVault(terminal_repo)) is None
 
 
 def test_status_reports_archive_and_vault_usage(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

@@ -109,7 +109,7 @@ def test_preserve_apply_creates_verified_local_archive_without_sync_state(monkey
     monkeypatch.setattr(cli, "_copy_verified", copy)
     monkeypatch.setattr(cli, "_vault", lambda *_a: pytest.fail("preserve must not use vault"))
     monkeypatch.setattr(cli, "load_state", lambda *_a: pytest.fail("preserve must not load state"))
-    monkeypatch.setattr(cli, "save_state", lambda *_a: pytest.fail("preserve must not save state"))
+    monkeypatch.setattr(cli, "save_state_if_unchanged", lambda *_a: pytest.fail("preserve must not save state"))
     result = cli.preserve(tmp_path / "config.local.json", apply=True)
     assert result["verified"] is True and result["dry_run"] is False
     assert copied[0].name.startswith(".preserve-incomplete-")

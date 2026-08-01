@@ -216,16 +216,29 @@ def test_interactive_builds_catalog_once_and_prelock_revalidation_does_not_rebui
 
 @pytest.mark.parametrize(
     "component",
-    ["process", "config", "state", "lock", "identity", "refs", "live", "head"],
+    ["process", "config", "state", "lock", "identity", "tag", "live", "main"],
 )
+@pytest.mark.parametrize("phase", ["pre-lock", "post-lock"])
 def test_final_lightweight_snapshot_rejects_late_context_change(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, component: str,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, component: str, phase: str,
 ) -> None:
     live, remote = "1" * 64, "2" * 64
     config_path, _, _ = _install_context(monkeypatch, tmp_path, live=live, remote=remote, baseline=live)
     expected_config = cli.load_config(config_path)
     expected_state = cli.load_state(cli._state_path(config_path))
     vault = cli._vault(expected_config)
+    lock = SimpleNamespace(
+        session=SimpleNamespace(session_id="11111111-1111-4111-8111-111111111111", base_commit="a" * 40),
+        oid="b" * 40,
+        local_tag="grim-dawn-sync-11111111-1111-4111-8111-111111111111",
+    )
+    acquired_lock = lock if phase == "post-lock" else None
+    required_state = cli._locked_state(expected_config, lock, expected_state) if acquired_lock else expected_state
+    baseline_snapshot = cli._execution_ref_snapshot(vault)
+    if acquired_lock:
+        baseline_snapshot = replace(baseline_snapshot, lock_oid=lock.oid)
+        monkeypatch.setattr(cli, "load_state", lambda _path: required_state)
+        monkeypatch.setattr(cli, "_execution_ref_snapshot", lambda _vault: baseline_snapshot)
 
     if component == "process":
         calls = 0
@@ -241,28 +254,29 @@ def test_final_lightweight_snapshot_rejects_late_context_change(
         values = iter((expected_config, changed))
         monkeypatch.setattr(cli, "load_config", lambda _path: next(values))
     elif component == "state":
-        changed = SyncState(last_applied_remote_commit="a" * 40,
-                            last_applied_manifest_root_hash="3" * 64, machine_id="machine")
-        values = iter((expected_state, changed))
+        changed = replace(required_state, last_applied_manifest_root_hash="3" * 64)
+        values = iter((required_state, changed))
         monkeypatch.setattr(cli, "load_state", lambda _path: next(values))
-    elif component == "lock":
-        values = iter((None, "b" * 40))
-        monkeypatch.setattr(cli, "_remote_lock_snapshot", lambda _vault: next(values))
+    elif component in {"lock", "tag", "main"}:
+        if component == "lock":
+            changed = replace(baseline_snapshot, lock_oid=("c" * 40 if acquired_lock else "b" * 40))
+        elif component == "tag":
+            changed = replace(baseline_snapshot, remote_ref_snapshot="2" * 64)
+        else:
+            changed = replace(baseline_snapshot, remote_head="c" * 40)
+        values = iter((baseline_snapshot, changed))
+        monkeypatch.setattr(cli, "_execution_ref_snapshot", lambda _vault: next(values))
     elif component == "identity":
         values = iter((("test://remote", "test://remote"), ("test://changed", "test://changed")))
         monkeypatch.setattr(cli, "read_remote_identity", lambda *_args: next(values))
-    elif component == "refs":
-        values = iter(("1" * 64, "2" * 64))
-        monkeypatch.setattr(cli, "_remote_ref_snapshot", lambda _vault: next(values))
     elif component == "live":
         values = iter(({"root_hash": live}, {"root_hash": "3" * 64}))
         monkeypatch.setattr(cli, "stable_manifest", lambda *_args, **_kwargs: next(values))
-    else:
-        values = iter(("a" * 40, "b" * 40))
-        vault.remote_oid = lambda: next(values)
 
     with pytest.raises(SyncError) as caught:
-        cli._capture_execution_context(config_path, expected_config, expected_state, vault)
+        cli._capture_execution_context(
+            config_path, expected_config, expected_state, vault, acquired_lock=acquired_lock,
+        )
     assert caught.value.code in {
         "catalog_context_changed", "game_already_running", "lock_held",
     }
@@ -281,13 +295,134 @@ def test_post_lock_snapshot_normalizes_only_the_owned_lock_transition(
         oid="b" * 40,
         local_tag="grim-dawn-sync-11111111-1111-4111-8111-111111111111",
     )
-    monkeypatch.setattr(cli, "load_state", lambda _path: cli._locked_state(expected_config, lock))
-    monkeypatch.setattr(cli, "_remote_lock_snapshot", lambda _vault: lock.oid)
+    monkeypatch.setattr(cli, "load_state", lambda _path: cli._locked_state(expected_config, lock, expected_state))
+    snapshot = replace(cli._execution_ref_snapshot(vault), lock_oid=lock.oid)
+    monkeypatch.setattr(cli, "_execution_ref_snapshot", lambda _vault: snapshot)
     context = cli._capture_execution_context(
         config_path, expected_config, expected_state, vault, acquired_lock=lock,
     )
     assert context["state"] == expected_state.as_dict()
     assert context["lock"] is None
+
+
+def _composite_snapshot(stdout: str, *, returncode: int = 0):
+    commands: list[tuple[str, ...]] = []
+    class Runner:
+        def run(self, *args, **_kwargs):
+            commands.append(args)
+            return SimpleNamespace(returncode=returncode, stdout=stdout)
+    vault = SimpleNamespace(remote="origin", remote_head="refs/heads/main", runner=Runner())
+    return cli._execution_ref_snapshot(vault), commands
+
+
+def test_composite_snapshot_uses_one_exact_query_and_separates_owned_lock() -> None:
+    main, lock, tag, target = "a" * 40, "b" * 40, "c" * 40, "d" * 40
+    managed = "refs/tags/grim-dawn-save-" + "1" * 32
+    rows = (
+        f"{main}\trefs/heads/main\n"
+        f"{lock}\t{cli.LOCK_REF}\n"
+        f"{main}\t{cli.LOCK_REF}^{{}}\n"
+        f"{tag}\t{managed}\n"
+        f"{target}\t{managed}^{{}}\n"
+        f"{tag}\trefs/tags/archive/legacy\n"
+        f"{target}\trefs/tags/archive/legacy^{{}}\n"
+    )
+    snapshot, commands = _composite_snapshot(rows)
+    assert commands == [(
+        "ls-remote", "origin", "refs/heads/main", cli.LOCK_REF,
+        "refs/tags/grim-dawn-save-*", "refs/tags/archive/*", "refs/tags/milestone/*",
+    )]
+    assert snapshot.remote_head == main and snapshot.lock_oid == lock
+
+    changed_lock, _ = _composite_snapshot(rows.replace(lock, "e" * 40, 1))
+    changed_main, _ = _composite_snapshot(rows.replace(main, "f" * 40, 1))
+    changed_tag, _ = _composite_snapshot(rows.replace(tag, "9" * 40, 1))
+    assert changed_lock.remote_ref_snapshot == snapshot.remote_ref_snapshot
+    assert changed_main.remote_head != snapshot.remote_head
+    assert changed_main.remote_ref_snapshot != snapshot.remote_ref_snapshot
+    assert changed_tag.remote_ref_snapshot != snapshot.remote_ref_snapshot
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_code"),
+    [
+        ("command", "catalog_ref_snapshot_failed"),
+        ("bytes", "catalog_ref_snapshot_failed"),
+        ("rows", "catalog_ref_snapshot_failed"),
+        ("malformed", "catalog_ref_snapshot_invalid"),
+        ("oid", "catalog_ref_snapshot_invalid"),
+        ("ref", "catalog_ref_snapshot_invalid"),
+        ("duplicate", "catalog_ref_snapshot_invalid"),
+        ("orphan-peeled", "catalog_ref_snapshot_invalid"),
+        ("long-ref", "catalog_ref_snapshot_invalid"),
+    ],
+)
+def test_composite_snapshot_fails_closed_on_every_parser_bound(case: str, expected_code: str) -> None:
+    oid = "a" * 40
+    returncode = 1 if case == "command" else 0
+    if case == "bytes":
+        output = "x" * (cli._REMOTE_REF_SNAPSHOT_MAX_BYTES + 1)
+    elif case == "rows":
+        output = "".join(
+            f"{oid}\trefs/tags/archive/{index:04d}\n"
+            for index in range(cli._REMOTE_REF_SNAPSHOT_MAX_ROWS + 1)
+        )
+    elif case == "malformed":
+        output = f"{oid} refs/heads/main\n"
+    elif case == "oid":
+        output = "not-an-oid\trefs/heads/main\n"
+    elif case == "ref":
+        output = f"{oid}\trefs/heads/unrequested\n"
+    elif case == "duplicate":
+        output = f"{oid}\trefs/heads/main\n{oid}\trefs/heads/main\n"
+    elif case == "orphan-peeled":
+        output = f"{oid}\trefs/tags/archive/orphan^{{}}\n"
+    elif case == "long-ref":
+        output = f"{oid}\trefs/tags/archive/{'x' * 600}\n"
+    else:
+        output = ""
+    with pytest.raises(SyncError) as caught:
+        _composite_snapshot(output, returncode=returncode)
+    assert caught.value.code == expected_code
+
+
+def test_post_lock_double_snapshot_stays_within_remote_and_hash_budgets(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    live, remote = "1" * 64, "2" * 64
+    config_path, _, _ = _install_context(monkeypatch, tmp_path, live=live, remote=remote, baseline=live)
+    expected_config = cli.load_config(config_path)
+    expected_state = cli.load_state(cli._state_path(config_path))
+    lock = SimpleNamespace(
+        session=SimpleNamespace(session_id="11111111-1111-4111-8111-111111111111", base_commit="a" * 40),
+        oid="b" * 40,
+        local_tag="grim-dawn-sync-11111111-1111-4111-8111-111111111111",
+    )
+    commands: list[tuple[str, ...]] = []
+    class Runner:
+        def run(self, *args, **_kwargs):
+            commands.append(args)
+            if args[0] == "remote":
+                return SimpleNamespace(returncode=0, stdout="test://remote\n")
+            if args[0] == "ls-remote":
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=f"{'a' * 40}\trefs/heads/main\n{lock.oid}\t{cli.LOCK_REF}\n",
+                )
+            raise AssertionError(args)
+    vault = SimpleNamespace(remote="origin", remote_head="refs/heads/main", runner=Runner())
+    stable_calls: list[str] = []
+    monkeypatch.setattr(cli, "load_state", lambda _path: cli._locked_state(expected_config, lock, expected_state))
+    monkeypatch.setattr(cli, "stable_manifest", lambda *_args, **_kwargs: stable_calls.append("hash") or {"root_hash": live})
+
+    context = cli._capture_execution_context(
+        config_path, expected_config, expected_state, vault, acquired_lock=lock,
+    )
+
+    ls_remote = [command for command in commands if command[0] == "ls-remote"]
+    assert context["live_root_hash"] == live
+    assert len(ls_remote) <= 2
+    assert len(stable_calls) <= 2 and len(stable_calls) * 2 <= 4
 
 
 def test_single_build_rejects_fetch_or_push_url_change(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -331,7 +466,8 @@ def test_single_build_rejects_state_config_lock_and_recovery_changes(monkeypatch
     assert error.value.code == "catalog_context_changed"
 
     config_path, _, _ = _install_context(monkeypatch, tmp_path, live=live, remote=remote, baseline=live)
-    monkeypatch.setattr(cli, "inspect_remote_lock_readonly", lambda _vault: object())
+    snapshot = cli._execution_ref_snapshot(cli._vault(None))
+    monkeypatch.setattr(cli, "_execution_ref_snapshot", lambda _vault: replace(snapshot, lock_oid="b" * 40))
     with pytest.raises(SyncError) as error:
         cli.versions(config_path)
     assert error.value.code == "lock_held"
@@ -371,8 +507,11 @@ def test_cross_process_capability_connects_promote_and_bookmark_apply(monkeypatc
 
     issued = cli.versions(config_path)
     made: list[tuple[str, str, str | None]] = []
-    monkeypatch.setattr(cli, "create_bookmark", lambda _vault, commit, *, display_name, note, created_by:
-                        made.append((commit, display_name, note)))
+    monkeypatch.setattr(
+        cli,
+        "create_commit_bookmark_locked",
+        lambda _vault, commit, _root, **kwargs: made.append((commit, kwargs["display_name"], kwargs["note"])),
+    )
     dry = cli.bookmark(config_path, "remote-id", "Named save", "note", apply=False,
                        catalog_token=issued["catalog_token"])
     assert dry == {"schema_version": "1.0.0", "command": "bookmark", "dry_run": True, "verified": True}
