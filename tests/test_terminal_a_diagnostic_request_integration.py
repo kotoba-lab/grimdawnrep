@@ -47,7 +47,9 @@ def _git(cwd: Path, *args: str) -> str:
     return _run(REAL_GIT, "-C", str(cwd), *args).stdout.strip()
 
 
-def _request_payload(*, expired: bool = False, bad_schema: bool = False) -> dict[str, object]:
+def _request_payload(
+    *, sequence: int = 2, expired: bool = False, bad_schema: bool = False
+) -> dict[str, object]:
     payload = json.loads(REQUEST.read_text(encoding="utf-8"))
     now = datetime.now(timezone.utc).replace(microsecond=0)
     not_before = now - (timedelta(hours=2) if expired else timedelta(seconds=30))
@@ -56,6 +58,7 @@ def _request_payload(*, expired: bool = False, bad_schema: bool = False) -> dict
     payload["issued_at"] = stamp(not_before)
     payload["not_before"] = stamp(not_before)
     payload["expires_at"] = stamp(expires)
+    payload["sequence"] = sequence
     if bad_schema:
         payload["schema_version"] = "2.0.0"
     return payload
@@ -108,7 +111,9 @@ def _setup_case(base: Path, *, expired: bool = False, bad_schema: bool = False) 
     _run(REAL_GIT, "init", "-b", "master", str(seed))
     _git(seed, "config", "user.name", "Test Operator")
     _git(seed, "config", "user.email", "operator@example.invalid")
-    initial_payload = _request_payload()
+    # The checked-in request is sequence 2.  Seed the clone with the older
+    # request so the test proves the canonical remote update is accepted.
+    initial_payload = _request_payload(sequence=1)
     initial_payload["request_id"] = "00000000-0000-0000-0000-000000000001"
     _write_request(seed, initial_payload)
     _git(seed, "add", "ops/handoff/terminal-a-diagnostic-request.v1.json")
@@ -117,7 +122,9 @@ def _setup_case(base: Path, *, expired: bool = False, bad_schema: bool = False) 
     _git(seed, "push", "-u", "origin", "master")
     _run(REAL_GIT, "clone", str(remote), str(terminal))
 
-    _write_request(seed, _request_payload(expired=expired, bad_schema=bad_schema))
+    updated_payload = _request_payload(sequence=2, expired=expired, bad_schema=bad_schema)
+    assert initial_payload["sequence"] < updated_payload["sequence"]
+    _write_request(seed, updated_payload)
     _git(seed, "add", "ops/handoff/terminal-a-diagnostic-request.v1.json")
     _git(seed, "commit", "-m", "new request")
     new_commit = _git(seed, "rev-parse", "HEAD")

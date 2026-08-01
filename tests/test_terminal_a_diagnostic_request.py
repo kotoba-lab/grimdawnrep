@@ -82,7 +82,7 @@ def test_terminal_a_request_has_exact_schema_identity_and_readonly_action() -> N
     assert set(payload) == EXPECTED_KEYS
     assert payload["schema_version"] == "1.0.0"
     assert payload["kind"] == "grim_dawn_terminal_diagnostic_request"
-    assert payload["sequence"] == 1
+    assert payload["sequence"] == 2
     assert payload["target_machine_id"] == "desktop-a"
     assert payload["leg"] == "A1" and payload["observed_code"] == "launch_failed"
     assert payload["action"] == "diagnose_readonly"
