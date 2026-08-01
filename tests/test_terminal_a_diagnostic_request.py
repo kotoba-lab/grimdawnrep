@@ -27,7 +27,7 @@ EXPECTED_KEYS = {
     "not_before",
     "expires_at",
 }
-EXPECTED_CHECKS = ["status", "doctor", "vault_remote_classification"]
+EXPECTED_CHECKS = ["status_baseline", "doctor", "validated_remote_and_baseline_manifest", "remote_diff_summary"]
 EXPECTED_CONSTRAINTS = [
     "no_game_launch",
     "no_lock",
@@ -35,7 +35,7 @@ EXPECTED_CONSTRAINTS = [
     "no_restore_snapshot_bookmark_promote",
     "no_commit_push_merge_rebase_reset_checkout",
     "no_state_config_save_remote_ref_write",
-    "vault_readonly_status_rev_parse_ls_remote_fetch_merge_base_manifest_compare",
+    "vault_readonly_status_rev_parse_ls_remote_fetch_merge_base_manifest_validate_diff",
     "no_fetched_code_execution",
 ]
 FORBIDDEN_FIELDS = {
@@ -79,12 +79,12 @@ def test_terminal_a_request_has_exact_schema_identity_and_readonly_action() -> N
     assert set(payload) == EXPECTED_KEYS
     assert payload["schema_version"] == "1.0.0"
     assert payload["kind"] == "grim_dawn_terminal_diagnostic_request"
-    assert payload["sequence"] == 6
+    assert payload["sequence"] == 7
     assert payload["target_machine_id"] == "desktop-a"
     assert payload["leg"] == "A1" and payload["observed_code"] == "remote_changed_or_unknown"
-    assert payload["action"] == "classify_remote_readonly"
-    assert payload["response_sentinel"] == "TERMINAL_A_REMOTE_CLASSIFICATION"
-    assert payload["request_id"] == "6414c271-db14-4b57-b579-81bc382c6693"
+    assert payload["action"] == "summarize_remote_diff_readonly"
+    assert payload["response_sentinel"] == "TERMINAL_A_REMOTE_DIFF_SUMMARY"
+    assert payload["request_id"] == "b08cfe0a-41c2-4cdd-b0ce-39c4d81b8b08"
     parsed_id = uuid.UUID(str(payload["request_id"]))
     assert str(parsed_id) == payload["request_id"]
 
@@ -111,8 +111,8 @@ def test_terminal_a_request_has_strict_utc_window_of_at_most_seventy_five_minute
         values[field] = parsed
     assert values["issued_at"] <= values["not_before"] < values["expires_at"]
     assert (values["expires_at"] - values["not_before"]).total_seconds() <= 4500
-    assert payload["issued_at"] == payload["not_before"] == "2026-08-01T13:18:00Z"
-    assert payload["expires_at"] == "2026-08-01T14:33:00Z"
+    assert payload["issued_at"] == payload["not_before"] == "2026-08-01T14:27:29Z"
+    assert payload["expires_at"] == "2026-08-01T15:42:29Z"
     assert (values["expires_at"] - values["not_before"]).total_seconds() == 4500
 
 
@@ -253,3 +253,33 @@ def test_remote_classification_block_is_read_only_and_sanitized() -> None:
     assert "'remote_content_differs'" in block
     for forbidden in (" launch", " recover", " restore", " snapshot", " bookmark", " promote", " commit", " push", " rebase", " reset", " checkout"):
         assert forbidden not in block.lower()
+
+
+def test_remote_diff_summary_block_uses_only_trusted_local_validation_and_aggregate_output() -> None:
+    runbook = RUNBOOK_PATH.read_text(encoding="utf-8")
+    block = runbook.split("## Copy-paste execution: validated remote diff summary", 1)[1].split("```powershell", 1)[1].split("```", 1)[0]
+
+    assert "TERMINAL_A_REMOTE_DIFF_SUMMARY" in block
+    assert "validate_commit_snapshot(sys.argv[2])" in block
+    assert "$python -c $probe $Vault $Commit" in block
+    assert "--no-tags','--no-write-fetch-head','origin',$remote" in block
+    assert "ls-remote','--refs','origin" in block
+    assert "character_core" in block and "character_tree_other" in block and "outside_character_tree" in block
+    assert "changed_size_bucket" in block
+    assert "remote_diff_summarized" in block and "observation_changed" in block
+    assert "$refs1" in block and "$refs2" in block and "$before -cne $after" in block
+    assert "function CompareManifests" in block
+    assert "$summary=CompareManifests $baseManifest $remoteManifest" in block
+    assert "function Compare($Left,$Right)" not in block
+    assert "function GitLines($Repo,[string[]]$CommandArgs)" in block
+    assert "GitLines -Repo $vault -CommandArgs @('ls-remote','--refs','origin')" in block
+    assert "GitQuiet -Repo $vault -CommandArgs @('fetch','--no-tags','--no-write-fetch-head','origin',$remote)" in block
+    assert "System.Collections.Generic.HashSet[string]" in block
+    assert "no path, character/account name, object" in runbook
+
+
+def test_remote_diff_summary_block_keeps_sequence6_classification_block_available() -> None:
+    runbook = RUNBOOK_PATH.read_text(encoding="utf-8")
+    classification = runbook.split("## Copy-paste execution", 1)[1].split("## Retired failure-diagnosis reference", 1)[0]
+    assert "TERMINAL_A_REMOTE_CLASSIFICATION" in classification
+    assert "safe_remote_ahead" in classification

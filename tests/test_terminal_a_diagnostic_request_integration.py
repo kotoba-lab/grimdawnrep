@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,7 @@ import sys
 import tempfile
 
 import pytest
+
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -50,7 +52,7 @@ def _git(cwd: Path, *args: str) -> str:
 
 
 def _request_payload(
-    *, sequence: int = 6, expired: bool = False, bad_schema: bool = False
+    *, sequence: int = 7, expired: bool = False, bad_schema: bool = False
 ) -> dict[str, object]:
     payload = json.loads(REQUEST.read_text(encoding="utf-8"))
     now = datetime.now(timezone.utc).replace(microsecond=0)
@@ -125,9 +127,9 @@ def _setup_case(
     _run(REAL_GIT, "init", "-b", "master", str(seed))
     _git(seed, "config", "user.name", "Test Operator")
     _git(seed, "config", "user.email", "operator@example.invalid")
-    # The checked-in request is sequence 6.  Seed the clone with the older
+    # The checked-in request is sequence 7.  Seed the clone with the older
     # request so the test proves the canonical remote update is accepted.
-    initial_payload = _request_payload(sequence=5)
+    initial_payload = _request_payload(sequence=6)
     initial_payload["request_id"] = "00000000-0000-0000-0000-000000000001"
     _write_request(seed, initial_payload)
     _git(seed, "add", "ops/handoff/terminal-a-diagnostic-request.v1.json")
@@ -136,8 +138,8 @@ def _setup_case(
     _git(seed, "push", "-u", "origin", "master")
     _run(REAL_GIT, "clone", str(remote), str(terminal))
 
-    updated_payload = _request_payload(sequence=6, expired=expired, bad_schema=bad_schema)
-    assert initial_payload["sequence"] == 5 < updated_payload["sequence"] == 6
+    updated_payload = _request_payload(sequence=7, expired=expired, bad_schema=bad_schema)
+    assert initial_payload["sequence"] == 6 < updated_payload["sequence"] == 7
     if timestamp_fault == "malformed":
         updated_payload["issued_at"] = "2026-08-01T09:46:11+00:00"
     _write_request(seed, updated_payload)
@@ -196,6 +198,16 @@ def _classification_script(base: Path) -> Path:
     section = RUNBOOK.read_text(encoding="utf-8").split("## Copy-paste execution", 1)[1]
     command = section.split("```powershell", 1)[1].split("```", 1)[0]
     path = base / "classification.ps1"
+    path.write_text(command, encoding="utf-8-sig", newline="\n")
+    return path
+
+
+def _summary_script(base: Path) -> Path:
+    section = RUNBOOK.read_text(encoding="utf-8").split(
+        "## Copy-paste execution: validated remote diff summary", 1
+    )[1]
+    command = section.split("```powershell", 1)[1].split("```", 1)[0]
+    path = base / "remote-diff-summary.ps1"
     path.write_text(command, encoding="utf-8-sig", newline="\n")
     return path
 
@@ -621,3 +633,125 @@ def test_classification_block_fails_closed_when_observed_state_changes(mutation:
         ]
         for secret in (str(base), PUBLIC_URL, "hook", "refs/heads", "root_hash"):
             assert secret not in result.stdout
+
+
+def _write_snapshot(repo: Path, files: dict[str, bytes], message: str) -> tuple[str, str]:
+    """Commit a real, package-validated save snapshot for the summary block."""
+    save = repo / "save"
+    shutil.rmtree(save, ignore_errors=True)
+    for name, value in files.items():
+        path = save / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(value)
+    rows = []
+    for name in sorted(files, key=str.casefold):
+        data = files[name]
+        rows.append({"path": name, "size": len(data), "sha256": hashlib.sha256(data).hexdigest()})
+    root = hashlib.sha256("\n".join(f"{row['path']}\0{row['size']}\0{row['sha256']}" for row in rows).encode()).hexdigest()
+    manifest = {"schema_version":"1.0.0", "created_at":"2026-08-01T00:00:00+00:00", "machine_id":"desktop-a", "root_hash":root, "file_count":len(rows), "total_bytes":sum(row["size"] for row in rows), "character_count":sum(1 for row in rows if row["path"].casefold().count("/")==2 and row["path"].casefold().startswith("main/") and row["path"].casefold().endswith("/player.gdc")), "files":rows}
+    sync = repo / ".sync"
+    sync.mkdir(exist_ok=True)
+    (sync / "manifest.json").write_text(json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8")
+    (sync / "vault.json").write_text(json.dumps({"schema_version": "1.0.0", "machine_id": "desktop-a", "session_id": "test", "root_hash": manifest["root_hash"]}) + "\n", encoding="utf-8")
+    _git(repo, "add", "save", ".sync")
+    _git(repo, "commit", "-m", message)
+    return _git(repo, "rev-parse", "HEAD"), str(manifest["root_hash"])
+
+
+def _summary_case(base: Path, *, remote_files: dict[str, bytes], corrupt: str | None = None) -> tuple[dict[str, str], dict[str, str]]:
+    assert REAL_GIT is not None
+    profile, local = base / "profile", base / "localappdata"
+    source, seed, vault, remote, live, stub = profile / "grimdawnrep", base / "seed", base / "vault", base / "remote.git", base / "live", base / "stub"
+    _run(REAL_GIT, "init", "--bare", str(remote)); _run(REAL_GIT, "init", "-b", "main", str(seed))
+    for repo in (seed,):
+        _git(repo, "config", "user.name", "Test"); _git(repo, "config", "user.email", "test@example.invalid")
+    baseline_files = {"main/Hero/player.gdc": b"base", "main/Hero/quests.gdd": b"quest", "transfer.gst": b"outside"}
+    baseline, live_root = _write_snapshot(seed, baseline_files, "baseline")
+    _git(seed, "remote", "add", "origin", str(remote)); _git(seed, "push", "-u", "origin", "main")
+    _run(REAL_GIT, "clone", str(remote), str(vault)); _git(vault, "checkout", "main")
+    remote_head, remote_root = _write_snapshot(seed, remote_files, "remote"); _git(seed, "push", "origin", "main")
+    if corrupt:
+        if corrupt == "blob": (seed / "save" / "transfer.gst").write_bytes(b"tampered")
+        elif corrupt == "tree": (seed / "save" / "extra.bin").write_bytes(b"extra")
+        else:
+            manifest = json.loads((seed / ".sync" / "manifest.json").read_text(encoding="utf-8")); manifest["root_hash"] = "0" * 64; (seed / ".sync" / "manifest.json").write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+        _git(seed, "add", "save", ".sync"); _git(seed, "commit", "-m", "corrupt"); remote_head = _git(seed, "rev-parse", "HEAD"); _git(seed, "push", "origin", "main")
+    _run(REAL_GIT, "init", "-b", "master", str(source)); _git(source, "config", "user.name", "Test"); _git(source, "config", "user.email", "test@example.invalid")
+    (source / "README").write_text("source\n", encoding="ascii"); _git(source, "add", "README"); _git(source, "commit", "-m", "source")
+    live.mkdir();
+    # Doctor's root is intentionally supplied by the fixed local test package;
+    # no fetched source is imported.
+    tool_python = local / "GrimDawnSaveSyncTool" / ".venv" / "Scripts" / "python.exe"; tool_python.parent.mkdir(parents=True); shutil.copy2(sys.executable, tool_python)
+    interp = Path(sys.executable).parent
+    for runtime in ("python3.dll", "python313.dll"):
+        candidate = interp / runtime
+        if candidate.exists(): shutil.copy2(candidate, tool_python.parent / runtime)
+    config = local / "GrimDawnSaveSync" / "config.local.json"; config.parent.mkdir(parents=True)
+    config.write_text(json.dumps({"machine_id":"desktop-a", "vault_repo":str(vault)}) + "\n", encoding="utf-8")
+    state = config.parent / "state.json"; state.write_text("{}\n", encoding="ascii")
+    package = stub / "grim_dawn_sync"; package.mkdir(parents=True)
+    (package / "__init__.py").write_text("from pkgutil import extend_path\n__path__=extend_path(__path__,__name__)\n", encoding="ascii")
+    (package / "__main__.py").write_text(
+        "import json,sys\ncmd=sys.argv[-1]\n"
+        f"root={live_root!r}\nhead={baseline!r}\n"
+        "if cmd=='status': print(json.dumps({'readiness':'blocked','vault_relation':'remote_changed_or_unknown','active_lock':None,'recovery_phase':None,'processes':{'status':'clear'},'last_pushed_commit':head}))\n"
+        "elif cmd=='doctor': print(json.dumps({'machine_id':'desktop-a','checks':{'save_root':{'manifest':{'root_hash':root}}}}))\n"
+        "else: raise SystemExit(2)\n", encoding="ascii")
+    wrapper = base / "bin"; wrapper.mkdir()
+    (wrapper / "git.cmd").write_text(
+        "@echo off\r\n"
+        "if not \"%~3\"==\"show\" goto real\r\n"
+        "if \"%GIT_SUMMARY_HOOK%\"==\"\" goto real\r\n"
+        f'"{REAL_GIT}" %*\r\n'
+        "if \"%GIT_SUMMARY_HOOK%\"==\"config\" echo x>>\"%GIT_SUMMARY_CONFIG%\"\r\n"
+        "if \"%GIT_SUMMARY_HOOK%\"==\"state\" echo x>>\"%GIT_SUMMARY_STATE%\"\r\n"
+        "if \"%GIT_SUMMARY_HOOK%\"==\"source_ref\" call \"%GIT_SUMMARY_GIT%\" -C \"%GIT_SUMMARY_SOURCE%\" commit --allow-empty -m hook 1>nul 2>nul\r\n"
+        "if \"%GIT_SUMMARY_HOOK%\"==\"vault_ref\" call \"%GIT_SUMMARY_GIT%\" -C \"%GIT_SUMMARY_VAULT%\" tag hook\r\n"
+        "if \"%GIT_SUMMARY_HOOK%\"==\"remote_main\" call \"%GIT_SUMMARY_GIT%\" -C \"%GIT_SUMMARY_SEED%\" commit --allow-empty -m hook 1>nul 2>nul\r\n"
+        "if \"%GIT_SUMMARY_HOOK%\"==\"remote_main\" call \"%GIT_SUMMARY_GIT%\" -C \"%GIT_SUMMARY_SEED%\" push origin main 1>nul 2>nul\r\n"
+        "exit /b 0\r\n:real\r\n" + f'"{REAL_GIT}" %*\r\nexit /b %errorlevel%\r\n', encoding="ascii", newline="")
+    env=os.environ.copy(); env.update(USERPROFILE=str(profile), LOCALAPPDATA=str(local), PYTHONPATH=str(stub)+os.pathsep+str(ROOT / "src"), PYTHONHOME=str(interp), PATH=str(wrapper)+os.pathsep+env["PATH"], GIT_SUMMARY_HOOK="", GIT_SUMMARY_CONFIG=str(config), GIT_SUMMARY_STATE=str(state), GIT_SUMMARY_GIT=str(REAL_GIT), GIT_SUMMARY_SOURCE=str(source), GIT_SUMMARY_VAULT=str(vault), GIT_SUMMARY_SEED=str(seed))
+    for command in ("status", "doctor"):
+        checked = subprocess.run([str(tool_python), "-m", "grim_dawn_sync", "--config", str(config), "--json", command], env=env, capture_output=True, text=True, encoding="utf-8")
+        assert checked.returncode == 0, checked.stderr
+        payload = json.loads(checked.stdout)
+        if command == "status":
+            assert payload == {"readiness":"blocked", "vault_relation":"remote_changed_or_unknown", "active_lock":None, "recovery_phase":None, "processes":{"status":"clear"}, "last_pushed_commit":baseline}
+        else: assert payload["machine_id"] == "desktop-a" and payload["checks"]["save_root"]["manifest"]["root_hash"] == live_root
+    return env, {"vault":str(vault),"config":str(config),"state":str(state),"source":str(source),"remote":str(remote),"baseline":baseline,"remote_head":remote_head,"remote_root":remote_root}
+
+
+def test_remote_diff_summary_runs_ps51_with_real_validated_snapshots_and_exact_categories() -> None:
+    files={"main/Hero/player.gdc":b"x"*4096, "main/Hero/quests.gdd":b"y"*65536, "transfer.gst":b"z"*1048577, "new.bin":b""}
+    with tempfile.TemporaryDirectory(prefix="terminal-a-summary-") as raw:
+        env, paths=_summary_case(Path(raw), remote_files=files); result=_invoke(_summary_script(Path(raw)),env)
+        assert result.returncode == 0 and result.stderr == ""
+        row=json.loads(result.stdout); assert row["sentinel"] == "TERMINAL_A_REMOTE_DIFF_SUMMARY" and row["code"] == "remote_diff_summarized"
+        assert row["live_vs_remote"] == row["baseline_vs_remote"] == "different"
+        assert row["character_core"] == {"any_change":True,"added":0,"removed":0,"changed":1,"changed_size_bucket":"le_4k"}
+        assert row["character_tree_other"] == {"any_change":True,"added":0,"removed":0,"changed":1,"changed_size_bucket":"le_64k"}
+        assert row["outside_character_tree"] == {"any_change":True,"added":1,"removed":0,"changed":1,"changed_size_bucket":"gt_1m"}
+        for secret in (str(Path(raw)), paths["remote"], paths["baseline"], paths["remote_head"], "transfer.gst", "stderr"):
+            assert secret not in result.stdout
+
+
+@pytest.mark.parametrize("corrupt", ["root", "blob", "tree"])
+def test_remote_diff_summary_rejects_invalid_validated_snapshot(corrupt: str) -> None:
+    with tempfile.TemporaryDirectory(prefix="terminal-a-summary-invalid-") as raw:
+        env, _ = _summary_case(Path(raw), remote_files={"main/Hero/player.gdc":b"next"}, corrupt=corrupt); result=_invoke(_summary_script(Path(raw)),env)
+        assert result.returncode == 1 and result.stderr == ""; assert json.loads(result.stdout)["code"] == "observation_changed"
+
+
+@pytest.mark.parametrize("hook", ["config", "state", "source_ref", "vault_ref", "remote_main"])
+def test_remote_diff_summary_fails_closed_when_observation_changes(hook: str) -> None:
+    with tempfile.TemporaryDirectory(prefix="terminal-a-summary-race-") as raw:
+        env, _ = _summary_case(Path(raw), remote_files={"main/Hero/player.gdc":b"next"}); env["GIT_SUMMARY_HOOK"] = hook; result=_invoke(_summary_script(Path(raw)),env)
+        assert result.returncode == 1 and result.stderr == ""; assert json.loads(result.stdout)["code"] == "observation_changed"
+
+
+def test_remote_diff_summary_block_parses_in_windows_powershell_51() -> None:
+    with tempfile.TemporaryDirectory(prefix="terminal-a-summary-parse-") as raw:
+        script = _summary_script(Path(raw)); parser = Path(raw) / "parse.ps1"
+        parser.write_text("$tokens=$null;$errors=$null;[void][System.Management.Automation.Language.Parser]::ParseFile($args[0],[ref]$tokens,[ref]$errors);if($errors.Count){exit 1}", encoding="utf-8-sig")
+        result = subprocess.run([str(POWERSHELL), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(parser), str(script)], capture_output=True, text=True, encoding="utf-8")
+        assert result.returncode == 0, result.stderr

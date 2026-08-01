@@ -1,9 +1,10 @@
 {
-  "action": "classify_remote_readonly",
+  "action": "summarize_remote_diff_readonly",
   "checks": [
-    "status",
+    "status_baseline",
     "doctor",
-    "vault_remote_classification"
+    "validated_remote_and_baseline_manifest",
+    "remote_diff_summary"
   ],
   "constraints": [
     "no_game_launch",
@@ -12,18 +13,18 @@
     "no_restore_snapshot_bookmark_promote",
     "no_commit_push_merge_rebase_reset_checkout",
     "no_state_config_save_remote_ref_write",
-    "vault_readonly_status_rev_parse_ls_remote_fetch_merge_base_manifest_compare",
+    "vault_readonly_status_rev_parse_ls_remote_fetch_merge_base_manifest_validate_diff",
     "no_fetched_code_execution"
   ],
-  "expires_at": "2026-08-01T14:33:00Z",
-  "issued_at": "2026-08-01T13:18:00Z",
+  "expires_at": "2026-08-01T15:42:29Z",
+  "issued_at": "2026-08-01T14:27:29Z",
   "kind": "grim_dawn_terminal_diagnostic_request",
   "leg": "A1",
-  "not_before": "2026-08-01T13:18:00Z",
+  "not_before": "2026-08-01T14:27:29Z",
   "observed_code": "remote_changed_or_unknown",
-  "request_id": "6414c271-db14-4b57-b579-81bc382c6693",
-  "response_sentinel": "TERMINAL_A_REMOTE_CLASSIFICATION",
+  "request_id": "b08cfe0a-41c2-4cdd-b0ce-39c4d81b8b08",
+  "response_sentinel": "TERMINAL_A_REMOTE_DIFF_SUMMARY",
   "schema_version": "1.0.0",
-  "sequence": 6,
+  "sequence": 7,
   "target_machine_id": "desktop-a"
 }

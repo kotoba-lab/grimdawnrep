@@ -1,7 +1,7 @@
-# Terminal A roundtrip: read-only A1 remote classification
+# Terminal A roundtrip: read-only A1 remote diff summary
 
 Use this runbook only after A1 reports `remote_changed_or_unknown`. It
-classifies the already enrolled Terminal A (`desktop-a`) without changing a
+summarizes the already enrolled Terminal A (`desktop-a`) without changing a
 save, state, configuration, source worktree, or Vault ref.
 
 ## Operator-mediated public remote request
@@ -166,18 +166,18 @@ try {
     if (-not ($request.schema_version -is [string]) -or $request.schema_version -cne '1.0.0' -or
         -not ($request.kind -is [string]) -or
         $request.kind -cne 'grim_dawn_terminal_diagnostic_request' -or
-        -not ($request.sequence -is [int]) -or $request.sequence -ne 6 -or
+        -not ($request.sequence -is [int]) -or $request.sequence -ne 7 -or
         -not ($request.target_machine_id -is [string]) -or $request.target_machine_id -cne $machineId -or
         -not ($request.leg -is [string]) -or -not ($request.observed_code -is [string]) -or
         -not ($request.action -is [string]) -or -not ($request.response_sentinel -is [string]) -or
         -not ($request.request_id -is [string]) -or
         $request.leg -cne 'A1' -or $request.observed_code -cne 'remote_changed_or_unknown' -or
-        $request.action -cne 'classify_remote_readonly' -or
-        $request.response_sentinel -cne 'TERMINAL_A_REMOTE_CLASSIFICATION') { throw 'invalid' }
-    Assert-ExactArray $request.checks @('status','doctor','vault_remote_classification')
+        $request.action -cne 'summarize_remote_diff_readonly' -or
+        $request.response_sentinel -cne 'TERMINAL_A_REMOTE_DIFF_SUMMARY') { throw 'invalid' }
+    Assert-ExactArray $request.checks @('status_baseline','doctor','validated_remote_and_baseline_manifest','remote_diff_summary')
     Assert-ExactArray $request.constraints @('no_game_launch','no_lock','no_recover',
         'no_restore_snapshot_bookmark_promote','no_commit_push_merge_rebase_reset_checkout',
-        'no_state_config_save_remote_ref_write','vault_readonly_status_rev_parse_ls_remote_fetch_merge_base_manifest_compare',
+        'no_state_config_save_remote_ref_write','vault_readonly_status_rev_parse_ls_remote_fetch_merge_base_manifest_validate_diff',
         'no_fetched_code_execution')
     $requestGuid = [Guid]::Empty
     if (-not [Guid]::TryParse([string]$request.request_id, [ref]$requestGuid) -or
@@ -372,6 +372,60 @@ try {
     Write-Output (Write-Classification $(if ($safe) { 'complete' } else { 'blocked' }) $classification $content $code); exit $(if ($safe) { 0 } else { 1 })
 }
 catch { Write-Output (Write-Classification 'blocked' 'unknown' 'unknown' 'observation_changed'); exit 1 }
+```
+
+## Copy-paste execution: validated remote diff summary
+
+Run this deployed, local block only after the request block exits zero.  It
+prints one aggregate-only sentinel: no path, character/account name, object
+ID, root hash, URL, file content, or Git stderr is emitted.  The two commits
+are fetched by their advertised object ID with `--no-tags --no-write-fetch-head`.
+Both manifests are structurally validated and their declared save blobs are
+checked against the commit before comparison.  Any changed local, live, or
+advertised remote observation fails closed.
+
+```powershell
+$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'
+$toolRoot=Join-Path $env:LOCALAPPDATA 'GrimDawnSaveSyncTool'; $python=Join-Path $toolRoot '.venv\Scripts\python.exe'
+$config=Join-Path $env:LOCALAPPDATA 'GrimDawnSaveSync\config.local.json'; $source=Join-Path $env:USERPROFILE 'grimdawnrep'; $machineId='desktop-a'
+$oidPattern='^[0-9a-f]{40}(?:[0-9a-f]{24})?$'
+function Out-Summary($Status,$Code,$Live,$Base,$Core,$Other,$Outside) {
+  if($Status -ne 'complete') { $Status='blocked'; $Code='observation_changed'; $Live='unknown'; $Base='unknown'; $Core=$Other=$Outside=$null }
+  $row=[ordered]@{sentinel='TERMINAL_A_REMOTE_DIFF_SUMMARY';status=$Status;leg='A1';machine_id=$machineId;code=$Code;live_vs_remote=$Live;baseline_vs_remote=$Base}
+  foreach($entry in @(@('character_core',$Core),@('character_tree_other',$Other),@('outside_character_tree',$Outside))){
+    if($null -eq $entry[1]){$row[$entry[0]]=[ordered]@{any_change=$false;added=0;removed=0;changed=0;changed_size_bucket='zero'}}
+    else{$row[$entry[0]]=$entry[1]}}
+  $row|ConvertTo-Json -Compress -Depth 4
+}
+function GitLines($Repo,[string[]]$CommandArgs){$x=@(& git -C $Repo @CommandArgs 2>$null);if($LASTEXITCODE -ne 0){throw 'invalid'};return @($x)}
+function GitOne($Repo,[string[]]$CommandArgs){$x=@(GitLines -Repo $Repo -CommandArgs $CommandArgs);if($x.Count -ne 1){throw 'invalid'};return ([string]$x[0]).Trim()}
+function GitQuiet($Repo,[string[]]$CommandArgs){$old=$ErrorActionPreference;try{$ErrorActionPreference='Continue';& git -C $Repo @CommandArgs 1>$null 2>$null;$rc=$LASTEXITCODE}finally{$ErrorActionPreference=$old};if($rc -ne 0){throw 'invalid'}}
+function HashFile($Path){if(!(Test-Path -LiteralPath $Path -PathType Leaf)){return 'missing'};$s=[IO.File]::Open($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read);$h=[Security.Cryptography.SHA256]::Create();try{return([BitConverter]::ToString($h.ComputeHash($s))).Replace('-','')}finally{$h.Dispose();$s.Dispose()}}
+ function Json([string[]]$CommandArgs){$x=@(& $python -m grim_dawn_sync --config $config --json @CommandArgs 2>$null);if($LASTEXITCODE -ne 0){throw 'invalid'};try{return (($x -join [Environment]::NewLine)|ConvertFrom-Json -ErrorAction Stop)}catch{throw 'invalid'}}
+ function FetchMark($Vault){$p=GitOne -Repo $Vault -CommandArgs @('rev-parse','--git-path','FETCH_HEAD');if(![IO.Path]::IsPathRooted($p)){$p=Join-Path $Vault $p};return (HashFile $p)}
+ function LocalMark($Vault,$State){return (@((GitOne -Repo $source -CommandArgs @('symbolic-ref','--quiet','HEAD')),(GitOne -Repo $source -CommandArgs @('rev-parse','HEAD')),((GitLines -Repo $source -CommandArgs @('status','--porcelain=v1','--untracked-files=all'))-join "`n"),(HashFile $python),(HashFile $config),(HashFile $State),((GitLines -Repo $Vault -CommandArgs @('status','--porcelain=v1','--untracked-files=all'))-join "`n"),(GitOne -Repo $Vault -CommandArgs @('rev-parse','HEAD')),((GitLines -Repo $Vault -CommandArgs @('for-each-ref','--sort=refname','--format=%(refname) %(objectname)','refs'))-join "`n"),(FetchMark $Vault)) -join "`0")}
+function Manifest($Vault,$Commit){
+  # This is the already installed, fixed local package only.  It is never
+  # loaded from the fetched commit; validate_commit_snapshot recomputes the
+  # root hash and verifies every declared blob plus save-tree exactness.
+  $probe='from pathlib import Path; from grim_dawn_sync.git_vault import GitVault; import sys; GitVault(Path(sys.argv[1])).validate_commit_snapshot(sys.argv[2])'
+  $prior=$ErrorActionPreference;try{$ErrorActionPreference='Continue';& $python -c $probe $Vault $Commit 1>$null 2>$null;$rc=$LASTEXITCODE}finally{$ErrorActionPreference=$prior};if($rc -ne 0){throw 'invalid'}
+  $raw=@(& git -C $Vault show "$Commit`:.sync/manifest.json" 2>$null)-join "`n";if($LASTEXITCODE -ne 0 -or !$raw){throw 'invalid'}
+  try{$m=$raw|ConvertFrom-Json -ErrorAction Stop}catch{throw 'invalid'}
+  if($m.root_hash -notmatch '^[0-9a-f]{64}$' -or !($m.files -is [array]) -or $m.file_count -ne $m.files.Count){throw 'invalid'}
+  return $m
+}
+function Bucket([int64]$Bytes){if($Bytes -eq 0){'zero'}elseif($Bytes -le 4096){'le_4k'}elseif($Bytes -le 65536){'le_64k'}elseif($Bytes -le 1048576){'le_1m'}else{'gt_1m'}}
+function Category($Path){$p=$Path -replace '\\','/';if($p -imatch '^main/[^/]+/player\.gdc$'){'character_core'}elseif($p -imatch '^main/[^/]+/'){'character_tree_other'}else{'outside_character_tree'}}
+function CompareManifests($Left,$Right){$l=@{};$r=@{};foreach($x in $Left.files){$l[$x.path]=$x};foreach($x in $Right.files){$r[$x.path]=$x};$out=@{};foreach($c in @('character_core','character_tree_other','outside_character_tree')){$out[$c]=[ordered]@{any_change=$false;added=0;removed=0;changed=0;changed_size_bucket='zero';_bytes=[int64]0}}
+  $allPaths=New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase);foreach($p in $l.Keys){[void]$allPaths.Add([string]$p)};foreach($p in $r.Keys){[void]$allPaths.Add([string]$p)};foreach($p in @($allPaths|Sort-Object)){$a=$l[$p];$b=$r[$p];$kind=Category $p;$row=$out[$kind];if($null -eq $a){$row.added++;$row._bytes+=[int64]$b.size}elseif($null -eq $b){$row.removed++;$row._bytes+=[int64]$a.size}elseif($a.sha256 -cne $b.sha256 -or [int64]$a.size -ne [int64]$b.size){$row.changed++;$row._bytes+=[Math]::Max([int64]$a.size,[int64]$b.size)}}
+  foreach($c in $out.Keys){$row=$out[$c];$row.any_change=(($row.added+$row.removed+$row.changed)-gt 0);$row.changed_size_bucket=Bucket $row._bytes;[void]$row.Remove('_bytes')};return $out}
+try{
+  if(!(Test-Path -LiteralPath $python -PathType Leaf) -or !(Test-Path -LiteralPath $config -PathType Leaf)){throw 'invalid'};$cfg=Get-Content -LiteralPath $config -Raw -Encoding utf8|ConvertFrom-Json -ErrorAction Stop;if($cfg.machine_id -cne $machineId -or !($cfg.vault_repo -is [string])){throw 'invalid'};$vault=[string]$cfg.vault_repo;$state=Join-Path ([IO.Path]::GetDirectoryName($config)) 'state.json'
+  $status=Json -CommandArgs @('status');$doctor=Json -CommandArgs @('doctor');if($status.readiness -ne 'blocked' -or $status.vault_relation -ne 'remote_changed_or_unknown' -or $status.active_lock -ne $null -or $status.recovery_phase -ne $null -or $status.processes.status -ne 'clear' -or $doctor.machine_id -cne $machineId){throw 'invalid'}
+  $before=LocalMark $vault $state;$baseline=GitOne -Repo $vault -CommandArgs @('rev-parse','HEAD');if($baseline -cne [string]$status.last_pushed_commit -or @(GitLines -Repo $vault -CommandArgs @('status','--porcelain=v1','--untracked-files=all')).Count){throw 'invalid'};$refs1=@(GitLines -Repo $vault -CommandArgs @('ls-remote','--refs','origin'));$main=@($refs1|Where-Object{$_ -match '^[0-9a-f]{40}(?:[0-9a-f]{24})?\s+refs/heads/main$'});if($main.Count -ne 1){throw 'invalid'};$remote=([string]$main[0]-split '\s+')[0];GitQuiet -Repo $vault -CommandArgs @('fetch','--no-tags','--no-write-fetch-head','origin',$remote);GitQuiet -Repo $vault -CommandArgs @('merge-base','--is-ancestor',$baseline,$remote)
+  $baseManifest=Manifest $vault $baseline;$remoteManifest=Manifest $vault $remote;$summary=CompareManifests $baseManifest $remoteManifest;$live=[string]$doctor.checks.save_root.manifest.root_hash;if($live -notmatch '^[0-9a-f]{64}$'){throw 'invalid'};$refs2=@(GitLines -Repo $vault -CommandArgs @('ls-remote','--refs','origin'));$after=LocalMark $vault $state;$again=Json -CommandArgs @('doctor');if(($refs1-join "`n") -cne ($refs2-join "`n") -or $before -cne $after -or $live -cne [string]$again.checks.save_root.manifest.root_hash){throw 'invalid'};Out-Summary 'complete' 'remote_diff_summarized' $(if($live -ceq $remoteManifest.root_hash){'same'}else{'different'}) $(if($baseManifest.root_hash -ceq $remoteManifest.root_hash){'same'}else{'different'}) $summary.character_core $summary.character_tree_other $summary.outside_character_tree;exit 0
+}catch{Write-Output (Out-Summary 'blocked' 'observation_changed' 'unknown' 'unknown' $null $null $null);exit 1}
 ```
 
 The old failure-diagnosis block below is retained only as historical context;
