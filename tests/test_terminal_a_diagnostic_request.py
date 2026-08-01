@@ -27,18 +27,15 @@ EXPECTED_KEYS = {
     "not_before",
     "expires_at",
 }
-EXPECTED_CHECKS = ["status", "doctor", "latest_launch_failure"]
+EXPECTED_CHECKS = ["status", "doctor", "vault_remote_classification"]
 EXPECTED_CONSTRAINTS = [
-    "no_launch_retry",
+    "no_game_launch",
+    "no_lock",
     "no_recover",
-    "no_save_mutation",
-    "no_push",
-    "no_pull",
-    "no_checkout",
-    "no_merge",
-    "no_reset",
-    "source_fetch_only",
-    "source_git_show_only",
+    "no_restore_snapshot_bookmark_promote",
+    "no_commit_push_merge_rebase_reset_checkout",
+    "no_state_config_save_remote_ref_write",
+    "vault_readonly_status_rev_parse_ls_remote_fetch_merge_base_manifest_compare",
     "no_fetched_code_execution",
 ]
 FORBIDDEN_FIELDS = {
@@ -82,12 +79,12 @@ def test_terminal_a_request_has_exact_schema_identity_and_readonly_action() -> N
     assert set(payload) == EXPECTED_KEYS
     assert payload["schema_version"] == "1.0.0"
     assert payload["kind"] == "grim_dawn_terminal_diagnostic_request"
-    assert payload["sequence"] == 4
+    assert payload["sequence"] == 6
     assert payload["target_machine_id"] == "desktop-a"
-    assert payload["leg"] == "A1" and payload["observed_code"] == "launch_failed"
-    assert payload["action"] == "diagnose_readonly"
-    assert payload["response_sentinel"] == "TERMINAL_A_DIAGNOSIS"
-    assert payload["request_id"] == "7c43e0e7-2dd3-4b70-8f35-9cc50673425a"
+    assert payload["leg"] == "A1" and payload["observed_code"] == "remote_changed_or_unknown"
+    assert payload["action"] == "classify_remote_readonly"
+    assert payload["response_sentinel"] == "TERMINAL_A_REMOTE_CLASSIFICATION"
+    assert payload["request_id"] == "6414c271-db14-4b57-b579-81bc382c6693"
     parsed_id = uuid.UUID(str(payload["request_id"]))
     assert str(parsed_id) == payload["request_id"]
 
@@ -103,7 +100,7 @@ def test_terminal_a_request_uses_exact_checks_constraints_and_no_forbidden_field
     assert b"private" not in raw.lower()
 
 
-def test_terminal_a_request_has_strict_utc_window_of_at_most_one_hour() -> None:
+def test_terminal_a_request_has_strict_utc_window_of_at_most_seventy_five_minutes() -> None:
     _raw, payload = _request()
     values: dict[str, datetime] = {}
     for field in ("issued_at", "not_before", "expires_at"):
@@ -113,10 +110,10 @@ def test_terminal_a_request_has_strict_utc_window_of_at_most_one_hour() -> None:
         assert parsed.utcoffset() == timezone.utc.utcoffset(parsed)
         values[field] = parsed
     assert values["issued_at"] <= values["not_before"] < values["expires_at"]
-    assert (values["expires_at"] - values["not_before"]).total_seconds() <= 3600
-    assert payload["issued_at"] == payload["not_before"] == "2026-08-01T10:15:00Z"
-    assert payload["expires_at"] == "2026-08-01T11:15:00Z"
-    assert (values["expires_at"] - values["not_before"]).total_seconds() == 3600
+    assert (values["expires_at"] - values["not_before"]).total_seconds() <= 4500
+    assert payload["issued_at"] == payload["not_before"] == "2026-08-01T13:18:00Z"
+    assert payload["expires_at"] == "2026-08-01T14:33:00Z"
+    assert (values["expires_at"] - values["not_before"]).total_seconds() == 4500
 
 
 def test_remote_handoff_fetches_canonical_master_and_reads_only_fixed_commit_path() -> None:
@@ -221,10 +218,38 @@ def test_remote_handoff_validates_canonical_json_shape_and_live_window_before_us
         "Get-RawStrictUtc",
         "[Regex]::Matches($Raw",
         "$issued -gt $notBefore",
-        "($expires - $notBefore).TotalSeconds -gt 3600",
+        "($expires - $notBefore).TotalSeconds -gt 4500",
         "$now -lt $notBefore",
         "$now -ge $expires",
     ):
         assert required in command
     assert "-not ($request.sequence -is [int])" in command
     assert "Get-StrictUtc ([string]$request.issued_at)" not in command
+
+
+def test_remote_classification_block_is_read_only_and_sanitized() -> None:
+    runbook = RUNBOOK_PATH.read_text(encoding="utf-8")
+    block = runbook.split("## Copy-paste execution", 1)[1].split("```powershell", 1)[1].split("```", 1)[0]
+
+    assert "TERMINAL_A_REMOTE_CLASSIFICATION" in block
+    assert "--json @CommandArgs" in block
+    assert "@('status')" in block and "@('doctor')" in block
+    assert "@('ls-remote','--refs','origin','refs/heads/main','refs/tags/grim-dawn-sync-active')" in block
+    assert "@('fetch','--no-tags','--no-write-fetch-head','origin',$remoteHead)" in block
+    assert "function Test-GitAncestor" in block
+    assert block.count("merge-base --is-ancestor") == 1
+    assert ".sync/manifest.json" in block
+    assert "Get-LocalFingerprint" in block
+    assert "Get-FetchHeadFingerprint" in block
+    assert "Get-FileFingerprint $State" in block
+    assert "'for-each-ref','--sort=refname','--format=%(refname) %(objectname)','refs'" in block
+    assert "refs/tags/grim-dawn-sync-active" in block
+    assert "$classification = if ($remoteHead -ceq $localHead)" in block
+    assert "'remote_ahead'" in block and "'remote_behind'" in block and "'diverged'" in block
+    assert "$content = if ($liveRoot -ceq $remoteManifest.root_hash)" in block
+    assert "only same content is safe to continue" in block
+    assert "$afterLiveRoot -cne $liveRoot" in block
+    assert "'safe_remote_ahead'" in block
+    assert "'remote_content_differs'" in block
+    for forbidden in (" launch", " recover", " restore", " snapshot", " bookmark", " promote", " commit", " push", " rebase", " reset", " checkout"):
+        assert forbidden not in block.lower()

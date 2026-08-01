@@ -1,32 +1,29 @@
 {
-  "action": "diagnose_readonly",
+  "action": "classify_remote_readonly",
   "checks": [
     "status",
     "doctor",
-    "latest_launch_failure"
+    "vault_remote_classification"
   ],
   "constraints": [
-    "no_launch_retry",
+    "no_game_launch",
+    "no_lock",
     "no_recover",
-    "no_save_mutation",
-    "no_push",
-    "no_pull",
-    "no_checkout",
-    "no_merge",
-    "no_reset",
-    "source_fetch_only",
-    "source_git_show_only",
+    "no_restore_snapshot_bookmark_promote",
+    "no_commit_push_merge_rebase_reset_checkout",
+    "no_state_config_save_remote_ref_write",
+    "vault_readonly_status_rev_parse_ls_remote_fetch_merge_base_manifest_compare",
     "no_fetched_code_execution"
   ],
-  "expires_at": "2026-08-01T11:15:00Z",
-  "issued_at": "2026-08-01T10:15:00Z",
+  "expires_at": "2026-08-01T14:33:00Z",
+  "issued_at": "2026-08-01T13:18:00Z",
   "kind": "grim_dawn_terminal_diagnostic_request",
   "leg": "A1",
-  "not_before": "2026-08-01T10:15:00Z",
-  "observed_code": "launch_failed",
-  "request_id": "7c43e0e7-2dd3-4b70-8f35-9cc50673425a",
-  "response_sentinel": "TERMINAL_A_DIAGNOSIS",
+  "not_before": "2026-08-01T13:18:00Z",
+  "observed_code": "remote_changed_or_unknown",
+  "request_id": "6414c271-db14-4b57-b579-81bc382c6693",
+  "response_sentinel": "TERMINAL_A_REMOTE_CLASSIFICATION",
   "schema_version": "1.0.0",
-  "sequence": 4,
+  "sequence": 6,
   "target_machine_id": "desktop-a"
 }

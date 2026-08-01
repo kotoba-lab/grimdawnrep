@@ -1,9 +1,8 @@
-# Terminal A roundtrip: read-only A1 diagnosis
+# Terminal A roundtrip: read-only A1 remote classification
 
-Use this runbook only after A1 reports `launch_failed`.  It performs a
-read-only diagnosis of the already enrolled Terminal A (`desktop-a`).  It
-does not pull public source first: even a fast-forward pull changes local
-state and is unnecessary for this diagnosis.
+Use this runbook only after A1 reports `remote_changed_or_unknown`. It
+classifies the already enrolled Terminal A (`desktop-a`) without changing a
+save, state, configuration, source worktree, or Vault ref.
 
 ## Operator-mediated public remote request
 
@@ -47,7 +46,7 @@ function Write-RequestBlocked {
         'ancestor','blob','schema','time','post_invariant')
     $safeStage = if ($stage -in $safeStages) { $stage } else { 'origin_identity' }
     [ordered]@{
-        sentinel = 'TERMINAL_A_DIAGNOSIS'
+        sentinel = 'TERMINAL_A_REMOTE_CLASSIFICATION'
         status = 'blocked'
         leg = 'A1'
         machine_id = $machineId
@@ -167,17 +166,19 @@ try {
     if (-not ($request.schema_version -is [string]) -or $request.schema_version -cne '1.0.0' -or
         -not ($request.kind -is [string]) -or
         $request.kind -cne 'grim_dawn_terminal_diagnostic_request' -or
-        -not ($request.sequence -is [int]) -or $request.sequence -ne 4 -or
+        -not ($request.sequence -is [int]) -or $request.sequence -ne 6 -or
         -not ($request.target_machine_id -is [string]) -or $request.target_machine_id -cne $machineId -or
         -not ($request.leg -is [string]) -or -not ($request.observed_code -is [string]) -or
         -not ($request.action -is [string]) -or -not ($request.response_sentinel -is [string]) -or
         -not ($request.request_id -is [string]) -or
-        $request.leg -cne 'A1' -or $request.observed_code -cne 'launch_failed' -or
-        $request.action -cne 'diagnose_readonly' -or
-        $request.response_sentinel -cne 'TERMINAL_A_DIAGNOSIS') { throw 'invalid' }
-    Assert-ExactArray $request.checks @('status','doctor','latest_launch_failure')
-    Assert-ExactArray $request.constraints @('no_launch_retry','no_recover','no_save_mutation','no_push',
-        'no_pull','no_checkout','no_merge','no_reset','source_fetch_only','source_git_show_only','no_fetched_code_execution')
+        $request.leg -cne 'A1' -or $request.observed_code -cne 'remote_changed_or_unknown' -or
+        $request.action -cne 'classify_remote_readonly' -or
+        $request.response_sentinel -cne 'TERMINAL_A_REMOTE_CLASSIFICATION') { throw 'invalid' }
+    Assert-ExactArray $request.checks @('status','doctor','vault_remote_classification')
+    Assert-ExactArray $request.constraints @('no_game_launch','no_lock','no_recover',
+        'no_restore_snapshot_bookmark_promote','no_commit_push_merge_rebase_reset_checkout',
+        'no_state_config_save_remote_ref_write','vault_readonly_status_rev_parse_ls_remote_fetch_merge_base_manifest_compare',
+        'no_fetched_code_execution')
     $requestGuid = [Guid]::Empty
     if (-not [Guid]::TryParse([string]$request.request_id, [ref]$requestGuid) -or
         $requestGuid.ToString() -cne [string]$request.request_id) { throw 'invalid' }
@@ -188,7 +189,7 @@ try {
     $expires = Get-RawStrictUtc $requestRaw 'expires_at'
     $now = [DateTimeOffset]::UtcNow
     if ($issued -gt $notBefore -or $notBefore -ge $expires -or
-        ($expires - $notBefore).TotalSeconds -gt 3600 -or $now -lt $notBefore -or $now -ge $expires) { throw 'invalid' }
+        ($expires - $notBefore).TotalSeconds -gt 4500 -or $now -lt $notBefore -or $now -ge $expires) { throw 'invalid' }
 
     $stage = 'post_invariant'
     $afterBranch = Get-OneGitLine @('symbolic-ref','--quiet','HEAD')
@@ -226,6 +227,157 @@ merge, rebase, push, launch retry, recovery, or save mutation.
   final sentinel line below.
 
 ## Copy-paste execution
+
+Run this deployed, local classification block only after the request block
+exits zero. It prints exactly one allow-listed sentinel. It never prints a
+remote URL, object ID, manifest root, path, save name, or native stderr. If
+the remote changes while it is examined, it reports `blocked/unknown`.
+
+```powershell
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$toolRoot = Join-Path $env:LOCALAPPDATA 'GrimDawnSaveSyncTool'
+$python = Join-Path $toolRoot '.venv\Scripts\python.exe'
+$config = Join-Path $env:LOCALAPPDATA 'GrimDawnSaveSync\config.local.json'
+$machineId = 'desktop-a'
+$source = Join-Path $env:USERPROFILE 'grimdawnrep'
+$shortcut = Join-Path (Join-Path $env:USERPROFILE 'Desktop') 'Grim Dawn (DPYes + Save Selection).lnk'
+$oidPattern = '^[0-9a-f]{40}(?:[0-9a-f]{24})?$'
+
+function Write-Classification([string]$Status, [string]$Classification, [string]$Content, [string]$Code) {
+    if ($Status -notin @('complete','blocked')) { $Status = 'blocked' }
+    if ($Classification -notin @('equal','remote_ahead','remote_behind','diverged','unknown')) { $Classification = 'unknown' }
+    if ($Content -notin @('same','different','unknown')) { $Content = 'unknown' }
+    if ($Code -notin @('safe_remote_ahead','remote_content_differs','not_target_relation','observation_changed')) { $Code = 'observation_changed' }
+    [ordered]@{ sentinel = 'TERMINAL_A_REMOTE_CLASSIFICATION'; status = $Status; leg = 'A1'; machine_id = $machineId; classification = $Classification; content = $Content; code = $Code } | ConvertTo-Json -Compress
+}
+function Invoke-GitLines([string]$Repo, [string[]]$CommandArgs) {
+    $lines = @(& git -C $Repo @CommandArgs 2>$null)
+    if ($LASTEXITCODE -ne 0) { throw 'invalid' }
+    return @($lines)
+}
+function Get-OneGitLine([string]$Repo, [string[]]$CommandArgs) {
+    $lines = @(Invoke-GitLines -Repo $Repo -CommandArgs $CommandArgs)
+    if ($lines.Count -ne 1) { throw 'invalid' }
+    return ([string]$lines[0]).Trim()
+}
+function Invoke-GitQuiet([string]$Repo, [string[]]$CommandArgs) {
+    $priorErrorAction = $ErrorActionPreference
+    try { $ErrorActionPreference = 'Continue'; & git -C $Repo @CommandArgs 1>$null 2>$null; $code = $LASTEXITCODE }
+    finally { $ErrorActionPreference = $priorErrorAction }
+    if ($code -ne 0) { throw 'invalid' }
+}
+function Test-GitAncestor([string]$Repo, [string]$Ancestor, [string]$Descendant) {
+    $priorErrorAction = $ErrorActionPreference
+    try { $ErrorActionPreference = 'Continue'; & git -C $Repo merge-base --is-ancestor $Ancestor $Descendant 1>$null 2>$null; $code = $LASTEXITCODE }
+    finally { $ErrorActionPreference = $priorErrorAction }
+    if ($code -eq 0) { return $true }
+    if ($code -eq 1) { return $false }
+    throw 'invalid'
+}
+function Get-Json([string[]]$CommandArgs) {
+    $output = @(& $python -m grim_dawn_sync --config $config --json @CommandArgs 2>$null)
+    if ($LASTEXITCODE -ne 0) { throw 'invalid' }
+    try { return ((@($output) -join [Environment]::NewLine) | ConvertFrom-Json -ErrorAction Stop) }
+    catch { throw 'invalid' }
+}
+function Get-FileFingerprint([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return 'missing' }
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($sha.ComputeHash($stream))).Replace('-', '') }
+    finally { $sha.Dispose(); $stream.Dispose() }
+}
+function Get-FetchHeadFingerprint([string]$Vault) {
+    # FETCH_HEAD is normally absent because the diagnostic network read uses
+    # --no-write-fetch-head.  Its absence is nevertheless observable state:
+    # a concurrent ordinary network refresh must fail closed like a ref move.
+    $priorErrorAction = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $lines = @(& git -C $Vault rev-parse --verify --quiet FETCH_HEAD 2>$null)
+        $code = $LASTEXITCODE
+    }
+    finally { $ErrorActionPreference = $priorErrorAction }
+    if ($code -eq 1) { return 'absent' }
+    if ($code -ne 0 -or $lines.Count -ne 1 -or [string]$lines[0] -notmatch '^[0-9a-f]{40}(?:[0-9a-f]{24})?$') { throw 'invalid' }
+    return ('present:' + [string]$lines[0])
+}
+function Get-LocalFingerprint([string]$Vault, [string]$State) {
+    $sourceBranch = Get-OneGitLine -Repo $source -CommandArgs @('symbolic-ref','--quiet','HEAD')
+    $sourceHead = Get-OneGitLine -Repo $source -CommandArgs @('rev-parse','HEAD')
+    $sourceStatus = (Invoke-GitLines -Repo $source -CommandArgs @('status','--porcelain=v1','--untracked-files=all')) -join "`n"
+    $vaultStatus = (Invoke-GitLines -Repo $Vault -CommandArgs @('status','--porcelain=v1','--untracked-files=all')) -join "`n"
+    $vaultHead = Get-OneGitLine -Repo $Vault -CommandArgs @('rev-parse','HEAD')
+    # Include every local ref, including refs/remotes, in a fixed order.  Do
+    # not reveal the fingerprint or its components outside this process.
+    $vaultRefs = (Invoke-GitLines -Repo $Vault -CommandArgs @('for-each-ref','--sort=refname','--format=%(refname) %(objectname)','refs')) -join "`n"
+    $fetchHead = Get-FetchHeadFingerprint $Vault
+    $parts = @()
+    $parts += $sourceBranch
+    $parts += $sourceHead
+    $parts += $sourceStatus
+    $parts += Get-FileFingerprint $python
+    $parts += Get-FileFingerprint $config
+    $parts += Get-FileFingerprint $State
+    $parts += $vaultStatus
+    $parts += $vaultHead
+    $parts += $vaultRefs
+    $parts += $fetchHead
+    return ($parts -join "`0")
+}
+
+try {
+    if (-not (Test-Path -LiteralPath $source -PathType Container) -or -not (Test-Path -LiteralPath $python -PathType Leaf) -or -not (Test-Path -LiteralPath $config -PathType Leaf) -or -not (Test-Path -LiteralPath $shortcut -PathType Leaf)) { throw 'invalid' }
+    $link = (New-Object -ComObject WScript.Shell).CreateShortcut($shortcut)
+    if ($link.TargetPath -cne [IO.Path]::GetFullPath($python) -or $link.WorkingDirectory -cne [IO.Path]::GetFullPath((Join-Path $source 'src')) -or $link.Arguments -notmatch 'grim_dawn_sync\.cli' -or $link.Arguments -notmatch "'launch'") { throw 'invalid' }
+    $configured = Get-Content -LiteralPath $config -Raw -Encoding utf8 | ConvertFrom-Json -ErrorAction Stop
+    if ($configured.machine_id -ne $machineId -or -not ($configured.vault_repo -is [string]) -or -not ($configured.vault_repo)) { throw 'invalid' }
+    $vault = [string]$configured.vault_repo
+    $state = Join-Path ([IO.Path]::GetDirectoryName($config)) 'state.json'
+    if (-not (Test-Path -LiteralPath $vault -PathType Container)) { throw 'invalid' }
+    $status = Get-Json -CommandArgs @('status'); $doctor = Get-Json -CommandArgs @('doctor')
+    if ($status.schema_version -ne '1.0.0' -or $status.command -ne 'status' -or $doctor.schema_version -ne '1.0.0' -or $doctor.command -ne 'doctor' -or $doctor.read_only -ne $true -or $doctor.machine_id -ne $machineId -or $status.processes.complete -ne $true -or $status.processes.status -ne 'clear' -or $status.active_lock -ne $null -or $status.recovery_phase -ne $null -or $status.last_pushed_commit -notmatch $oidPattern) { throw 'invalid' }
+    $beforeLocal = Get-LocalFingerprint $vault $state
+    if (@(Invoke-GitLines -Repo $source -CommandArgs @('status','--porcelain=v1','--untracked-files=all')).Count -ne 0) { throw 'invalid' }
+    $worktree = @(Invoke-GitLines -Repo $vault -CommandArgs @('status','--porcelain=v1','--untracked-files=all'))
+    if ($worktree.Count -ne 0) { throw 'invalid' }
+    $localHead = Get-OneGitLine -Repo $vault -CommandArgs @('rev-parse','HEAD')
+    if ($localHead -cne [string]$status.last_pushed_commit) { throw 'invalid' }
+    $beforeRemoteRefs = @(Invoke-GitLines -Repo $vault -CommandArgs @('ls-remote','--refs','origin','refs/heads/main','refs/tags/grim-dawn-sync-active'))
+    $beforeMain = @($beforeRemoteRefs | Where-Object { $_ -match '^[0-9a-f]{40}(?:[0-9a-f]{24})?\s+refs/heads/main$' })
+    if ($beforeMain.Count -ne 1) { throw 'invalid' }
+    $remoteHead = ([string]$beforeMain[0] -split '\s+')[0]
+    # Fetch the already advertised object ID, not the branch ref: clone's
+    # default fetch refspec would otherwise advance refs/remotes/origin/main.
+    Invoke-GitQuiet -Repo $vault -CommandArgs @('fetch','--no-tags','--no-write-fetch-head','origin',$remoteHead)
+    $localIsAncestor = Test-GitAncestor $vault $localHead $remoteHead
+    $remoteIsAncestor = Test-GitAncestor $vault $remoteHead $localHead
+    $manifestRaw = @(& git -C $vault show "$remoteHead`:.sync/manifest.json" 2>$null) -join "`n"
+    if ($LASTEXITCODE -ne 0) { throw 'invalid' }
+    $remoteManifest = $manifestRaw | ConvertFrom-Json -ErrorAction Stop
+    $liveRoot = [string]$doctor.checks.save_root.manifest.root_hash
+    if ($liveRoot -notmatch '^[0-9a-f]{64}$' -or $remoteManifest.root_hash -notmatch '^[0-9a-f]{64}$') { throw 'invalid' }
+    $afterRemoteRefs = @(Invoke-GitLines -Repo $vault -CommandArgs @('ls-remote','--refs','origin','refs/heads/main','refs/tags/grim-dawn-sync-active'))
+    $afterLocal = Get-LocalFingerprint $vault $state
+    $afterDoctor = Get-Json -CommandArgs @('doctor')
+    $afterLiveRoot = [string]$afterDoctor.checks.save_root.manifest.root_hash
+    if (($beforeRemoteRefs -join "`n") -cne ($afterRemoteRefs -join "`n") -or $afterLocal -cne $beforeLocal -or $afterLiveRoot -cne $liveRoot) { Write-Output (Write-Classification 'blocked' 'unknown' 'unknown' 'observation_changed'); exit 1 }
+    $classification = if ($remoteHead -ceq $localHead) { 'equal' } elseif ($localIsAncestor -and -not $remoteIsAncestor) { 'remote_ahead' } elseif ($remoteIsAncestor -and -not $localIsAncestor) { 'remote_behind' } else { 'diverged' }
+    $content = if ($liveRoot -ceq $remoteManifest.root_hash) { 'same' } else { 'different' }
+    # An advanced remote is still reported by ancestry even when its content differs;
+    # only same content is safe to continue without an explicit user decision.
+    $safe = ($classification -eq 'remote_ahead' -and $content -eq 'same')
+    $code = if ($safe) { 'safe_remote_ahead' } elseif ($classification -eq 'remote_ahead' -and $content -eq 'different') { 'remote_content_differs' } else { 'not_target_relation' }
+    Write-Output (Write-Classification $(if ($safe) { 'complete' } else { 'blocked' }) $classification $content $code); exit $(if ($safe) { 0 } else { 1 })
+}
+catch { Write-Output (Write-Classification 'blocked' 'unknown' 'unknown' 'observation_changed'); exit 1 }
+```
+
+The old failure-diagnosis block below is retained only as historical context;
+do not run it for this request.
+
+## Retired failure-diagnosis reference
 
 The block suppresses command output, validates the existing configuration's
 machine ID, then reduces observations to allow-listed enums and booleans.  A
