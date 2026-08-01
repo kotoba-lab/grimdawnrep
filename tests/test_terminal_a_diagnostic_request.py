@@ -89,7 +89,7 @@ def test_terminal_a_request_has_exact_schema_identity_and_readonly_action() -> N
     assert payload["leg"] == "A1" and payload["observed_code"] == "remote_changed_or_unknown"
     assert payload["action"] == "selector_cancel_reload_dry_run"
     assert payload["response_sentinel"] == "TERMINAL_A_SELECTOR_DRY_RUN"
-    assert payload["request_id"] == "2fb462bc-8b6d-4f09-ae13-0996640dcf07"
+    assert payload["request_id"] == "7c41ca11-8075-4236-b361-caec323095d2"
     parsed_id = uuid.UUID(str(payload["request_id"]))
     assert str(parsed_id) == payload["request_id"]
 
@@ -116,8 +116,8 @@ def test_terminal_a_request_has_strict_utc_window_of_at_most_seventy_five_minute
         values[field] = parsed
     assert values["issued_at"] <= values["not_before"] < values["expires_at"]
     assert (values["expires_at"] - values["not_before"]).total_seconds() <= 4500
-    assert payload["issued_at"] == payload["not_before"] == "2026-08-02T13:45:00Z"
-    assert payload["expires_at"] == "2026-08-02T15:00:00Z"
+    assert payload["issued_at"] == payload["not_before"] == "2026-08-01T21:57:35Z"
+    assert payload["expires_at"] == "2026-08-01T23:12:35Z"
     assert (values["expires_at"] - values["not_before"]).total_seconds() == 4500
 
 
