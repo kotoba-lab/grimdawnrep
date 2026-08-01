@@ -27,15 +27,20 @@ EXPECTED_KEYS = {
     "not_before",
     "expires_at",
 }
-EXPECTED_CHECKS = ["status_baseline", "doctor", "validated_remote_and_baseline_manifest", "remote_diff_summary"]
+EXPECTED_CHECKS = [
+    "status_baseline", "doctor", "current_deployment_contract",
+    "remote_ahead_live_equals_baseline", "stable_remote_difference",
+    "selector_cancel_reload_invariants",
+]
 EXPECTED_CONSTRAINTS = [
-    "no_game_launch",
+    "shortcut_ui_cancel_reload_only",
+    "no_game_or_dpyes_start",
     "no_lock",
     "no_recover",
     "no_restore_snapshot_bookmark_promote",
     "no_commit_push_merge_rebase_reset_checkout",
     "no_state_config_save_remote_ref_write",
-    "vault_readonly_status_rev_parse_ls_remote_fetch_merge_base_manifest_validate_diff",
+    "allow_only_designated_catalog_tracking_ref_transition",
     "no_fetched_code_execution",
 ]
 FORBIDDEN_FIELDS = {
@@ -79,12 +84,12 @@ def test_terminal_a_request_has_exact_schema_identity_and_readonly_action() -> N
     assert set(payload) == EXPECTED_KEYS
     assert payload["schema_version"] == "1.0.0"
     assert payload["kind"] == "grim_dawn_terminal_diagnostic_request"
-    assert payload["sequence"] == 7
+    assert payload["sequence"] == 8
     assert payload["target_machine_id"] == "desktop-a"
     assert payload["leg"] == "A1" and payload["observed_code"] == "remote_changed_or_unknown"
-    assert payload["action"] == "summarize_remote_diff_readonly"
-    assert payload["response_sentinel"] == "TERMINAL_A_REMOTE_DIFF_SUMMARY"
-    assert payload["request_id"] == "b08cfe0a-41c2-4cdd-b0ce-39c4d81b8b08"
+    assert payload["action"] == "selector_cancel_reload_dry_run"
+    assert payload["response_sentinel"] == "TERMINAL_A_SELECTOR_DRY_RUN"
+    assert payload["request_id"] == "2fb462bc-8b6d-4f09-ae13-0996640dcf07"
     parsed_id = uuid.UUID(str(payload["request_id"]))
     assert str(parsed_id) == payload["request_id"]
 
@@ -111,8 +116,8 @@ def test_terminal_a_request_has_strict_utc_window_of_at_most_seventy_five_minute
         values[field] = parsed
     assert values["issued_at"] <= values["not_before"] < values["expires_at"]
     assert (values["expires_at"] - values["not_before"]).total_seconds() <= 4500
-    assert payload["issued_at"] == payload["not_before"] == "2026-08-01T14:27:29Z"
-    assert payload["expires_at"] == "2026-08-01T15:42:29Z"
+    assert payload["issued_at"] == payload["not_before"] == "2026-08-02T13:45:00Z"
+    assert payload["expires_at"] == "2026-08-02T15:00:00Z"
     assert (values["expires_at"] - values["not_before"]).total_seconds() == 4500
 
 
@@ -283,3 +288,56 @@ def test_remote_diff_summary_block_keeps_sequence6_classification_block_availabl
     classification = runbook.split("## Copy-paste execution", 1)[1].split("## Retired failure-diagnosis reference", 1)[0]
     assert "TERMINAL_A_REMOTE_CLASSIFICATION" in classification
     assert "safe_remote_ahead" in classification
+
+
+def test_selector_dry_run_allows_only_catalog_ref_to_advertised_remote() -> None:
+    runbook = RUNBOOK_PATH.read_text(encoding="utf-8")
+    block = runbook.split("## Selector cancel/reload dry-run block", 1)[1].split("```powershell", 1)[1].split("```", 1)[0]
+
+    assert "TERMINAL_A_SELECTOR_DRY_RUN" in block
+    assert "$catalogRef='refs/remotes/origin/main'" in block
+    assert "function Stable($Vault,$Remote,$Base,$Before,$After)" in block
+    assert "$Before[$catalogRef] -cne $Base" in block
+    assert "!$After.Contains($catalogRef)" in block
+    assert "$After[$catalogRef] -cne $Remote" in block
+    assert "refs/remotes/origin/main" not in block.split("foreach($k in $Before.Keys)", 1)[1]
+
+
+def test_selector_dry_run_uses_exact_shortcut_contract_and_pid_bound_window_input() -> None:
+    runbook = RUNBOOK_PATH.read_text(encoding="utf-8")
+    block = runbook.split("## Selector cancel/reload dry-run block", 1)[1].split("```powershell", 1)[1].split("```", 1)[0]
+
+    assert "from grim_dawn_sync.shortcut import _launch_arguments" in block
+    assert "$link.Arguments -cne [string]$expectedArgs[0]" in block
+    assert "$link.WorkingDirectory -cne [IO.Path]::GetFullPath($sourceRoot)" in block
+    assert "AppActivate" not in block and "SendKeys" not in block
+    assert "GetWindowThreadProcessId" in block and "PostMessage" in block
+    assert "@(SelectorWindows).Count -ne 0" in block
+    assert "SendSelectorKey $ui 'ESC'" in block
+    assert block.count("SendSelectorKey $ui 'F5'") == 1
+
+
+def test_selector_dry_run_fails_closed_for_malicious_shortcut_and_window_ambiguity() -> None:
+    runbook = RUNBOOK_PATH.read_text(encoding="utf-8")
+    block = runbook.split("## Selector cancel/reload dry-run block", 1)[1].split("```powershell", 1)[1].split("```", 1)[0]
+
+    # Exact equality rejects appended or substituted launch arguments.  Window
+    # enumeration rejects a pre-existing title, duplicate title, or ambiguous
+    # new Python ownership before any ESC/F5 input is sent.
+    assert "$link.Arguments -cne [string]$expectedArgs[0]" in block
+    assert "if(@(SelectorWindows).Count -ne 0){throw 'precondition_failed'}" in block
+    assert "$windows.Count -eq 1 -and $new.Count -eq 1" in block
+    assert "$windows.Count -gt 1 -or $new.Count -gt 1" in block
+    assert "if((GameRunning)){throw 'game_started_unexpectedly'}" in block
+
+
+def test_selector_dry_run_ref_and_output_boundaries_are_privacy_safe() -> None:
+    runbook = RUNBOOK_PATH.read_text(encoding="utf-8")
+    block = runbook.split("## Selector cancel/reload dry-run block", 1)[1].split("```powershell", 1)[1].split("```", 1)[0]
+
+    assert "foreach($k in $Before.Keys){if($k -cne $catalogRef" in block
+    assert "foreach($k in $After.Keys){if($k -cne $catalogRef" in block
+    assert "$After[$catalogRef] -cne $Remote" in block
+    assert "ConvertTo-Json -Compress" in block
+    assert "2>$null" in block
+    assert "Write-Output (Out-DryRun" in block

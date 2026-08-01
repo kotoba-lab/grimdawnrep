@@ -1,30 +1,33 @@
 {
-  "action": "summarize_remote_diff_readonly",
+  "action": "selector_cancel_reload_dry_run",
   "checks": [
     "status_baseline",
     "doctor",
-    "validated_remote_and_baseline_manifest",
-    "remote_diff_summary"
+    "current_deployment_contract",
+    "remote_ahead_live_equals_baseline",
+    "stable_remote_difference",
+    "selector_cancel_reload_invariants"
   ],
   "constraints": [
-    "no_game_launch",
+    "shortcut_ui_cancel_reload_only",
+    "no_game_or_dpyes_start",
     "no_lock",
     "no_recover",
     "no_restore_snapshot_bookmark_promote",
     "no_commit_push_merge_rebase_reset_checkout",
     "no_state_config_save_remote_ref_write",
-    "vault_readonly_status_rev_parse_ls_remote_fetch_merge_base_manifest_validate_diff",
+    "allow_only_designated_catalog_tracking_ref_transition",
     "no_fetched_code_execution"
   ],
-  "expires_at": "2026-08-01T15:42:29Z",
-  "issued_at": "2026-08-01T14:27:29Z",
+  "expires_at": "2026-08-02T15:00:00Z",
+  "issued_at": "2026-08-02T13:45:00Z",
   "kind": "grim_dawn_terminal_diagnostic_request",
   "leg": "A1",
-  "not_before": "2026-08-01T14:27:29Z",
+  "not_before": "2026-08-02T13:45:00Z",
   "observed_code": "remote_changed_or_unknown",
-  "request_id": "b08cfe0a-41c2-4cdd-b0ce-39c4d81b8b08",
-  "response_sentinel": "TERMINAL_A_REMOTE_DIFF_SUMMARY",
+  "request_id": "2fb462bc-8b6d-4f09-ae13-0996640dcf07",
+  "response_sentinel": "TERMINAL_A_SELECTOR_DRY_RUN",
   "schema_version": "1.0.0",
-  "sequence": 7,
+  "sequence": 8,
   "target_machine_id": "desktop-a"
 }

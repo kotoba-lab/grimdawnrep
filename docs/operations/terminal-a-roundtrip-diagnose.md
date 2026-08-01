@@ -1,8 +1,11 @@
-# Terminal A roundtrip: read-only A1 remote diff summary
+# Terminal A roundtrip: selector cancel/reload dry run
 
-Use this runbook only after A1 reports `remote_changed_or_unknown`. It
-summarizes the already enrolled Terminal A (`desktop-a`) without changing a
-save, state, configuration, source worktree, or Vault ref.
+Use this runbook only after A1 reports a stable, content-different
+`remote_ahead` observation and its aggregate diff summary. It exercises the
+already enrolled Terminal A (`desktop-a`) selector without selecting data,
+starting DPYes or Grim Dawn, or changing a save, state, configuration, source
+worktree, or Vault ref (apart from the designated catalog tracking ref update
+performed by the installed selector while it refreshes its catalog).
 
 ## Operator-mediated public remote request
 
@@ -166,18 +169,19 @@ try {
     if (-not ($request.schema_version -is [string]) -or $request.schema_version -cne '1.0.0' -or
         -not ($request.kind -is [string]) -or
         $request.kind -cne 'grim_dawn_terminal_diagnostic_request' -or
-        -not ($request.sequence -is [int]) -or $request.sequence -ne 7 -or
+        -not ($request.sequence -is [int]) -or $request.sequence -ne 8 -or
         -not ($request.target_machine_id -is [string]) -or $request.target_machine_id -cne $machineId -or
         -not ($request.leg -is [string]) -or -not ($request.observed_code -is [string]) -or
         -not ($request.action -is [string]) -or -not ($request.response_sentinel -is [string]) -or
         -not ($request.request_id -is [string]) -or
         $request.leg -cne 'A1' -or $request.observed_code -cne 'remote_changed_or_unknown' -or
-        $request.action -cne 'summarize_remote_diff_readonly' -or
-        $request.response_sentinel -cne 'TERMINAL_A_REMOTE_DIFF_SUMMARY') { throw 'invalid' }
-    Assert-ExactArray $request.checks @('status_baseline','doctor','validated_remote_and_baseline_manifest','remote_diff_summary')
-    Assert-ExactArray $request.constraints @('no_game_launch','no_lock','no_recover',
+        $request.action -cne 'selector_cancel_reload_dry_run' -or
+        $request.response_sentinel -cne 'TERMINAL_A_SELECTOR_DRY_RUN') { throw 'invalid' }
+    Assert-ExactArray $request.checks @('status_baseline','doctor','current_deployment_contract',
+        'remote_ahead_live_equals_baseline','stable_remote_difference','selector_cancel_reload_invariants')
+    Assert-ExactArray $request.constraints @('shortcut_ui_cancel_reload_only','no_game_or_dpyes_start','no_lock','no_recover',
         'no_restore_snapshot_bookmark_promote','no_commit_push_merge_rebase_reset_checkout',
-        'no_state_config_save_remote_ref_write','vault_readonly_status_rev_parse_ls_remote_fetch_merge_base_manifest_validate_diff',
+        'no_state_config_save_remote_ref_write','allow_only_designated_catalog_tracking_ref_transition',
         'no_fetched_code_execution')
     $requestGuid = [Guid]::Empty
     if (-not [Guid]::TryParse([string]$request.request_id, [ref]$requestGuid) -or
@@ -205,6 +209,77 @@ catch {
     Write-Output (Write-RequestBlocked)
     exit 1
 }
+```
+
+## Selector cancel/reload dry-run block
+
+Run this deployed, local block only after the request block exits zero. It
+uses the existing Selection shortcut exactly twice.  The first visible
+selector is cancelled; the second receives exactly one `F5`, waits for the
+rebuilt selector, then is cancelled.  Never select a row, activate Launch,
+confirm a dialog, or retry a click.  A title mismatch, timeout, second
+instance, game/DPYes process, or any observation other than the designated
+`refs/remotes/origin/main` catalog-tracking transition is blocked.
+
+```powershell
+$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue'
+$toolRoot=Join-Path $env:LOCALAPPDATA 'GrimDawnSaveSyncTool';$python=Join-Path $toolRoot '.venv\Scripts\python.exe'
+$config=Join-Path $env:LOCALAPPDATA 'GrimDawnSaveSync\config.local.json';$source=Join-Path $env:USERPROFILE 'grimdawnrep';$machineId='desktop-a'
+$shortcut=Join-Path (Join-Path $env:USERPROFILE 'Desktop') 'Grim Dawn (DPYes + Save Selection).lnk';$selectorTitle='Grim Dawn Save Selection';$catalogRef='refs/remotes/origin/main'
+Add-Type @'
+using System; using System.Text; using System.Runtime.InteropServices;
+public static class SelectorWindow {
+ [DllImport("user32.dll")] public static extern bool EnumWindows(Func<IntPtr,IntPtr,bool> f,IntPtr l);
+ [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+ [DllImport("user32.dll",CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr h,StringBuilder b,int n);
+ [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h,out uint p);
+ [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
+ [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+ [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h,uint m,IntPtr w,IntPtr l);
+}
+'@
+function Out-DryRun($Status,$Code,$First,$Reload,$Second,$Default,$Count,$Game,$Mutated){
+  if($Status -ne 'complete'){$Status='blocked';if($Code -notin @('precondition_failed','selector_failed','game_started_unexpectedly','observation_changed','unexpected_failed')){$Code='unexpected_failed'};$First=$false;$Reload=$false;$Second=$false;$Default='unknown';$Count='one';$Game=$false;$Mutated=$false}
+  [ordered]@{sentinel='TERMINAL_A_SELECTOR_DRY_RUN';status=$Status;leg='A1';machine_id=$machineId;first_cancelled=[bool]$First;reload_completed=[bool]$Reload;second_cancelled=[bool]$Second;selector_visible_count=2;default_role=$Default;candidate_count_bucket=$Count;game_started=[bool]$Game;mutations_detected=[bool]$Mutated;code=$Code}|ConvertTo-Json -Compress
+}
+function Json([string[]]$Args){$x=@(& $python -m grim_dawn_sync --config $config --json @Args 2>$null);if($LASTEXITCODE -ne 0){throw 'precondition_failed'};try{return (($x -join [Environment]::NewLine)|ConvertFrom-Json -ErrorAction Stop)}catch{throw 'precondition_failed'}}
+function Git([string]$Repo,[string[]]$Args){$x=@(& git -C $Repo @Args 2>$null);if($LASTEXITCODE -ne 0){throw 'observation_changed'};return @($x)}
+function One([string]$Repo,[string[]]$Args){$x=@(Git $Repo $Args);if($x.Count -ne 1){throw 'observation_changed'};return ([string]$x[0]).Trim()}
+function Hash($Path){if(!(Test-Path -LiteralPath $Path -PathType Leaf)){return 'missing'};(Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash}
+function RefMap($Vault){$m=[ordered]@{};foreach($line in @(Git $Vault @('for-each-ref','--sort=refname','--format=%(refname) %(objectname)','refs'))){$p=[string]$line -split ' ',2;if($p.Count -ne 2){throw 'observation_changed'};$m[$p[0]]=$p[1]};return $m}
+function Stable($Vault,$Remote,$Base,$Before,$After){
+  $r1=@(Git $Vault @('ls-remote','--refs','origin','refs/heads/main','refs/tags/grim-dawn-sync-active'))-join "`n";$r2=@(Git $Vault @('ls-remote','--refs','origin','refs/heads/main','refs/tags/grim-dawn-sync-active'))-join "`n";if($r1 -cne $r2){return $false}
+  # The selector may refresh only its dedicated catalog tracking ref.  Its
+  # final value must be the already advertised main object; an arbitrary ref
+  # update (or a stale/missing final catalog ref) is never acceptable.
+  if(($Before.Contains($catalogRef) -and $Before[$catalogRef] -cne $Base) -or !$After.Contains($catalogRef) -or $After[$catalogRef] -cne $Remote){return $false}
+  foreach($k in $Before.Keys){if($k -cne $catalogRef -and (!$After.Contains($k) -or $Before[$k] -cne $After[$k])){return $false}};foreach($k in $After.Keys){if($k -cne $catalogRef -and !$Before.Contains($k)){return $false}}
+  return $true
+}
+function GameRunning(){return @((Get-Process -Name 'Grim Dawn','DPYes' -ErrorAction SilentlyContinue)).Count -gt 0}
+function PythonPids(){return @((Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='pythonw.exe'" -ErrorAction Stop|ForEach-Object{[uint32]$_.ProcessId}|Sort-Object -Unique)}
+function SelectorWindows(){
+  $rows=New-Object 'System.Collections.Generic.List[object]';$cb=[Func[IntPtr,IntPtr,bool]]{param($h,$l) if([SelectorWindow]::IsWindowVisible($h)){ $b=New-Object Text.StringBuilder 512;[void][SelectorWindow]::GetWindowText($h,$b,$b.Capacity);if($b.ToString() -ceq $selectorTitle){[uint32]$p=0;[void][SelectorWindow]::GetWindowThreadProcessId($h,[ref]$p);$rows.Add([pscustomobject]@{handle=$h;pid=$p})} };return $true};[void][SelectorWindow]::EnumWindows($cb,[IntPtr]::Zero);return @($rows)
+}
+function WaitSelector([int]$Seconds,[uint32[]]$BeforePids){$end=(Get-Date).AddSeconds($Seconds);while((Get-Date)-lt $end){if((GameRunning)){throw 'game_started_unexpectedly'};$windows=@(SelectorWindows);$now=@(PythonPids);$new=@($now|Where-Object{$BeforePids -notcontains $_});if($windows.Count -eq 1 -and $new.Count -eq 1 -and $windows[0].pid -eq $new[0]){return $windows[0]};if($windows.Count -gt 1 -or $new.Count -gt 1){throw 'selector_failed'};Start-Sleep -Milliseconds 250};throw 'selector_failed'}
+function WaitGone($Window,[int]$Seconds){$end=(Get-Date).AddSeconds($Seconds);while((Get-Date)-lt $end){if((GameRunning)){throw 'game_started_unexpectedly'};if(![SelectorWindow]::IsWindow($Window.handle)){return};Start-Sleep -Milliseconds 250};throw 'selector_failed'}
+function SendSelectorKey($Window,[string]$Key){if($Key -eq 'ESC'){$v=27}elseif($Key -eq 'F5'){$v=116}else{throw 'selector_failed'};if(![SelectorWindow]::SetForegroundWindow($Window.handle)){throw 'selector_failed'};if(![SelectorWindow]::PostMessage($Window.handle,0x100,[IntPtr]$v,[IntPtr]::Zero) -or ![SelectorWindow]::PostMessage($Window.handle,0x101,[IntPtr]$v,[IntPtr]::Zero)){throw 'selector_failed'}}
+try{
+  if(!(Test-Path -LiteralPath $python -PathType Leaf) -or !(Test-Path -LiteralPath $config -PathType Leaf) -or !(Test-Path -LiteralPath $shortcut -PathType Leaf)){throw 'precondition_failed'}
+  $cfg=Get-Content -LiteralPath $config -Raw -Encoding utf8|ConvertFrom-Json -ErrorAction Stop;if($cfg.machine_id -cne $machineId -or !($cfg.vault_repo -is [string])){throw 'precondition_failed'};$vault=[string]$cfg.vault_repo;$state=Join-Path ([IO.Path]::GetDirectoryName($config)) 'state.json'
+  $sourceRoot=Join-Path $source 'src';$link=(New-Object -ComObject WScript.Shell).CreateShortcut($shortcut);$expectedArgs=@(& $python -c "from pathlib import Path; from grim_dawn_sync.shortcut import _launch_arguments; import sys; print(_launch_arguments(Path(sys.argv[1]),Path(sys.argv[2])))" $sourceRoot $config 2>$null);if($LASTEXITCODE -ne 0 -or $expectedArgs.Count -ne 1 -or $link.TargetPath -cne [IO.Path]::GetFullPath($python) -or $link.WorkingDirectory -cne [IO.Path]::GetFullPath($sourceRoot) -or $link.Arguments -cne [string]$expectedArgs[0]){throw 'precondition_failed'}
+  $s=Json @('status');$d=Json @('doctor');if($s.readiness -ne 'blocked' -or $s.vault_relation -ne 'remote_changed_or_unknown' -or $s.active_lock -ne $null -or $s.recovery_phase -ne $null -or $s.processes.status -ne 'clear' -or $d.machine_id -cne $machineId -or (GameRunning)){throw 'precondition_failed'}
+  $base=One $vault @('rev-parse','HEAD');if($base -cne [string]$s.last_pushed_commit){throw 'precondition_failed'};$r=@(Git $vault @('ls-remote','--refs','origin','refs/heads/main'));if($r.Count -ne 1){throw 'precondition_failed'};$remote=([string]$r[0]-split '\s+')[0]
+  & git -C $vault fetch --no-tags --no-write-fetch-head origin $remote 1>$null 2>$null;if($LASTEXITCODE -ne 0){throw 'precondition_failed'};& git -C $vault merge-base --is-ancestor $base $remote 1>$null 2>$null;if($LASTEXITCODE -ne 0){throw 'precondition_failed'}
+  $live=[string]$d.checks.save_root.manifest.root_hash;$baseRoot=([string]@(& git -C $vault show "$base`:.sync/manifest.json" 2>$null)-join "`n"|ConvertFrom-Json -ErrorAction Stop).root_hash;$remoteRoot=([string]@(& git -C $vault show "$remote`:.sync/manifest.json" 2>$null)-join "`n"|ConvertFrom-Json -ErrorAction Stop).root_hash;if($live -cne $baseRoot -or $remoteRoot -ceq $baseRoot){throw 'precondition_failed'}
+  $versions=Json @('versions');if($versions.command -ne 'versions' -or !($versions.candidates -is [array])){throw 'precondition_failed'};$n=@($versions.candidates).Count;$bucket=if($n -le 1){'one'}elseif($n -eq 2){'two'}else{'three_or_more'}
+  $before=@((One $source @('symbolic-ref','--quiet','HEAD')),(One $source @('rev-parse','HEAD')),((Git $source @('status','--porcelain=v1','--untracked-files=all'))-join "`n"),(Hash $python),(Hash $config),(Hash $state),((Git $vault @('status','--porcelain=v1','--untracked-files=all'))-join "`n"));$refsBefore=RefMap $vault
+  if(@(SelectorWindows).Count -ne 0){throw 'precondition_failed'};$sh=New-Object -ComObject WScript.Shell;$pids=@(PythonPids);$null=$sh.Run('"'+$shortcut+'"',1,$false);$ui=WaitSelector 75 $pids;SendSelectorKey $ui 'ESC';WaitGone $ui 15;$first=$true
+  if(@(SelectorWindows).Count -ne 0){throw 'selector_failed'};$pids=@(PythonPids);$null=$sh.Run('"'+$shortcut+'"',1,$false);$ui=WaitSelector 75 $pids;SendSelectorKey $ui 'F5';WaitGone $ui 15;$ui=WaitSelector 75 $pids;SendSelectorKey $ui 'ESC';WaitGone $ui 15;$reload=$true;$second=$true
+  $refsAfter=RefMap $vault;$after=@((One $source @('symbolic-ref','--quiet','HEAD')),(One $source @('rev-parse','HEAD')),((Git $source @('status','--porcelain=v1','--untracked-files=all'))-join "`n"),(Hash $python),(Hash $config),(Hash $state),((Git $vault @('status','--porcelain=v1','--untracked-files=all'))-join "`n"));$again=Json @('doctor')
+  if((GameRunning) -or ($before-join "`0") -cne ($after-join "`0") -or !$(Stable $vault $remote $base $refsBefore $refsAfter) -or $live -cne [string]$again.checks.save_root.manifest.root_hash){throw 'observation_changed'}
+  Out-DryRun 'complete' 'selector_dry_run_complete' $first $reload $second 'remote_current' $bucket $false $false;exit 0
+}catch{ $code=[string]$_.Exception.Message;if($code -notin @('precondition_failed','selector_failed','game_started_unexpectedly','observation_changed')){$code='unexpected_failed'};Write-Output (Out-DryRun 'blocked' $code $false $false $false 'unknown' 'one' ($code -eq 'game_started_unexpectedly') ($code -eq 'observation_changed'));exit 1 }
 ```
 
 Continue only when the block exits zero and prints no output. Then run only

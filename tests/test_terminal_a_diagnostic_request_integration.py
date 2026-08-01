@@ -52,7 +52,7 @@ def _git(cwd: Path, *args: str) -> str:
 
 
 def _request_payload(
-    *, sequence: int = 7, expired: bool = False, bad_schema: bool = False
+    *, sequence: int = 8, expired: bool = False, bad_schema: bool = False
 ) -> dict[str, object]:
     payload = json.loads(REQUEST.read_text(encoding="utf-8"))
     now = datetime.now(timezone.utc).replace(microsecond=0)
@@ -127,9 +127,9 @@ def _setup_case(
     _run(REAL_GIT, "init", "-b", "master", str(seed))
     _git(seed, "config", "user.name", "Test Operator")
     _git(seed, "config", "user.email", "operator@example.invalid")
-    # The checked-in request is sequence 7.  Seed the clone with the older
+    # The checked-in request is sequence 8.  Seed the clone with the older
     # request so the test proves the canonical remote update is accepted.
-    initial_payload = _request_payload(sequence=6)
+    initial_payload = _request_payload(sequence=7)
     initial_payload["request_id"] = "00000000-0000-0000-0000-000000000001"
     _write_request(seed, initial_payload)
     _git(seed, "add", "ops/handoff/terminal-a-diagnostic-request.v1.json")
@@ -138,8 +138,8 @@ def _setup_case(
     _git(seed, "push", "-u", "origin", "master")
     _run(REAL_GIT, "clone", str(remote), str(terminal))
 
-    updated_payload = _request_payload(sequence=7, expired=expired, bad_schema=bad_schema)
-    assert initial_payload["sequence"] == 6 < updated_payload["sequence"] == 7
+    updated_payload = _request_payload(sequence=8, expired=expired, bad_schema=bad_schema)
+    assert initial_payload["sequence"] == 7 < updated_payload["sequence"] == 8
     if timestamp_fault == "malformed":
         updated_payload["issued_at"] = "2026-08-01T09:46:11+00:00"
     _write_request(seed, updated_payload)
