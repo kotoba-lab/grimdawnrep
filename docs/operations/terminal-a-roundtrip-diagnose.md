@@ -77,6 +77,14 @@ function Get-StrictUtc([string]$Value) {
     return $parsed
 }
 
+function Get-RawStrictUtc([string]$Raw, [string]$Key) {
+    $escapedKey = [Regex]::Escape($Key)
+    $keyMatches = [Regex]::Matches($Raw, '(?<!\\)"' + $escapedKey + '"\s*:')
+    $valueMatches = [Regex]::Matches($Raw, '(?<!\\)"' + $escapedKey + '"\s*:\s*"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)"')
+    if ($keyMatches.Count -ne 1 -or $valueMatches.Count -ne 1) { throw 'invalid' }
+    return Get-StrictUtc $valueMatches[0].Groups[1].Value
+}
+
 function Get-FileSha256([string]$Path) {
     $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
     $sha = [Security.Cryptography.SHA256]::Create()
@@ -126,7 +134,7 @@ try {
     if (-not ($request.schema_version -is [string]) -or $request.schema_version -cne '1.0.0' -or
         -not ($request.kind -is [string]) -or
         $request.kind -cne 'grim_dawn_terminal_diagnostic_request' -or
-        -not ($request.sequence -is [int]) -or $request.sequence -ne 2 -or
+        -not ($request.sequence -is [int]) -or $request.sequence -ne 3 -or
         -not ($request.target_machine_id -is [string]) -or $request.target_machine_id -cne $machineId -or
         -not ($request.leg -is [string]) -or -not ($request.observed_code -is [string]) -or
         -not ($request.action -is [string]) -or -not ($request.response_sentinel -is [string]) -or
@@ -141,9 +149,9 @@ try {
     if (-not [Guid]::TryParse([string]$request.request_id, [ref]$requestGuid) -or
         $requestGuid.ToString() -cne [string]$request.request_id) { throw 'invalid' }
 
-    $issued = Get-StrictUtc ([string]$request.issued_at)
-    $notBefore = Get-StrictUtc ([string]$request.not_before)
-    $expires = Get-StrictUtc ([string]$request.expires_at)
+    $issued = Get-RawStrictUtc $requestRaw 'issued_at'
+    $notBefore = Get-RawStrictUtc $requestRaw 'not_before'
+    $expires = Get-RawStrictUtc $requestRaw 'expires_at'
     $now = [DateTimeOffset]::UtcNow
     if ($issued -gt $notBefore -or $notBefore -ge $expires -or
         ($expires - $notBefore).TotalSeconds -gt 3600 -or $now -lt $notBefore -or $now -ge $expires) { throw 'invalid' }

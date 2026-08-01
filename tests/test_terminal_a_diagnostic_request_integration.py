@@ -48,7 +48,7 @@ def _git(cwd: Path, *args: str) -> str:
 
 
 def _request_payload(
-    *, sequence: int = 2, expired: bool = False, bad_schema: bool = False
+    *, sequence: int = 3, expired: bool = False, bad_schema: bool = False
 ) -> dict[str, object]:
     payload = json.loads(REQUEST.read_text(encoding="utf-8"))
     now = datetime.now(timezone.utc).replace(microsecond=0)
@@ -97,7 +97,9 @@ def _make_git_wrapper(directory: Path) -> Path:
     return wrapper
 
 
-def _setup_case(base: Path, *, expired: bool = False, bad_schema: bool = False) -> tuple[Path, Path, dict[str, str], str, str]:
+def _setup_case(
+    base: Path, *, expired: bool = False, bad_schema: bool = False, timestamp_fault: str | None = None
+) -> tuple[Path, Path, dict[str, str], str, str]:
     remote = base / "remote.git"
     seed = base / "seed"
     profile = base / "profile"
@@ -111,9 +113,9 @@ def _setup_case(base: Path, *, expired: bool = False, bad_schema: bool = False) 
     _run(REAL_GIT, "init", "-b", "master", str(seed))
     _git(seed, "config", "user.name", "Test Operator")
     _git(seed, "config", "user.email", "operator@example.invalid")
-    # The checked-in request is sequence 2.  Seed the clone with the older
+    # The checked-in request is sequence 3.  Seed the clone with the older
     # request so the test proves the canonical remote update is accepted.
-    initial_payload = _request_payload(sequence=1)
+    initial_payload = _request_payload(sequence=2)
     initial_payload["request_id"] = "00000000-0000-0000-0000-000000000001"
     _write_request(seed, initial_payload)
     _git(seed, "add", "ops/handoff/terminal-a-diagnostic-request.v1.json")
@@ -122,9 +124,20 @@ def _setup_case(base: Path, *, expired: bool = False, bad_schema: bool = False) 
     _git(seed, "push", "-u", "origin", "master")
     _run(REAL_GIT, "clone", str(remote), str(terminal))
 
-    updated_payload = _request_payload(sequence=2, expired=expired, bad_schema=bad_schema)
-    assert initial_payload["sequence"] < updated_payload["sequence"]
+    updated_payload = _request_payload(sequence=3, expired=expired, bad_schema=bad_schema)
+    assert initial_payload["sequence"] == 2 < updated_payload["sequence"] == 3
+    if timestamp_fault == "malformed":
+        updated_payload["issued_at"] = "2026-08-01T09:46:11+00:00"
     _write_request(seed, updated_payload)
+    if timestamp_fault == "duplicate":
+        request_path = seed / "ops" / "handoff" / "terminal-a-diagnostic-request.v1.json"
+        request_path.write_text(
+            request_path.read_text(encoding="ascii").replace(
+                '  "issued_at":', '  "issued_at": "2026-08-01T09:46:11Z",\n  "issued_at":', 1
+            ),
+            encoding="ascii",
+            newline="\n",
+        )
     _git(seed, "add", "ops/handoff/terminal-a-diagnostic-request.v1.json")
     _git(seed, "commit", "-m", "new request")
     new_commit = _git(seed, "rev-parse", "HEAD")
@@ -201,13 +214,16 @@ def test_remote_request_block_fetches_explicit_destination_without_changing_head
 
 @pytest.mark.parametrize(
     "fault",
-    ["url_mismatch", "extra_url", "dirty", "wrong_branch", "fetch_fail", "non_ff", "oid_mismatch", "schema", "expiry"],
+    ["url_mismatch", "extra_url", "dirty", "wrong_branch", "fetch_fail", "non_ff", "oid_mismatch", "schema", "expiry", "timestamp_malformed", "timestamp_duplicate"],
 )
 def test_remote_request_block_fault_matrix_is_fail_closed_and_sanitized(fault: str) -> None:
     with tempfile.TemporaryDirectory(prefix=f"terminal-a-{fault}-") as raw_base:
         base = Path(raw_base)
         terminal, remote, env, _before_head, _new_commit = _setup_case(
-            base, expired=fault == "expiry", bad_schema=fault == "schema"
+            base,
+            expired=fault == "expiry",
+            bad_schema=fault == "schema",
+            timestamp_fault={"timestamp_malformed": "malformed", "timestamp_duplicate": "duplicate"}.get(fault),
         )
         script = _operator_script(base)
 

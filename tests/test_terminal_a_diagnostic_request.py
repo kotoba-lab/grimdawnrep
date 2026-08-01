@@ -82,7 +82,7 @@ def test_terminal_a_request_has_exact_schema_identity_and_readonly_action() -> N
     assert set(payload) == EXPECTED_KEYS
     assert payload["schema_version"] == "1.0.0"
     assert payload["kind"] == "grim_dawn_terminal_diagnostic_request"
-    assert payload["sequence"] == 2
+    assert payload["sequence"] == 3
     assert payload["target_machine_id"] == "desktop-a"
     assert payload["leg"] == "A1" and payload["observed_code"] == "launch_failed"
     assert payload["action"] == "diagnose_readonly"
@@ -155,7 +155,7 @@ def test_remote_handoff_relays_only_sanitized_sentinel_without_private_data() ->
     assert "without disclosing the request,\nremote URL, object IDs, local paths, or Git output" in remote_section
     assert "code = 'remote_request_invalid'" in command
     assert "Write-Output (Write-RequestBlocked)" in command
-    assert "$requestRaw" not in command.split("catch {", 1)[1]
+    assert "Write-Output $requestRaw" not in command
 
 
 def test_remote_handoff_validates_canonical_json_shape_and_live_window_before_use() -> None:
@@ -171,6 +171,8 @@ def test_remote_handoff_validates_canonical_json_shape_and_live_window_before_us
         "Assert-ExactArray $request.constraints",
         "[Guid]::TryParse",
         "Get-StrictUtc",
+        "Get-RawStrictUtc",
+        "[Regex]::Matches($Raw",
         "$issued -gt $notBefore",
         "($expires - $notBefore).TotalSeconds -gt 3600",
         "$now -lt $notBefore",
@@ -178,3 +180,4 @@ def test_remote_handoff_validates_canonical_json_shape_and_live_window_before_us
     ):
         assert required in command
     assert "-not ($request.sequence -is [int])" in command
+    assert "Get-StrictUtc ([string]$request.issued_at)" not in command
