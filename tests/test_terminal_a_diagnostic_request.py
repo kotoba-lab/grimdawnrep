@@ -82,11 +82,12 @@ def test_terminal_a_request_has_exact_schema_identity_and_readonly_action() -> N
     assert set(payload) == EXPECTED_KEYS
     assert payload["schema_version"] == "1.0.0"
     assert payload["kind"] == "grim_dawn_terminal_diagnostic_request"
-    assert payload["sequence"] == 3
+    assert payload["sequence"] == 4
     assert payload["target_machine_id"] == "desktop-a"
     assert payload["leg"] == "A1" and payload["observed_code"] == "launch_failed"
     assert payload["action"] == "diagnose_readonly"
     assert payload["response_sentinel"] == "TERMINAL_A_DIAGNOSIS"
+    assert payload["request_id"] == "7c43e0e7-2dd3-4b70-8f35-9cc50673425a"
     parsed_id = uuid.UUID(str(payload["request_id"]))
     assert str(parsed_id) == payload["request_id"]
 
@@ -113,6 +114,9 @@ def test_terminal_a_request_has_strict_utc_window_of_at_most_one_hour() -> None:
         values[field] = parsed
     assert values["issued_at"] <= values["not_before"] < values["expires_at"]
     assert (values["expires_at"] - values["not_before"]).total_seconds() <= 3600
+    assert payload["issued_at"] == payload["not_before"] == "2026-08-01T10:15:00Z"
+    assert payload["expires_at"] == "2026-08-01T11:15:00Z"
+    assert (values["expires_at"] - values["not_before"]).total_seconds() == 3600
 
 
 def test_remote_handoff_fetches_canonical_master_and_reads_only_fixed_commit_path() -> None:
@@ -151,11 +155,54 @@ def test_remote_handoff_forbids_source_mutation_execution_and_preserves_a1_bound
 def test_remote_handoff_relays_only_sanitized_sentinel_without_private_data() -> None:
     remote_section, command = _remote_section_and_block()
 
-    assert "one fixed blocked sentinel" in remote_section
+    assert "one allow-listed blocked sentinel identifying only the failed stage" in remote_section
     assert "without disclosing the request,\nremote URL, object IDs, local paths, or Git output" in remote_section
-    assert "code = 'remote_request_invalid'" in command
+    expected_codes = {
+        "origin_identity": "origin_identity_invalid",
+        "source_branch": "source_branch_invalid",
+        "source_clean": "source_clean_invalid",
+        "fingerprint": "fingerprint_invalid",
+        "fetch": "fetch_failed",
+        "oid": "oid_invalid",
+        "ancestor": "ancestor_invalid",
+        "blob": "blob_invalid",
+        "schema": "schema_invalid",
+        "time": "time_invalid",
+        "post_invariant": "post_invariant_invalid",
+    }
+    for stage, code in expected_codes.items():
+        assert f"{stage} = '{code}'" in command
+        assert f"$stage = '{stage}'" in command
+    assert "stage = $safeStage" in command
+    assert "code = [string]$stageCodes[$safeStage]" in command
+    assert "remote_request_invalid" not in command
     assert "Write-Output (Write-RequestBlocked)" in command
     assert "Write-Output $requestRaw" not in command
+
+
+def test_remote_handoff_sets_each_observable_stage_before_its_check() -> None:
+    _remote_section, command = _remote_section_and_block()
+    try_block = command.split("try {", 2)[2]
+    ordered_stage_checks = (
+        ("$stage = 'origin_identity'", "$fetchUrls ="),
+        ("$stage = 'source_branch'", "$beforeBranch ="),
+        ("$stage = 'source_clean'", "$beforeStatus ="),
+        ("$stage = 'fingerprint'", "$beforePython ="),
+        ("$stage = 'fetch'", "Invoke-GitQuiet @('fetch'"),
+        ("$stage = 'oid'", "$originMaster ="),
+        ("$stage = 'ancestor'", "Invoke-GitQuiet @('merge-base'"),
+        ("$stage = 'blob'", "$requestLines ="),
+        ("$stage = 'schema'", "ConvertFrom-Json -ErrorAction Stop"),
+        ("$stage = 'time'", "$issued = Get-RawStrictUtc"),
+        ("$stage = 'post_invariant'", "$afterBranch ="),
+    )
+    positions: list[int] = []
+    for stage_marker, check_marker in ordered_stage_checks:
+        stage_position = try_block.index(stage_marker)
+        check_position = try_block.index(check_marker)
+        assert stage_position < check_position
+        positions.append(stage_position)
+    assert positions == sorted(positions)
 
 
 def test_remote_handoff_validates_canonical_json_shape_and_live_window_before_use() -> None:

@@ -12,7 +12,8 @@ coordination data, not a command, script, configuration, or authorization to
 run fetched source. An operator may retrieve it only from the canonical
 public `origin/master`; no other remote or branch is accepted. Run this block
 in **Windows PowerShell 5.1**. It emits nothing on success. On any failure it
-emits one fixed blocked sentinel and stops without disclosing the request,
+emits one allow-listed blocked sentinel identifying only the failed stage and
+stops without disclosing the request,
 remote URL, object IDs, local paths, or Git output.
 
 ```powershell
@@ -26,14 +27,32 @@ $machineId = 'desktop-a'
 $publicUrl = 'https://github.com/kotoba-lab/grimdawnrep.git'
 $requestObjectPath = 'ops/handoff/terminal-a-diagnostic-request.v1.json'
 $oidPattern = '^[0-9a-f]{40}(?:[0-9a-f]{24})?$'
+$stage = 'origin_identity'
+$stageCodes = @{
+    origin_identity = 'origin_identity_invalid'
+    source_branch = 'source_branch_invalid'
+    source_clean = 'source_clean_invalid'
+    fingerprint = 'fingerprint_invalid'
+    fetch = 'fetch_failed'
+    oid = 'oid_invalid'
+    ancestor = 'ancestor_invalid'
+    blob = 'blob_invalid'
+    schema = 'schema_invalid'
+    time = 'time_invalid'
+    post_invariant = 'post_invariant_invalid'
+}
 
 function Write-RequestBlocked {
+    $safeStages = @('origin_identity','source_branch','source_clean','fingerprint','fetch','oid',
+        'ancestor','blob','schema','time','post_invariant')
+    $safeStage = if ($stage -in $safeStages) { $stage } else { 'origin_identity' }
     [ordered]@{
         sentinel = 'TERMINAL_A_DIAGNOSIS'
         status = 'blocked'
         leg = 'A1'
         machine_id = $machineId
-        code = 'remote_request_invalid'
+        stage = $safeStage
+        code = [string]$stageCodes[$safeStage]
     } | ConvertTo-Json -Compress
 }
 
@@ -93,30 +112,43 @@ function Get-FileSha256([string]$Path) {
 }
 
 try {
-    if (-not (Test-Path -LiteralPath $source -PathType Container) -or
-        -not (Test-Path -LiteralPath $python -PathType Leaf) -or
-        -not (Test-Path -LiteralPath $config -PathType Leaf)) { throw 'invalid' }
-
+    $stage = 'origin_identity'
+    if (-not (Test-Path -LiteralPath $source -PathType Container)) { throw 'invalid' }
     $fetchUrls = @(Invoke-GitLines @('remote','get-url','--all','origin'))
     $pushUrls = @(Invoke-GitLines @('remote','get-url','--push','--all','origin'))
     if ($fetchUrls.Count -ne 1 -or $pushUrls.Count -ne 1 -or
         ([string]$fetchUrls[0]).Trim() -cne $publicUrl -or
         ([string]$pushUrls[0]).Trim() -cne $publicUrl) { throw 'invalid' }
 
+    $stage = 'source_branch'
     $beforeBranch = Get-OneGitLine @('symbolic-ref','--quiet','HEAD')
     $beforeHead = Get-OneGitLine @('rev-parse','HEAD')
+    if ($beforeBranch -cne 'refs/heads/master') { throw 'invalid' }
+
+    $stage = 'source_clean'
     $beforeStatus = @(Invoke-GitLines @('status','--porcelain=v1','--untracked-files=all'))
-    if ($beforeBranch -cne 'refs/heads/master' -or $beforeHead -cnotmatch $oidPattern -or $beforeStatus.Count -ne 0) { throw 'invalid' }
+    if ($beforeStatus.Count -ne 0) { throw 'invalid' }
+
+    $stage = 'fingerprint'
+    if (-not (Test-Path -LiteralPath $python -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $config -PathType Leaf)) { throw 'invalid' }
     $beforePython = Get-FileSha256 $python
     $beforeConfig = Get-FileSha256 $config
 
+    $stage = 'fetch'
     Invoke-GitQuiet @('fetch','--no-tags','origin','master:refs/remotes/origin/master')
+
+    $stage = 'oid'
     $originMaster = Get-OneGitLine @('rev-parse','origin/master')
     $fetchHead = Get-OneGitLine @('rev-parse','FETCH_HEAD')
-    if ($originMaster -cnotmatch $oidPattern -or $fetchHead -cnotmatch $oidPattern -or $originMaster -cne $fetchHead) { throw 'invalid' }
+    if ($beforeHead -cnotmatch $oidPattern -or $originMaster -cnotmatch $oidPattern -or
+        $fetchHead -cnotmatch $oidPattern -or $originMaster -cne $fetchHead) { throw 'invalid' }
+
+    $stage = 'ancestor'
     Invoke-GitQuiet @('merge-base','--is-ancestor',$beforeHead,$fetchHead)
     $requestCommit = $fetchHead
 
+    $stage = 'blob'
     $requestLines = @(& git -C $source show "$requestCommit`:$requestObjectPath" 2>$null)
     if ($LASTEXITCODE -ne 0 -or $requestLines.Count -eq 0) { throw 'invalid' }
     $requestRaw = @($requestLines) -join "`n"
@@ -124,6 +156,7 @@ try {
     if ($requestBytes -gt 4096 -or $requestRaw.Length -eq 0 -or
         $requestRaw[0] -eq [char]0xFEFF -or $requestRaw.Contains([char]0xFFFD) -or
         $requestRaw -match '[^\x09\x0A\x0D\x20-\x7E]') { throw 'invalid' }
+    $stage = 'schema'
     try { $request = $requestRaw | ConvertFrom-Json -ErrorAction Stop }
     catch { throw 'invalid' }
 
@@ -134,7 +167,7 @@ try {
     if (-not ($request.schema_version -is [string]) -or $request.schema_version -cne '1.0.0' -or
         -not ($request.kind -is [string]) -or
         $request.kind -cne 'grim_dawn_terminal_diagnostic_request' -or
-        -not ($request.sequence -is [int]) -or $request.sequence -ne 3 -or
+        -not ($request.sequence -is [int]) -or $request.sequence -ne 4 -or
         -not ($request.target_machine_id -is [string]) -or $request.target_machine_id -cne $machineId -or
         -not ($request.leg -is [string]) -or -not ($request.observed_code -is [string]) -or
         -not ($request.action -is [string]) -or -not ($request.response_sentinel -is [string]) -or
@@ -149,6 +182,7 @@ try {
     if (-not [Guid]::TryParse([string]$request.request_id, [ref]$requestGuid) -or
         $requestGuid.ToString() -cne [string]$request.request_id) { throw 'invalid' }
 
+    $stage = 'time'
     $issued = Get-RawStrictUtc $requestRaw 'issued_at'
     $notBefore = Get-RawStrictUtc $requestRaw 'not_before'
     $expires = Get-RawStrictUtc $requestRaw 'expires_at'
@@ -156,6 +190,7 @@ try {
     if ($issued -gt $notBefore -or $notBefore -ge $expires -or
         ($expires - $notBefore).TotalSeconds -gt 3600 -or $now -lt $notBefore -or $now -ge $expires) { throw 'invalid' }
 
+    $stage = 'post_invariant'
     $afterBranch = Get-OneGitLine @('symbolic-ref','--quiet','HEAD')
     $afterHead = Get-OneGitLine @('rev-parse','HEAD')
     $afterStatus = @(Invoke-GitLines @('status','--porcelain=v1','--untracked-files=all'))

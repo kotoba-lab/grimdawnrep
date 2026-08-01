@@ -18,15 +18,15 @@
     "source_git_show_only",
     "no_fetched_code_execution"
   ],
-  "expires_at": "2026-08-01T10:46:11Z",
-  "issued_at": "2026-08-01T09:46:11Z",
+  "expires_at": "2026-08-01T11:15:00Z",
+  "issued_at": "2026-08-01T10:15:00Z",
   "kind": "grim_dawn_terminal_diagnostic_request",
   "leg": "A1",
-  "not_before": "2026-08-01T09:46:11Z",
+  "not_before": "2026-08-01T10:15:00Z",
   "observed_code": "launch_failed",
-  "request_id": "8d0cc911-bd1c-4955-be13-e1eb9c36505d",
+  "request_id": "7c43e0e7-2dd3-4b70-8f35-9cc50673425a",
   "response_sentinel": "TERMINAL_A_DIAGNOSIS",
   "schema_version": "1.0.0",
-  "sequence": 3,
+  "sequence": 4,
   "target_machine_id": "desktop-a"
 }

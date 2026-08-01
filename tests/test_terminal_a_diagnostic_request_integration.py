@@ -48,7 +48,7 @@ def _git(cwd: Path, *args: str) -> str:
 
 
 def _request_payload(
-    *, sequence: int = 3, expired: bool = False, bad_schema: bool = False
+    *, sequence: int = 4, expired: bool = False, bad_schema: bool = False
 ) -> dict[str, object]:
     payload = json.loads(REQUEST.read_text(encoding="utf-8"))
     now = datetime.now(timezone.utc).replace(microsecond=0)
@@ -89,6 +89,11 @@ def _make_git_wrapper(directory: Path) -> Path:
         "  echo %GIT_MOCK_FETCH_HEAD%\r\n"
         "  exit /b 0\r\n"
         ")\r\n"
+        "if \"%~3\"==\"show\" if \"%GIT_MOCK_MUTATE_CONFIG%\"==\"1\" (\r\n"
+        f'  "{REAL_GIT}" %*\r\n'
+        "  echo changed>>\"%GIT_MOCK_CONFIG_PATH%\"\r\n"
+        "  exit /b 0\r\n"
+        ")\r\n"
         f'"{REAL_GIT}" %*\r\n'
         "exit /b %errorlevel%\r\n",
         encoding="ascii",
@@ -98,7 +103,12 @@ def _make_git_wrapper(directory: Path) -> Path:
 
 
 def _setup_case(
-    base: Path, *, expired: bool = False, bad_schema: bool = False, timestamp_fault: str | None = None
+    base: Path,
+    *,
+    expired: bool = False,
+    bad_schema: bool = False,
+    missing_blob: bool = False,
+    timestamp_fault: str | None = None,
 ) -> tuple[Path, Path, dict[str, str], str, str]:
     remote = base / "remote.git"
     seed = base / "seed"
@@ -113,9 +123,9 @@ def _setup_case(
     _run(REAL_GIT, "init", "-b", "master", str(seed))
     _git(seed, "config", "user.name", "Test Operator")
     _git(seed, "config", "user.email", "operator@example.invalid")
-    # The checked-in request is sequence 3.  Seed the clone with the older
+    # The checked-in request is sequence 4.  Seed the clone with the older
     # request so the test proves the canonical remote update is accepted.
-    initial_payload = _request_payload(sequence=2)
+    initial_payload = _request_payload(sequence=3)
     initial_payload["request_id"] = "00000000-0000-0000-0000-000000000001"
     _write_request(seed, initial_payload)
     _git(seed, "add", "ops/handoff/terminal-a-diagnostic-request.v1.json")
@@ -124,8 +134,8 @@ def _setup_case(
     _git(seed, "push", "-u", "origin", "master")
     _run(REAL_GIT, "clone", str(remote), str(terminal))
 
-    updated_payload = _request_payload(sequence=3, expired=expired, bad_schema=bad_schema)
-    assert initial_payload["sequence"] == 2 < updated_payload["sequence"] == 3
+    updated_payload = _request_payload(sequence=4, expired=expired, bad_schema=bad_schema)
+    assert initial_payload["sequence"] == 3 < updated_payload["sequence"] == 4
     if timestamp_fault == "malformed":
         updated_payload["issued_at"] = "2026-08-01T09:46:11+00:00"
     _write_request(seed, updated_payload)
@@ -138,6 +148,8 @@ def _setup_case(
             encoding="ascii",
             newline="\n",
         )
+    if missing_blob:
+        (seed / "ops" / "handoff" / "terminal-a-diagnostic-request.v1.json").unlink()
     _git(seed, "add", "ops/handoff/terminal-a-diagnostic-request.v1.json")
     _git(seed, "commit", "-m", "new request")
     new_commit = _git(seed, "rev-parse", "HEAD")
@@ -164,6 +176,8 @@ def _setup_case(
         GIT_MOCK_PUSH_URL=PUBLIC_URL,
         GIT_MOCK_EXTRA_URL="0",
         GIT_MOCK_FETCH_HEAD="",
+        GIT_MOCK_MUTATE_CONFIG="0",
+        GIT_MOCK_CONFIG_PATH=str(config),
     )
     return terminal, remote, env, before_head, new_commit
 
@@ -187,13 +201,22 @@ def _invoke(script: Path, env: dict[str, str]) -> subprocess.CompletedProcess[st
     )
 
 
-def _assert_blocked(result: subprocess.CompletedProcess[str]) -> None:
+def _assert_blocked(result: subprocess.CompletedProcess[str], stage: str, code: str) -> None:
     assert result.returncode == 1
     assert result.stderr == ""
     assert result.stdout.splitlines() == [
-        '{"sentinel":"TERMINAL_A_DIAGNOSIS","status":"blocked","leg":"A1","machine_id":"desktop-a","code":"remote_request_invalid"}'
+        '{"sentinel":"TERMINAL_A_DIAGNOSIS","status":"blocked","leg":"A1",'
+        f'"machine_id":"desktop-a","stage":"{stage}","code":"{code}"}}'
     ]
-    for secret in (PUBLIC_URL, "schema_version", "request_id", "ops/handoff", "refs/heads", "origin/master"):
+    for secret in (
+        PUBLIC_URL,
+        "schema_version",
+        "request_id",
+        "ops/handoff",
+        "refs/heads",
+        "origin/master",
+        "remote_request_invalid",
+    ):
         assert secret not in result.stdout
 
 
@@ -213,16 +236,35 @@ def test_remote_request_block_fetches_explicit_destination_without_changing_head
 
 
 @pytest.mark.parametrize(
-    "fault",
-    ["url_mismatch", "extra_url", "dirty", "wrong_branch", "fetch_fail", "non_ff", "oid_mismatch", "schema", "expiry", "timestamp_malformed", "timestamp_duplicate"],
+    ("fault", "stage", "code"),
+    [
+        ("url_mismatch", "origin_identity", "origin_identity_invalid"),
+        ("extra_url", "origin_identity", "origin_identity_invalid"),
+        ("wrong_branch", "source_branch", "source_branch_invalid"),
+        ("dirty", "source_clean", "source_clean_invalid"),
+        ("fingerprint", "fingerprint", "fingerprint_invalid"),
+        ("fetch_fail", "fetch", "fetch_failed"),
+        ("non_ff", "fetch", "fetch_failed"),
+        ("oid_mismatch", "oid", "oid_invalid"),
+        ("ancestor", "ancestor", "ancestor_invalid"),
+        ("blob", "blob", "blob_invalid"),
+        ("schema", "schema", "schema_invalid"),
+        ("expiry", "time", "time_invalid"),
+        ("timestamp_malformed", "time", "time_invalid"),
+        ("timestamp_duplicate", "time", "time_invalid"),
+        ("post_invariant", "post_invariant", "post_invariant_invalid"),
+    ],
 )
-def test_remote_request_block_fault_matrix_is_fail_closed_and_sanitized(fault: str) -> None:
+def test_remote_request_block_fault_matrix_is_fail_closed_and_sanitized(
+    fault: str, stage: str, code: str
+) -> None:
     with tempfile.TemporaryDirectory(prefix=f"terminal-a-{fault}-") as raw_base:
         base = Path(raw_base)
         terminal, remote, env, _before_head, _new_commit = _setup_case(
             base,
             expired=fault == "expiry",
             bad_schema=fault == "schema",
+            missing_blob=fault == "blob",
             timestamp_fault={"timestamp_malformed": "malformed", "timestamp_duplicate": "duplicate"}.get(fault),
         )
         script = _operator_script(base)
@@ -235,6 +277,8 @@ def test_remote_request_block_fault_matrix_is_fail_closed_and_sanitized(fault: s
             (terminal / "untracked.txt").write_text("dirty\n", encoding="ascii")
         elif fault == "wrong_branch":
             _git(terminal, "checkout", "-b", "other")
+        elif fault == "fingerprint":
+            Path(env["LOCALAPPDATA"], "GrimDawnSaveSyncTool", ".venv", "Scripts", "python.exe").unlink()
         elif fault == "fetch_fail":
             remote.rename(base / "remote-unavailable.git")
         elif fault == "non_ff":
@@ -252,5 +296,20 @@ def test_remote_request_block_fault_matrix_is_fail_closed_and_sanitized(fault: s
             _git(terminal, "update-ref", "refs/remotes/origin/master", divergent)
         elif fault == "oid_mismatch":
             env["GIT_MOCK_FETCH_HEAD"] = "0000000000000000000000000000000000000001"
+        elif fault == "ancestor":
+            tree = _git(terminal, "rev-parse", "HEAD^{tree}")
+            divergent = _run(
+                REAL_GIT or "git",
+                "-C",
+                str(terminal),
+                "commit-tree",
+                tree,
+                input="divergent-head\n",
+                env={**os.environ, "GIT_AUTHOR_NAME": "Test", "GIT_AUTHOR_EMAIL": "test@example.invalid",
+                     "GIT_COMMITTER_NAME": "Test", "GIT_COMMITTER_EMAIL": "test@example.invalid"},
+            ).stdout.strip()
+            _git(terminal, "update-ref", "refs/heads/master", divergent)
+        elif fault == "post_invariant":
+            env["GIT_MOCK_MUTATE_CONFIG"] = "1"
 
-        _assert_blocked(_invoke(script, env))
+        _assert_blocked(_invoke(script, env), stage, code)
