@@ -221,6 +221,25 @@ def test_identity_present_before_launch_is_never_adopted_later(tmp_path: Path) -
     assert subject.run().game_pids == (10,)
 
 
+def test_sixty_second_active_exit_uses_at_most_sixty_one_scans(tmp_path: Path) -> None:
+    root = tmp_path / "game"
+    clock = Clock()
+
+    class ActiveForSixtySeconds:
+        calls = 0
+        def scan(self) -> ProcessScan:
+            self.calls += 1
+            return ProcessScan((game(root),)) if clock() < 60 else ProcessScan(())
+
+    monitor = ActiveForSixtySeconds()
+    subject = DPYesLauncher(config(tmp_path), monitor, FakeRunner(), clock=clock, sleep=clock.sleep)
+    observed = subject._wait_for_exit({10: 100}, {"grim dawn.exe"}, set())
+
+    assert observed == {10}
+    assert monitor.calls <= 61
+    assert subject.poll_seconds == 0.1 and subject.exit_poll_seconds == 1.0
+
+
 def test_runner_failure_is_launch_error(tmp_path: Path) -> None:
     class BadRunner:
         def start(self, *args, **kwargs): raise OSError("no start")

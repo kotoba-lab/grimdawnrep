@@ -104,8 +104,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _process_preflight(config: Any, monitor: ProcessMonitor | None = None) -> dict[str, Any]:
     """Do not mutate when process enumeration is incomplete or a target runs."""
-    scan = (monitor or WindowsProcessMonitor()).scan()
     names = {name.casefold() for name in getattr(config, "game_process_names", ("Grim Dawn.exe",))} | {"dpyes.exe"}
+    scan = (monitor or WindowsProcessMonitor(names)).scan()
     if not scan.complete:
         raise SyncError("process_scan_incomplete", "Game process status could not be verified; no change was made.", 5)
     matches = [item for item in scan.processes if item.name.casefold() in names]
@@ -115,8 +115,8 @@ def _process_preflight(config: Any, monitor: ProcessMonitor | None = None) -> di
 
 
 def _process_status(config: Any, monitor: ProcessMonitor | None = None) -> dict[str, Any]:
-    scan = (monitor or WindowsProcessMonitor()).scan()
     names = {name.casefold() for name in getattr(config, "game_process_names", ("Grim Dawn.exe",))} | {"dpyes.exe"}
+    scan = (monitor or WindowsProcessMonitor(names)).scan()
     if not scan.complete:
         return {"status": "unknown", "complete": False}
     matches = [item for item in scan.processes if item.name.casefold() in names]

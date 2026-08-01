@@ -11,7 +11,7 @@ import ctypes
 from ctypes import wintypes
 import os
 from pathlib import Path
-from typing import Protocol
+from typing import Iterable, Protocol
 
 
 @dataclass(frozen=True)
@@ -43,6 +43,9 @@ class WindowsProcessMonitor:
     _TH32CS_SNAPPROCESS = 0x00000002
     _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
     _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+    def __init__(self, watched_names: Iterable[str]) -> None:
+        self.watched_names = frozenset(name.casefold() for name in watched_names)
 
     def scan(self) -> ProcessScan:
         if os.name != "nt":
@@ -80,7 +83,10 @@ class WindowsProcessMonitor:
             ok = first(handle, ctypes.byref(entry))
             while ok:
                 pid = int(entry.th32ProcessID)
-                items.append(self._details(kernel32, pid, entry.szExeFile))
+                name = entry.szExeFile
+                details = self._details_if_watched(kernel32, pid, name)
+                if details is not None:
+                    items.append(details)
                 entry.dwSize = ctypes.sizeof(entry)
                 ok = next_item(handle, ctypes.byref(entry))
             error = ctypes.get_last_error()
@@ -89,6 +95,11 @@ class WindowsProcessMonitor:
         finally:
             kernel32.CloseHandle(handle)
         return ProcessScan(tuple(items))
+
+    def _details_if_watched(self, kernel32: object, pid: int, name: str) -> ProcessInfo | None:
+        if name.casefold() not in self.watched_names:
+            return None
+        return self._details(kernel32, pid, name)
 
     def _details(self, kernel32: object, pid: int, name: str) -> ProcessInfo:
         open_process = kernel32.OpenProcess

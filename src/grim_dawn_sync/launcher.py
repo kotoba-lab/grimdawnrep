@@ -29,11 +29,13 @@ class LaunchResult:
 
 
 class DPYesLauncher:
-    def __init__(self, config: SyncConfig, monitor: ProcessMonitor | None = None, runner: ProcessRunner | None = None, *, clock: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep, poll_seconds: float = 0.1, state_hook: Callable[[str], None] | None = None) -> None:
+    def __init__(self, config: SyncConfig, monitor: ProcessMonitor | None = None, runner: ProcessRunner | None = None, *, clock: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep, poll_seconds: float = 0.1, exit_poll_seconds: float = 1.0, state_hook: Callable[[str], None] | None = None) -> None:
         self.config = config
-        self.monitor = WindowsProcessMonitor() if monitor is None else monitor
+        watched_names = {*config.game_process_names, "dpyes.exe"}
+        self.monitor = WindowsProcessMonitor(watched_names) if monitor is None else monitor
         self.runner = SubprocessRunner() if runner is None else runner
-        self.clock, self.sleep, self.poll_seconds, self.state_hook = clock, sleep, poll_seconds, state_hook
+        self.clock, self.sleep = clock, sleep
+        self.poll_seconds, self.exit_poll_seconds, self.state_hook = poll_seconds, exit_poll_seconds, state_hook
 
     def run(self) -> LaunchResult:
         before = self._scan()
@@ -121,7 +123,7 @@ class DPYesLauncher:
             observed_pids.update(pid for pid, _ in current)
             watched = dict(active)
             if active:
-                self.sleep(self.poll_seconds)
+                self.sleep(self.exit_poll_seconds)
         return observed_pids
 
     def _scan(self) -> ProcessScan:
