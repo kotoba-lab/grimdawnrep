@@ -50,7 +50,7 @@ def _git(cwd: Path, *args: str) -> str:
 
 
 def _request_payload(
-    *, sequence: int = 12, expired: bool = False, bad_schema: bool = False
+    *, sequence: int = 13, expired: bool = False, bad_schema: bool = False
 ) -> dict[str, object]:
     payload = json.loads(REQUEST.read_text(encoding="utf-8"))
     now = datetime.now(timezone.utc).replace(microsecond=0)
@@ -96,6 +96,11 @@ def _make_git_wrapper(directory: Path) -> Path:
         "  echo changed>>\"%GIT_MOCK_CONFIG_PATH%\"\r\n"
         "  exit /b 0\r\n"
         ")\r\n"
+        "if \"%~3\"==\"show\" if \"%GIT_MOCK_MUTATE_SKILL%\"==\"1\" (\r\n"
+        f'  "{REAL_GIT}" %*\r\n'
+        "  echo changed>>\"%GIT_MOCK_SKILL_PATH%\"\r\n"
+        "  exit /b 0\r\n"
+        ")\r\n"
         f'"{REAL_GIT}" %*\r\n'
         "exit /b %errorlevel%\r\n",
         encoding="ascii",
@@ -125,9 +130,9 @@ def _setup_case(
     _run(REAL_GIT, "init", "-b", "master", str(seed))
     _git(seed, "config", "user.name", "Test Operator")
     _git(seed, "config", "user.email", "operator@example.invalid")
-    # The checked-in request is sequence 12. Seed the clone with the older
+    # The checked-in request is sequence 13. Seed the clone with the older
     # request so the test proves the canonical remote update is accepted.
-    initial_payload = _request_payload(sequence=11)
+    initial_payload = _request_payload(sequence=12)
     initial_payload["request_id"] = "00000000-0000-0000-0000-000000000001"
     _write_request(seed, initial_payload)
     package = seed / "src" / "grim_dawn_sync"
@@ -140,8 +145,18 @@ def _setup_case(
     _git(seed, "push", "-u", "origin", "master")
     _run(REAL_GIT, "clone", str(remote), str(terminal))
 
-    updated_payload = _request_payload(sequence=12, expired=expired, bad_schema=bad_schema)
-    assert initial_payload["sequence"] == 11 < updated_payload["sequence"] == 12
+    agents_skill = terminal / ".agents" / "skills" / "grim-dawn-buildcraft"
+    claude_skill = terminal / ".claude" / "skills" / "grim-dawn-buildcraft"
+    (agents_skill / "agents").mkdir(parents=True)
+    (agents_skill / "references" / "empty").mkdir(parents=True)
+    (claude_skill / "empty").mkdir(parents=True)
+    (agents_skill / "SKILL.md").write_text("agent skill\n", encoding="utf-8")
+    (agents_skill / "agents" / "openai.yaml").write_text("model: test\n", encoding="utf-8")
+    (agents_skill / "references" / "extra.md").write_text("extra\n", encoding="utf-8")
+    (claude_skill / "SKILL.md").write_text("claude skill\n", encoding="utf-8")
+
+    updated_payload = _request_payload(sequence=13, expired=expired, bad_schema=bad_schema)
+    assert initial_payload["sequence"] == 12 < updated_payload["sequence"] == 13
     if timestamp_fault == "malformed":
         updated_payload["issued_at"] = "2026-08-01T09:46:11+00:00"
     _write_request(seed, updated_payload)
@@ -184,6 +199,8 @@ def _setup_case(
         GIT_MOCK_FETCH_HEAD="",
         GIT_MOCK_MUTATE_CONFIG="0",
         GIT_MOCK_CONFIG_PATH=str(config),
+        GIT_MOCK_MUTATE_SKILL="0",
+        GIT_MOCK_SKILL_PATH=str(agents_skill / "SKILL.md"),
     )
     return terminal, remote, env, before_head, new_commit
 
@@ -231,7 +248,7 @@ def _stage_probe_script(base: Path) -> Path:
 
 
 def _source_path_repair_script(base: Path) -> Path:
-    section = RUNBOOK.read_text(encoding="utf-8").split("## Source-path runtime repair (sequence 12)", 1)[1]
+    section = RUNBOOK.read_text(encoding="utf-8").split("## Source-path runtime repair (sequence 13)", 1)[1]
     command = section.split("```powershell", 1)[1].split("```", 1)[0]
     path = base / "source-path-repair.ps1"
     path.write_text(command, encoding="utf-8-sig", newline="\n")
@@ -280,7 +297,12 @@ def test_remote_request_block_fetches_explicit_destination_without_changing_head
         assert result.returncode == 0 and result.stdout == "" and result.stderr == ""
         assert _git(terminal, "rev-parse", "HEAD") == before_head
         assert _git(terminal, "symbolic-ref", "HEAD") == "refs/heads/master"
-        assert _git(terminal, "status", "--porcelain=v1", "--untracked-files=all") == ""
+        porcelain = _git(terminal, "status", "--porcelain=v1", "--untracked-files=all").splitlines()
+        assert porcelain and all(
+            row.startswith("?? .agents/skills/grim-dawn-buildcraft/")
+            or row.startswith("?? .claude/skills/grim-dawn-buildcraft/")
+            for row in porcelain
+        )
         assert _git(terminal, "rev-parse", "origin/master") == new_commit
 
 
@@ -290,7 +312,11 @@ def test_remote_request_block_fetches_explicit_destination_without_changing_head
         ("url_mismatch", "origin_identity", "origin_identity_invalid"),
         ("extra_url", "origin_identity", "origin_identity_invalid"),
         ("wrong_branch", "source_branch", "source_branch_invalid"),
-        ("dirty", "source_clean", "source_clean_invalid"),
+        ("other_untracked", "source_policy", "source_policy_invalid"),
+        ("tracked_dirty", "source_policy", "source_policy_invalid"),
+        ("missing_skill_root", "source_policy", "source_policy_invalid"),
+        ("intent_to_add_in_skill", "source_policy", "source_policy_invalid"),
+        ("skill_root_reparse", "user_skills", "user_skills_invalid"),
         ("fingerprint", "fingerprint", "fingerprint_invalid"),
         ("fetch_fail", "fetch", "fetch_failed"),
         ("non_ff", "fetch", "fetch_failed"),
@@ -302,6 +328,7 @@ def test_remote_request_block_fetches_explicit_destination_without_changing_head
         ("timestamp_malformed", "time", "time_invalid"),
         ("timestamp_duplicate", "time", "time_invalid"),
         ("post_invariant", "post_invariant", "post_invariant_invalid"),
+        ("skill_changed", "post_invariant", "post_invariant_invalid"),
     ],
 )
 def test_remote_request_block_fault_matrix_is_fail_closed_and_sanitized(
@@ -322,8 +349,28 @@ def test_remote_request_block_fault_matrix_is_fail_closed_and_sanitized(
             env["GIT_MOCK_FETCH_URL"] = "https://example.invalid/wrong.git"
         elif fault == "extra_url":
             env["GIT_MOCK_EXTRA_URL"] = "1"
-        elif fault == "dirty":
+        elif fault == "other_untracked":
             (terminal / "untracked.txt").write_text("dirty\n", encoding="ascii")
+        elif fault == "tracked_dirty":
+            (terminal / "src" / "grim_dawn_sync" / "__init__.py").write_text("dirty\n", encoding="ascii")
+        elif fault == "missing_skill_root":
+            shutil.rmtree(terminal / ".claude" / "skills" / "grim-dawn-buildcraft")
+        elif fault == "intent_to_add_in_skill":
+            _git(terminal, "add", "-N", ".agents/skills/grim-dawn-buildcraft/SKILL.md")
+        elif fault == "skill_root_reparse":
+            skill_root = terminal / ".claude" / "skills" / "grim-dawn-buildcraft"
+            outside = base / "reparse-target"
+            shutil.rmtree(skill_root)
+            outside.mkdir()
+            (outside / "SKILL.md").write_text("outside\n", encoding="ascii")
+            made = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(skill_root), str(outside)],
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+            )
+            assert made.returncode == 0, made.stderr
         elif fault == "wrong_branch":
             _git(terminal, "checkout", "-b", "other")
         elif fault == "fingerprint":
@@ -360,6 +407,8 @@ def test_remote_request_block_fault_matrix_is_fail_closed_and_sanitized(
             _git(terminal, "update-ref", "refs/heads/master", divergent)
         elif fault == "post_invariant":
             env["GIT_MOCK_MUTATE_CONFIG"] = "1"
+        elif fault == "skill_changed":
+            env["GIT_MOCK_MUTATE_SKILL"] = "1"
 
         _assert_blocked(_invoke(script, env), stage, code)
 
@@ -761,6 +810,15 @@ def _summary_case(base: Path, *, remote_files: dict[str, bytes], corrupt: str | 
         " elif hook=='vault_detached': subprocess.run([git,'-C',os.environ['GIT_PROBE_VAULT'],'checkout','--detach',os.environ['GIT_PROBE_VAULT_HEAD']],check=True,stdout=subprocess.DEVNULL)\n"
         " elif hook=='remote_lock': subprocess.run([git,'-C',os.environ['GIT_PROBE_SEED'],'tag','grim-dawn-sync-active'],check=True); subprocess.run([git,'-C',os.environ['GIT_PROBE_SEED'],'push','origin','refs/tags/grim-dawn-sync-active'],check=True)\n"
         " elif hook=='remote_main': subprocess.run([git,'-C',os.environ['GIT_PROBE_SEED'],'commit','--allow-empty','-m','race'],check=True); subprocess.run([git,'-C',os.environ['GIT_PROBE_SEED'],'push','origin','main'],check=True)\n", encoding="ascii")
+    source_package = source / "src" / "grim_dawn_sync"
+    source_package.mkdir(parents=True)
+    shutil.copy2(package / "__init__.py", source_package / "__init__.py")
+    shutil.copy2(package / "__main__.py", source_package / "__main__.py")
+    _git(source, "add", "src/grim_dawn_sync")
+    _git(source, "commit", "-m", "source package")
+    pth = tool_python.parents[1] / "Lib" / "site-packages" / "grim_dawn_sync_source.pth"
+    pth.parent.mkdir(parents=True)
+    pth.write_bytes(str(source / "src").encode("utf-8") + os.linesep.encode("ascii"))
     wrapper = base / "bin"; wrapper.mkdir()
     (wrapper / "git.cmd").write_text(
         "@echo off\r\n"
@@ -790,7 +848,7 @@ def _summary_case(base: Path, *, remote_files: dict[str, bytes], corrupt: str | 
     # local mock CLI after its second status/doctor reply, so the production
     # Git invocation path is never intercepted.
     counter = base / "probe-count"
-    env=os.environ.copy(); env.update(USERPROFILE=str(profile), LOCALAPPDATA=str(local), PYTHONPATH=str(stub)+os.pathsep+str(ROOT / "src"), PYTHONHOME=str(interp), PATH=str(wrapper)+os.pathsep+env["PATH"], GIT_SHIM_DIR=str(wrapper), REAL_GIT=str(REAL_GIT), STAGE_PROBE_FAULT="", GIT_SUMMARY_HOOK="", GIT_SUMMARY_CONFIG=str(config), GIT_SUMMARY_STATE=str(state), GIT_SUMMARY_GIT=str(REAL_GIT), GIT_SUMMARY_SOURCE=str(source), GIT_SUMMARY_VAULT=str(vault), GIT_SUMMARY_SEED=str(seed), GIT_PROBE_HOOK="", GIT_PROBE_SOURCE=str(source), GIT_PROBE_VAULT=str(vault), GIT_PROBE_SOURCE_HEAD=_git(source, "rev-parse", "HEAD"), GIT_PROBE_VAULT_HEAD=_git(vault, "rev-parse", "HEAD"), GIT_PROBE_SEED=str(seed), GIT_PROBE_CONFIG=str(config), GIT_PROBE_STATE=str(state), GIT_PROBE_LIVE=str(live), GIT_PROBE_PACKAGE_MAIN=str(package / "__main__.py"), GIT_PROBE_COUNTER=str(counter), GIT_PROBE_SOURCE_FETCH_HEAD=str(source / ".git" / "FETCH_HEAD"), GIT_PROBE_VAULT_FETCH_HEAD=str(vault / ".git" / "FETCH_HEAD"))
+    env=os.environ.copy(); env.update(USERPROFILE=str(profile), LOCALAPPDATA=str(local), PYTHONPATH=str(stub)+os.pathsep+str(ROOT / "src"), PYTHONHOME=str(interp), PATH=str(wrapper)+os.pathsep+env["PATH"], GIT_SHIM_DIR=str(wrapper), REAL_GIT=str(REAL_GIT), STAGE_PROBE_FAULT="", GIT_SUMMARY_HOOK="", GIT_SUMMARY_CONFIG=str(config), GIT_SUMMARY_STATE=str(state), GIT_SUMMARY_GIT=str(REAL_GIT), GIT_SUMMARY_SOURCE=str(source), GIT_SUMMARY_VAULT=str(vault), GIT_SUMMARY_SEED=str(seed), GIT_PROBE_HOOK="", GIT_PROBE_SOURCE=str(source), GIT_PROBE_VAULT=str(vault), GIT_PROBE_SOURCE_HEAD=_git(source, "rev-parse", "HEAD"), GIT_PROBE_VAULT_HEAD=_git(vault, "rev-parse", "HEAD"), GIT_PROBE_SEED=str(seed), GIT_PROBE_CONFIG=str(config), GIT_PROBE_STATE=str(state), GIT_PROBE_LIVE=str(live), GIT_PROBE_PACKAGE_MAIN=str(pth), GIT_PROBE_COUNTER=str(counter), GIT_PROBE_SOURCE_FETCH_HEAD=str(source / ".git" / "FETCH_HEAD"), GIT_PROBE_VAULT_FETCH_HEAD=str(vault / ".git" / "FETCH_HEAD"))
     for command in ("status", "doctor"):
         checked = subprocess.run([str(tool_python), "-m", "grim_dawn_sync", "--config", str(config), "--json", command], env=env, capture_output=True, text=True, encoding="utf-8")
         assert checked.returncode == 0, checked.stderr
@@ -1108,12 +1166,6 @@ def test_sequence_9_request_block_parses_in_windows_powershell_51() -> None:
 def _prepare_stage_case(base: Path) -> tuple[dict[str, str], dict[str, str]]:
     env, paths = _summary_case(base, remote_files={"main/Hero/player.gdc": b"next"})
     source = Path(paths["source"])
-    source_package = source / "src" / "grim_dawn_sync"
-    source_package.mkdir(parents=True)
-    shutil.copy2(base / "stub" / "grim_dawn_sync" / "__init__.py", source_package / "__init__.py")
-    shutil.copy2(base / "stub" / "grim_dawn_sync" / "__main__.py", source_package / "__main__.py")
-    _git(source, "add", "src/grim_dawn_sync")
-    _git(source, "commit", "-m", "source package")
     package = base / "localappdata" / "GrimDawnSaveSyncTool" / ".venv" / "Lib" / "site-packages" / "grim_dawn_sync"
     package.mkdir(parents=True)
     shutil.copy2(base / "stub" / "grim_dawn_sync" / "__init__.py", package / "__init__.py")
@@ -1326,6 +1378,26 @@ def test_sequence_12_source_path_repair_rolls_back_exactly_when_import_fails(old
         else:
             assert pth.read_bytes() == old
         assert list(pth.parent.glob(".grim_dawn_sync_source.*")) == []
+
+
+def test_sequence_13_source_path_repair_preserves_exact_backup_when_rollback_fails() -> None:
+    with tempfile.TemporaryDirectory(prefix="terminal-a-source-path-rollback-failure-") as raw:
+        base = Path(raw)
+        old = b"only exact old pth backup\x00\xff"
+        env, pth = _prepare_source_path_repair_case(base, existing_pth=old, import_fails=True)
+        script = _source_path_repair_script(base)
+        text = script.read_text(encoding="utf-8-sig")
+        marker = "if($oldExists){if(!$rollback-or!(Test-Path -LiteralPath $rollback -PathType Leaf)-or!(SameBytes ([IO.File]::ReadAllBytes($rollback)) $oldBytes)){throw 'rollback_failed'};$temp="
+        replacement = "if($oldExists){if(!$rollback-or!(Test-Path -LiteralPath $rollback -PathType Leaf)-or!(SameBytes ([IO.File]::ReadAllBytes($rollback)) $oldBytes)){throw 'rollback_failed'};throw 'rollback_failed';$temp="
+        assert marker in text
+        script.write_text(text.replace(marker, replacement, 1), encoding="utf-8-sig")
+
+        result = _invoke(script, env)
+
+        _assert_source_path_failure(result, "rollback", "rollback_failed")
+        backups = list(pth.parent.glob(".grim_dawn_sync_source.*.rollback"))
+        assert len(backups) == 1
+        assert backups[0].read_bytes() == old
 
 
 def test_sequence_12_source_path_repair_parses_in_windows_powershell_51() -> None:

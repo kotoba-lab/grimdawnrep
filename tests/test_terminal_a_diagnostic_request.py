@@ -27,9 +27,16 @@ EXPECTED_KEYS = {
     "not_before",
     "expires_at",
 }
-EXPECTED_CHECKS = ["validated_public_source_tree", "exact_pth_contract", "post_repair_import_and_invariants"]
+EXPECTED_CHECKS = [
+    "validated_public_source_tree",
+    "preserved_exact_local_user_skill_roots",
+    "exact_pth_contract",
+    "post_repair_import_and_invariants",
+]
 EXPECTED_CONSTRAINTS = [
     "fixed_local_pth_only",
+    "allow_exact_untracked_user_skill_roots_in_place",
+    "no_user_skill_mutation",
     "no_pip_network_git_com_ui_input_process_kill_or_write",
     "no_source_config_state_save_vault_shortcut_remote_ref_mutation",
     "no_fetched_code_execution",
@@ -76,12 +83,12 @@ def test_terminal_a_request_has_exact_schema_identity_and_bounded_repair_action(
     assert set(payload) == EXPECTED_KEYS
     assert payload["schema_version"] == "1.0.0"
     assert payload["kind"] == "grim_dawn_terminal_diagnostic_request"
-    assert payload["sequence"] == 12
+    assert payload["sequence"] == 13
     assert payload["target_machine_id"] == "desktop-a"
     assert payload["leg"] == "A1" and payload["observed_code"] == "remote_changed_or_unknown"
     assert payload["action"] == "source_path_runtime_repair"
     assert payload["response_sentinel"] == "TERMINAL_A_SOURCE_PATH_REPAIR"
-    assert payload["request_id"] == "dd053eb5-3863-4250-bcdf-21e41e8fb5be"
+    assert payload["request_id"] == "89ad6e15-05f6-4475-8330-347f5c01bcb5"
     parsed_id = uuid.UUID(str(payload["request_id"]))
     assert str(parsed_id) == payload["request_id"]
 
@@ -108,15 +115,15 @@ def test_terminal_a_request_has_strict_utc_window_of_at_most_seventy_five_minute
         values[field] = parsed
     assert values["issued_at"] <= values["not_before"] < values["expires_at"]
     assert (values["expires_at"] - values["not_before"]).total_seconds() <= 4500
-    assert payload["issued_at"] == payload["not_before"] == "2026-08-02T07:12:04Z"
-    assert payload["expires_at"] == "2026-08-02T08:27:04Z"
+    assert payload["issued_at"] == payload["not_before"] == "2026-08-02T07:34:18Z"
+    assert payload["expires_at"] == "2026-08-02T08:49:18Z"
     assert (values["expires_at"] - values["not_before"]).total_seconds() == 4500
 
 
-def test_sequence_11_false_diagnostic_is_retired_and_sequence_12_is_exactly_bounded() -> None:
+def test_sequence_11_false_diagnostic_is_retired_and_sequence_13_is_exactly_bounded() -> None:
     runbook = RUNBOOK_PATH.read_text(encoding="utf-8")
-    retired = runbook.split("## Retired package artifact substage probe (sequence 11; DO NOT RUN)", 1)[1].split("## Source-path runtime repair (sequence 12)", 1)[0]
-    block = runbook.split("## Source-path runtime repair (sequence 12)", 1)[1].split("```powershell", 1)[1].split("```", 1)[0]
+    retired = runbook.split("## Retired package artifact substage probe (sequence 11; DO NOT RUN)", 1)[1].split("## Source-path runtime repair (sequence 13)", 1)[0]
+    block = runbook.split("## Source-path runtime repair (sequence 13)", 1)[1].split("```powershell", 1)[1].split("```", 1)[0]
 
     assert "false\ndiagnostic" in retired and "```powershell" not in retired
     for stage in ("bootstrap", "source_package", "purelib", "source_path", "import", "rollback", "post_invariant", "complete"):
@@ -128,20 +135,41 @@ def test_sequence_11_false_diagnostic_is_retired_and_sequence_12_is_exactly_boun
     assert "Text.UTF8Encoding($false)" in block and "[IO.File]::Replace" in block
     assert "pth_already_current" in block and "pth_repaired" in block
     assert "if($changed-and!$success)" in block and "[IO.File]::Move($pth,$rollback)" in block
+    assert "$rollback-and(!$oldExists-or$success)" in block
     for forbidden in ("pip", "Start-Process", "New-Object -ComObject", "SendKeys", "PostMessage", "taskkill", "Get-CimInstance", " git", "Invoke-WebRequest", "fetch", "commit", "push", "config.local", "state.json", "save_root", "vault_repo"):
         assert forbidden.lower() not in block.lower()
 
 
-def test_dynamic_quarantine_operator_delivery_constructs_link_prone_filenames() -> None:
+def test_dynamic_quarantine_is_retired_and_user_skills_stay_in_place() -> None:
     runbook = RUNBOOK_PATH.read_text(encoding="utf-8")
-    delivery = runbook.split("### Operator delivery integrity for dynamic quarantine", 1)[1].split(
+    delivery = runbook.split("### Retired dynamic quarantine (DO NOT RUN)", 1)[1].split(
         "## Retired selector cancel/reload automation", 1
     )[0]
 
-    assert "('SKILL'+[char]46+'md')" in delivery
-    assert "(Join-Path 'agents' ('openai'+[char]46+'yaml'))" in delivery
-    assert "SKILL.md" not in delivery
-    assert "openai.yaml" not in delivery
+    assert "preserves both exact roots in place" in delivery
+    assert "```powershell" not in delivery
+    for forbidden in ("Directory]::Move", "Move-Item", "Remove-Item", "git stash", "git commit"):
+        assert forbidden not in delivery
+
+
+def test_sequence_13_validator_preserves_only_two_dynamic_user_skill_roots() -> None:
+    _section, block = _remote_section_and_block()
+
+    assert "$request.sequence -ne 13" in block
+    assert "preserved_exact_local_user_skill_roots" in block
+    assert "allow_exact_untracked_user_skill_roots_in_place" in block
+    assert "no_user_skill_mutation" in block
+    assert "Get-UserSkillTreeMark" in block
+    assert "[Convert]::ToBase64String" in block
+    assert "[Array]::Sort($ordered, [StringComparer]::Ordinal)" in block
+    assert "Get-FileSha256" in block and "[int64]$item.Length" in block
+    assert "Assert-NoReparse" in block and "path_escape" not in block
+    assert "'diff','--quiet','--ignore-submodules=none','--'" in block
+    assert "'diff','--cached','--quiet','--ignore-submodules=none','--'" in block
+    assert "'--exclude=.agents/skills/grim-dawn-buildcraft/**'" in block
+    assert "'--exclude=.claude/skills/grim-dawn-buildcraft/**'" in block
+    assert "$afterAgentsSkill -cne $beforeAgentsSkill" in block
+    assert "$afterClaudeSkill -cne $beforeClaudeSkill" in block
 
 
 def test_sequence_10_stage_probe_has_closed_stages_codes_and_readonly_surface() -> None:
@@ -221,7 +249,8 @@ def test_remote_handoff_relays_only_sanitized_sentinel_without_private_data() ->
     expected_codes = {
         "origin_identity": "origin_identity_invalid",
         "source_branch": "source_branch_invalid",
-        "source_clean": "source_clean_invalid",
+        "source_policy": "source_policy_invalid",
+        "user_skills": "user_skills_invalid",
         "fingerprint": "fingerprint_invalid",
         "fetch": "fetch_failed",
         "oid": "oid_invalid",
@@ -247,7 +276,8 @@ def test_remote_handoff_sets_each_observable_stage_before_its_check() -> None:
     ordered_stage_checks = (
         ("$stage = 'origin_identity'", "$fetchUrls ="),
         ("$stage = 'source_branch'", "$beforeBranch ="),
-        ("$stage = 'source_clean'", "$beforeStatus ="),
+        ("$stage = 'source_policy'", "\n    Assert-SourcePolicy\n"),
+        ("$stage = 'user_skills'", "$agentsParent ="),
         ("$stage = 'fingerprint'", "$beforePython ="),
         ("$stage = 'fetch'", "Invoke-GitQuiet @('fetch'"),
         ("$stage = 'oid'", "$originMaster ="),

@@ -2,25 +2,28 @@
   "action": "source_path_runtime_repair",
   "checks": [
     "validated_public_source_tree",
+    "preserved_exact_local_user_skill_roots",
     "exact_pth_contract",
     "post_repair_import_and_invariants"
   ],
   "constraints": [
     "fixed_local_pth_only",
+    "allow_exact_untracked_user_skill_roots_in_place",
+    "no_user_skill_mutation",
     "no_pip_network_git_com_ui_input_process_kill_or_write",
     "no_source_config_state_save_vault_shortcut_remote_ref_mutation",
     "no_fetched_code_execution",
     "atomic_pth_write_with_exact_rollback"
   ],
-  "expires_at": "2026-08-02T08:27:04Z",
-  "issued_at": "2026-08-02T07:12:04Z",
+  "expires_at": "2026-08-02T08:49:18Z",
+  "issued_at": "2026-08-02T07:34:18Z",
   "kind": "grim_dawn_terminal_diagnostic_request",
   "leg": "A1",
-  "not_before": "2026-08-02T07:12:04Z",
+  "not_before": "2026-08-02T07:34:18Z",
   "observed_code": "remote_changed_or_unknown",
-  "request_id": "dd053eb5-3863-4250-bcdf-21e41e8fb5be",
+  "request_id": "89ad6e15-05f6-4475-8330-347f5c01bcb5",
   "response_sentinel": "TERMINAL_A_SOURCE_PATH_REPAIR",
   "schema_version": "1.0.0",
-  "sequence": 12,
+  "sequence": 13,
   "target_machine_id": "desktop-a"
 }

@@ -33,7 +33,8 @@ $stage = 'origin_identity'
 $stageCodes = @{
     origin_identity = 'origin_identity_invalid'
     source_branch = 'source_branch_invalid'
-    source_clean = 'source_clean_invalid'
+    source_policy = 'source_policy_invalid'
+    user_skills = 'user_skills_invalid'
     fingerprint = 'fingerprint_invalid'
     fetch = 'fetch_failed'
     oid = 'oid_invalid'
@@ -45,7 +46,7 @@ $stageCodes = @{
 }
 
 function Write-RequestBlocked {
-    $safeStages = @('origin_identity','source_branch','source_clean','fingerprint','fetch','oid',
+    $safeStages = @('origin_identity','source_branch','source_policy','user_skills','fingerprint','fetch','oid',
         'ancestor','blob','schema','time','post_invariant')
     $safeStage = if ($stage -in $safeStages) { $stage } else { 'origin_identity' }
     [ordered]@{
@@ -119,6 +120,70 @@ function Get-FileSha256([string]$Path) {
     finally { $sha.Dispose(); $stream.Dispose() }
 }
 
+function Assert-NoReparse([string]$Path) {
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'invalid' }
+}
+
+function Get-UserSkillTreeMark([string]$Root, [string]$Label) {
+    if (-not (Test-Path -LiteralPath $Root -PathType Container)) { throw 'invalid' }
+    Assert-NoReparse $Root
+    $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd([char[]]'\')
+    $prefix = $rootFull + '\'
+    $rows = New-Object 'System.Collections.Generic.List[string]'
+    $pending = New-Object 'System.Collections.Generic.Stack[string]'
+    $pending.Push($rootFull)
+    while ($pending.Count -gt 0) {
+        $current = $pending.Pop()
+        Assert-NoReparse $current
+        foreach ($item in @(Get-ChildItem -LiteralPath $current -Force -ErrorAction Stop)) {
+            $full = [IO.Path]::GetFullPath($item.FullName)
+            if (-not $full.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { throw 'invalid' }
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'invalid' }
+            $relative = $full.Substring($prefix.Length)
+            if ([string]::IsNullOrEmpty($relative) -or $relative.StartsWith('\') -or
+                $relative.StartsWith('/') -or $relative.Split('\') -contains '..') { throw 'invalid' }
+            $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($relative))
+            if ($item.PSIsContainer) {
+                [void]$rows.Add($Label + [char]0 + 'D' + [char]0 + $encoded)
+                $pending.Push($full)
+            }
+            else {
+                $lengthBefore = [int64]$item.Length
+                $digest = Get-FileSha256 $item.FullName
+                $after = Get-Item -LiteralPath $item.FullName -Force -ErrorAction Stop
+                if (($after.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+                    [int64]$after.Length -ne $lengthBefore) { throw 'invalid' }
+                [void]$rows.Add($Label + [char]0 + 'F' + [char]0 + $encoded + [char]0 +
+                    [string]$lengthBefore + [char]0 + $digest)
+            }
+        }
+    }
+    if ($rows.Count -eq 0) { throw 'invalid' }
+    $ordered = [string[]]$rows.ToArray()
+    [Array]::Sort($ordered, [StringComparer]::Ordinal)
+    return $ordered -join "`n"
+}
+
+function Assert-SourcePolicy {
+    Invoke-GitQuiet @('diff','--quiet','--ignore-submodules=none','--')
+    Invoke-GitQuiet @('diff','--cached','--quiet','--ignore-submodules=none','--')
+    $status = @(Invoke-GitLines @('status','--porcelain=v1','--untracked-files=all'))
+    foreach ($row in $status) { if (-not ([string]$row).StartsWith('?? ')) { throw 'invalid' } }
+    $trackedInRoots = @(Invoke-GitLines @('ls-files','--',
+        '.agents/skills/grim-dawn-buildcraft/**','.claude/skills/grim-dawn-buildcraft/**'))
+    if ($trackedInRoots.Count -ne 0) { throw 'invalid' }
+    $outside = @(Invoke-GitLines @('ls-files','--others','--exclude-standard',
+        '--exclude=.agents/skills/grim-dawn-buildcraft/**',
+        '--exclude=.claude/skills/grim-dawn-buildcraft/**','--','.'))
+    if ($outside.Count -ne 0) { throw 'invalid' }
+    $agentEntries = @(Invoke-GitLines @('ls-files','--others','--exclude-standard','--',
+        '.agents/skills/grim-dawn-buildcraft/**'))
+    $claudeEntries = @(Invoke-GitLines @('ls-files','--others','--exclude-standard','--',
+        '.claude/skills/grim-dawn-buildcraft/**'))
+    if ($agentEntries.Count -eq 0 -or $claudeEntries.Count -eq 0) { throw 'invalid' }
+}
+
 try {
     $stage = 'origin_identity'
     if (-not (Test-Path -LiteralPath $source -PathType Container)) { throw 'invalid' }
@@ -133,9 +198,20 @@ try {
     $beforeHead = Get-OneGitLine @('rev-parse','HEAD')
     if ($beforeBranch -cne 'refs/heads/master') { throw 'invalid' }
 
-    $stage = 'source_clean'
-    $beforeStatus = @(Invoke-GitLines @('status','--porcelain=v1','--untracked-files=all'))
-    if ($beforeStatus.Count -ne 0) { throw 'invalid' }
+    $stage = 'source_policy'
+    Assert-SourcePolicy
+
+    $stage = 'user_skills'
+    $agentsParent = Join-Path $source '.agents'
+    $agentsSkills = Join-Path $agentsParent 'skills'
+    $agentsRoot = Join-Path $agentsSkills 'grim-dawn-buildcraft'
+    $claudeParent = Join-Path $source '.claude'
+    $claudeSkills = Join-Path $claudeParent 'skills'
+    $claudeRoot = Join-Path $claudeSkills 'grim-dawn-buildcraft'
+    foreach ($path in @($source,$agentsParent,$agentsSkills,$agentsRoot,
+        $claudeParent,$claudeSkills,$claudeRoot)) { Assert-NoReparse $path }
+    $beforeAgentsSkill = Get-UserSkillTreeMark $agentsRoot 'agents'
+    $beforeClaudeSkill = Get-UserSkillTreeMark $claudeRoot 'claude'
 
     $stage = 'fingerprint'
     if (-not (Test-Path -LiteralPath $python -PathType Leaf) -or
@@ -179,7 +255,7 @@ try {
     if (-not ($request.schema_version -is [string]) -or $request.schema_version -cne '1.0.0' -or
         -not ($request.kind -is [string]) -or
         $request.kind -cne 'grim_dawn_terminal_diagnostic_request' -or
-        -not ($request.sequence -is [int]) -or $request.sequence -ne 12 -or
+        -not ($request.sequence -is [int]) -or $request.sequence -ne 13 -or
         -not ($request.target_machine_id -is [string]) -or $request.target_machine_id -cne $machineId -or
         -not ($request.leg -is [string]) -or -not ($request.observed_code -is [string]) -or
         -not ($request.action -is [string]) -or -not ($request.response_sentinel -is [string]) -or
@@ -187,8 +263,8 @@ try {
         $request.leg -cne 'A1' -or $request.observed_code -cne 'remote_changed_or_unknown' -or
         $request.action -cne 'source_path_runtime_repair' -or
         $request.response_sentinel -cne 'TERMINAL_A_SOURCE_PATH_REPAIR') { throw 'invalid' }
-    Assert-ExactArray $request.checks @('validated_public_source_tree','exact_pth_contract','post_repair_import_and_invariants')
-    Assert-ExactArray $request.constraints @('fixed_local_pth_only','no_pip_network_git_com_ui_input_process_kill_or_write',
+    Assert-ExactArray $request.checks @('validated_public_source_tree','preserved_exact_local_user_skill_roots','exact_pth_contract','post_repair_import_and_invariants')
+    Assert-ExactArray $request.constraints @('fixed_local_pth_only','allow_exact_untracked_user_skill_roots_in_place','no_user_skill_mutation','no_pip_network_git_com_ui_input_process_kill_or_write',
         'no_source_config_state_save_vault_shortcut_remote_ref_mutation','no_fetched_code_execution','atomic_pth_write_with_exact_rollback')
     $requestGuid = [Guid]::Empty
     if (-not [Guid]::TryParse([string]$request.request_id, [ref]$requestGuid) -or
@@ -205,11 +281,14 @@ try {
     $stage = 'post_invariant'
     $afterBranch = Get-OneGitLine @('symbolic-ref','--quiet','HEAD')
     $afterHead = Get-OneGitLine @('rev-parse','HEAD')
-    $afterStatus = @(Invoke-GitLines @('status','--porcelain=v1','--untracked-files=all'))
+    Assert-SourcePolicy
+    $afterAgentsSkill = Get-UserSkillTreeMark $agentsRoot 'agents'
+    $afterClaudeSkill = Get-UserSkillTreeMark $claudeRoot 'claude'
     $afterPython = Get-FileSha256 $python
     $afterConfig = Get-FileSha256 $config
     if ($afterBranch -cne $beforeBranch -or $afterHead -cne $beforeHead -or
-        $afterStatus.Count -ne 0 -or $afterPython -cne $beforePython -or $afterConfig -cne $beforeConfig) { throw 'invalid' }
+        $afterAgentsSkill -cne $beforeAgentsSkill -or $afterClaudeSkill -cne $beforeClaudeSkill -or
+        $afterPython -cne $beforePython -or $afterConfig -cne $beforeConfig) { throw 'invalid' }
     exit 0
 }
 catch {
@@ -283,10 +362,11 @@ The supported deployment instead imports the verified worktree through
 diagnostic.  The executable block has been removed; do not reconstruct or run
 it.
 
-## Source-path runtime repair (sequence 12)
+## Source-path runtime repair (sequence 13)
 
-Run this installed local block only after the sequence 12 request validation
-block exits zero.  That validation proves the clean local
+Run this installed local block only after the sequence 13 request validation
+block exits zero.  That validation proves the tracked local state is clean,
+preserves the exact two user-owned untracked skill roots in place, and proves the local
 `HEAD:src/grim_dawn_sync` tree is byte-identical to the fetched canonical
 public tree without checking out or executing fetched content.  This block
 uses the fixed venv interpreter to locate its `purelib` directory.  It makes no
@@ -318,34 +398,21 @@ try{
  $stage='import';try{$importLines=@(Python @('-B','-c','from pathlib import Path; import grim_dawn_sync, grim_dawn_sync.__main__, sys; actual=Path(grim_dawn_sync.__file__).resolve(); expected=Path(sys.argv[1]).resolve(); raise SystemExit(0 if expected in actual.parents else 3)',(Join-Path $sourceRoot 'grim_dawn_sync')) 'source_package_import_failed');if($importLines.Count-ne0){throw 'source_package_import_failed'}}catch{throw 'source_package_import_failed'}
  $stage='post_invariant';if(!(SameBytes ([IO.File]::ReadAllBytes($pth)) $expected)-or(TreeDigest $sourceRoot)-cne$sourceMark-or(Digest $python)-cne$pythonMark){throw 'post_invariant_changed'}
  $success=$true;Write-Output (Out 'complete' 'complete' $(if($already){'pth_already_current'}else{'pth_repaired'}));exit 0
-}catch{$failedStage=$stage;$code=[string]$_.Exception.Message;if($changed-and!$success){$stage='rollback';try{if(!(Test-Path -LiteralPath $pth -PathType Leaf)-or!(SameBytes ([IO.File]::ReadAllBytes($pth)) $expected)){throw 'rollback_failed'};if($oldExists){if(!$rollback-or!(Test-Path -LiteralPath $rollback -PathType Leaf)-or!(SameBytes ([IO.File]::ReadAllBytes($rollback)) $oldBytes)){throw 'rollback_failed'};$temp=Join-Path ([IO.Path]::GetDirectoryName($pth)) ('.grim_dawn_sync_source.'+[Guid]::NewGuid().ToString('N')+'.discard');[IO.File]::Replace($rollback,$pth,$temp);$rollback=$null;if(!(SameBytes ([IO.File]::ReadAllBytes($pth)) $oldBytes)){throw 'rollback_failed'}}else{$rollback=Join-Path ([IO.Path]::GetDirectoryName($pth)) ('.grim_dawn_sync_source.'+[Guid]::NewGuid().ToString('N')+'.rollback');[IO.File]::Move($pth,$rollback);if(Test-Path -LiteralPath $pth){throw 'rollback_failed'}};$changed=$false;$stage=$failedStage}catch{$code='rollback_failed'}};$allowed=@('python_missing','source_package_missing','purelib_invalid','source_path_unreadable','source_path_write_failed','source_package_import_failed','rollback_failed','post_invariant_changed','artifact_missing','artifact_unreadable','unexpected_failed');if($code-notin$allowed){$code='unexpected_failed'};Write-Output (Out 'blocked' $stage $code);exit 1}finally{foreach($scratch in @($temp,$rollback)){if($scratch-and(Test-Path -LiteralPath $scratch -PathType Leaf)){[IO.File]::Delete($scratch)}}}
+}catch{$failedStage=$stage;$code=[string]$_.Exception.Message;if($changed-and!$success){$stage='rollback';try{if(!(Test-Path -LiteralPath $pth -PathType Leaf)-or!(SameBytes ([IO.File]::ReadAllBytes($pth)) $expected)){throw 'rollback_failed'};if($oldExists){if(!$rollback-or!(Test-Path -LiteralPath $rollback -PathType Leaf)-or!(SameBytes ([IO.File]::ReadAllBytes($rollback)) $oldBytes)){throw 'rollback_failed'};$temp=Join-Path ([IO.Path]::GetDirectoryName($pth)) ('.grim_dawn_sync_source.'+[Guid]::NewGuid().ToString('N')+'.discard');[IO.File]::Replace($rollback,$pth,$temp);$rollback=$null;if(!(SameBytes ([IO.File]::ReadAllBytes($pth)) $oldBytes)){throw 'rollback_failed'}}else{$rollback=Join-Path ([IO.Path]::GetDirectoryName($pth)) ('.grim_dawn_sync_source.'+[Guid]::NewGuid().ToString('N')+'.rollback');[IO.File]::Move($pth,$rollback);if(Test-Path -LiteralPath $pth){throw 'rollback_failed'}};$changed=$false;$stage=$failedStage}catch{$code='rollback_failed'}};$allowed=@('python_missing','source_package_missing','purelib_invalid','source_path_unreadable','source_path_write_failed','source_package_import_failed','rollback_failed','post_invariant_changed','artifact_missing','artifact_unreadable','unexpected_failed');if($code-notin$allowed){$code='unexpected_failed'};Write-Output (Out 'blocked' $stage $code);exit 1}finally{if($temp-and(Test-Path -LiteralPath $temp -PathType Leaf)){[IO.File]::Delete($temp)};if($rollback-and(!$oldExists-or$success)-and(Test-Path -LiteralPath $rollback -PathType Leaf)){[IO.File]::Delete($rollback)}}
 ```
 
 Report exactly the single JSON line.  `pth_already_current` and `pth_repaired`
 are both successful, idempotent outcomes.  Any blocked result is fail-closed;
 do not launch the shortcut or run another repair.
 
-### Operator delivery integrity for dynamic quarantine
+### Retired dynamic quarantine (DO NOT RUN)
 
-A Terminal A dynamic-quarantine attempt correctly stopped with
-`core_file_missing` before it created a quarantine root or moved any content.
-The cause was an operator-delivery defect: rich-text copy/rendering transformed
-a dotted filename in the PowerShell block into a URL-like link.  It was not a
-quarantine logic failure.
-
-Any future copyable PowerShell quarantine block must construct the two
-link-prone filenames at runtime; do not emit either as a bare dotted filename
-in the block.  Use this form when building the required core-file list:
-
-```powershell
-$coreFiles = @(
-    ('SKILL'+[char]46+'md'),
-    (Join-Path 'agents' ('openai'+[char]46+'yaml'))
-)
-```
-
-This is a delivery-layer safeguard only.  The snapshot, manifest,
-`[IO.Directory]::Move`, and verification logic remain unchanged.
+The quarantine approach is retired.  It cannot satisfy source policy while a
+second legitimate user-owned skill root remains under `.claude`, and rich-text
+operator delivery also corrupted dotted filenames in an earlier attempt.
+Sequence 13 instead preserves both exact roots in place and fingerprints their
+complete dynamic contents before and after validation.  Do not reconstruct or
+run any quarantine, restore, ignore, delete, stash, or commit block for them.
 
 ## Retired selector cancel/reload automation (sequence 8; DO NOT RUN)
 
@@ -841,7 +908,7 @@ function InstalledManifestRoot($root){
   if($v.Count -ne 1 -or $v[0] -notmatch '^[0-9a-f]{64}$'){throw 'precondition_failed'}
   return [string]$v[0]
 }
-function ToolIdentity($p){if(!(Test-Path -LiteralPath $p -PathType Leaf)){throw 'precondition_failed'};$pkg=Join-Path ([IO.Path]::GetDirectoryName([IO.Path]::GetDirectoryName($p))) 'Lib\site-packages\grim_dawn_sync';if(!(Test-Path -LiteralPath $pkg -PathType Container)){throw 'precondition_failed'};$py=@(Get-ChildItem -LiteralPath $pkg -Recurse -File -Filter *.py|Sort-Object FullName);if($py.Count -eq 0){throw 'precondition_failed'};$rows=@($py|ForEach-Object{$rel=$_.FullName.Substring($pkg.Length);$rel+'='+(FileDigest -p $_.FullName)});$meta=Get-Item -LiteralPath $p;return @([IO.Path]::GetFullPath($p),$meta.Length,$meta.LastWriteTimeUtc.Ticks,($rows -join "`n")) -join "`0"}
+function ToolIdentity($p){if(!(Test-Path -LiteralPath $p -PathType Leaf)){throw 'precondition_failed'};$site=Join-Path ([IO.Path]::GetDirectoryName([IO.Path]::GetDirectoryName($p))) 'Lib\site-packages';$pth=Join-Path $site 'grim_dawn_sync_source.pth';$src=Join-Path $source 'src';$entry=Join-Path $src 'grim_dawn_sync\__main__.py';if(!(Test-Path -LiteralPath $entry -PathType Leaf)-or!(Test-Path -LiteralPath $pth -PathType Leaf)){throw 'precondition_failed'};$actual=[IO.File]::ReadAllBytes($pth);$expected=(New-Object Text.UTF8Encoding($false)).GetBytes($src+[Environment]::NewLine);if($actual.Length-ne$expected.Length){throw 'precondition_failed'};for($i=0;$i-lt$actual.Length;$i++){if($actual[$i]-ne$expected[$i]){throw 'precondition_failed'}};$meta=Get-Item -LiteralPath $p;return @([IO.Path]::GetFullPath($p),$meta.Length,$meta.LastWriteTimeUtc.Ticks,(FileDigest -p $pth)) -join "`0"}
 function Windows(){try{return @([ProbeWindow]::Matching($selectorTitle)|ForEach-Object{[pscustomobject]@{pid=$_}})}catch{throw 'process_observation_inconclusive'}}
 function Processes(){try{return @(Get-CimInstance Win32_Process -ErrorAction Stop)}catch{throw 'process_observation_inconclusive'}}
 function Out($status,$code,$safe,$selector,$owned,$py,$ps,$unchanged){$x=[ordered]@{sentinel='TERMINAL_A_POST_SELECTOR_FAILURE_PROBE';status=$status;leg='A1';machine_id=$machineId;safe_to_retry=$safe;code=$code};if($status-eq'complete'){$x.status_expected=$true;$x.lock_clear=$true;$x.recovery_clear=$true;$x.game_processes_clear=$true;$x.remote_lock_clear=$true;$x.remote_stable=$true;$x.live_unchanged=$unchanged;$x.state_unchanged=$unchanged;$x.vault_unchanged=$unchanged;$x.source_unchanged=$unchanged;$x.selector_window_count_bucket=(Bucket $selector);$x.selector_owned_python_count_bucket=(Bucket $owned);$x.all_python_count_bucket=(Bucket $py);$x.non_operator_powershell_count_bucket=(Bucket $ps)};$x|ConvertTo-Json -Compress}
