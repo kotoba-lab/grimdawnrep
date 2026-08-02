@@ -27,12 +27,13 @@ EXPECTED_KEYS = {
     "not_before",
     "expires_at",
 }
-EXPECTED_CHECKS = ["two_pass_package_artifact_observation"]
+EXPECTED_CHECKS = ["validated_public_source_tree", "exact_pth_contract", "post_repair_import_and_invariants"]
 EXPECTED_CONSTRAINTS = [
-    "installed_local_fixed_block_only",
-    "no_python_cli_git_network_com_ui_input_process_kill_or_write",
-    "no_save_state_config_vault_remote_ref_mutation",
+    "fixed_local_pth_only",
+    "no_pip_network_git_com_ui_input_process_kill_or_write",
+    "no_source_config_state_save_vault_shortcut_remote_ref_mutation",
     "no_fetched_code_execution",
+    "atomic_pth_write_with_exact_rollback",
 ]
 FORBIDDEN_FIELDS = {
     "command",
@@ -69,18 +70,18 @@ def test_terminal_a_request_is_fixed_canonical_small_utf8_lf_json() -> None:
     assert raw.decode("utf-8") == canonical
 
 
-def test_terminal_a_request_has_exact_schema_identity_and_readonly_action() -> None:
+def test_terminal_a_request_has_exact_schema_identity_and_bounded_repair_action() -> None:
     _raw, payload = _request()
 
     assert set(payload) == EXPECTED_KEYS
     assert payload["schema_version"] == "1.0.0"
     assert payload["kind"] == "grim_dawn_terminal_diagnostic_request"
-    assert payload["sequence"] == 11
+    assert payload["sequence"] == 12
     assert payload["target_machine_id"] == "desktop-a"
     assert payload["leg"] == "A1" and payload["observed_code"] == "remote_changed_or_unknown"
-    assert payload["action"] == "package_artifact_substage_readonly"
-    assert payload["response_sentinel"] == "TERMINAL_A_PACKAGE_ARTIFACT_PROBE"
-    assert payload["request_id"] == "6a79b8d4-e4f0-454a-88ca-734fdad8a2dd"
+    assert payload["action"] == "source_path_runtime_repair"
+    assert payload["response_sentinel"] == "TERMINAL_A_SOURCE_PATH_REPAIR"
+    assert payload["request_id"] == "79fbbdbb-6f6e-421a-aa91-9e069cbf93f1"
     parsed_id = uuid.UUID(str(payload["request_id"]))
     assert str(parsed_id) == payload["request_id"]
 
@@ -107,23 +108,27 @@ def test_terminal_a_request_has_strict_utc_window_of_at_most_seventy_five_minute
         values[field] = parsed
     assert values["issued_at"] <= values["not_before"] < values["expires_at"]
     assert (values["expires_at"] - values["not_before"]).total_seconds() <= 4500
-    assert payload["issued_at"] == payload["not_before"] == "2026-08-02T04:22:00Z"
-    assert payload["expires_at"] == "2026-08-02T05:37:00Z"
+    assert payload["issued_at"] == payload["not_before"] == "2026-08-02T05:20:00Z"
+    assert payload["expires_at"] == "2026-08-02T06:35:00Z"
     assert (values["expires_at"] - values["not_before"]).total_seconds() == 4500
 
 
-def test_sequence_11_package_artifact_probe_is_exactly_bounded_and_readonly() -> None:
+def test_sequence_11_false_diagnostic_is_retired_and_sequence_12_is_exactly_bounded() -> None:
     runbook = RUNBOOK_PATH.read_text(encoding="utf-8")
-    block = runbook.split("## Package artifact substage probe (sequence 11)", 1)[1].split("```powershell", 1)[1].split("```", 1)[0]
+    retired = runbook.split("## Retired package artifact substage probe (sequence 11; DO NOT RUN)", 1)[1].split("## Source-path runtime repair (sequence 12)", 1)[0]
+    block = runbook.split("## Source-path runtime repair (sequence 12)", 1)[1].split("```powershell", 1)[1].split("```", 1)[0]
 
-    for stage in ("installed_package_directory", "installed_package_sources", "config_file", "state_file", "shortcut_file", "live_save_root", "post_invariant", "complete"):
+    assert "false\ndiagnostic" in retired and "```powershell" not in retired
+    for stage in ("bootstrap", "source_package", "purelib", "source_path", "import", "rollback", "post_invariant", "complete"):
         assert f"'{stage}'" in block
-    for code in ("artifact_missing", "artifact_unreadable", "artifact_changed", "unexpected_failed"):
+    for code in ("python_missing", "source_package_missing", "purelib_invalid", "source_path_unreadable", "source_path_write_failed", "source_package_import_failed", "rollback_failed", "post_invariant_changed", "unexpected_failed"):
         assert f"'{code}'" in block
-    assert "TERMINAL_A_PACKAGE_ARTIFACT_PROBE" in block
-    assert "ToolDirectory" in block and "ToolIdentity" in block and "TreeDigest" in block
-    assert "ConvertFrom-Json" in block and "save_root" in block
-    for forbidden in ("Start-Process", "New-Object -ComObject", "SendKeys", "PostMessage", "taskkill", "Get-CimInstance", " git", "-m grim_dawn_sync", "Invoke-WebRequest", "fetch", "commit", "push", "recover", "restore"):
+    assert "TERMINAL_A_SOURCE_PATH_REPAIR" in block
+    assert "grim_dawn_sync_source.pth" in block and "[Environment]::NewLine" in block
+    assert "Text.UTF8Encoding($false)" in block and "[IO.File]::Replace" in block
+    assert "pth_already_current" in block and "pth_repaired" in block
+    assert "if($changed-and!$success)" in block and "[IO.File]::Move($pth,$rollback)" in block
+    for forbidden in ("pip", "Start-Process", "New-Object -ComObject", "SendKeys", "PostMessage", "taskkill", "Get-CimInstance", " git", "Invoke-WebRequest", "fetch", "commit", "push", "config.local", "state.json", "save_root", "vault_repo"):
         assert forbidden.lower() not in block.lower()
 
 
@@ -169,6 +174,9 @@ def test_remote_handoff_fetches_canonical_master_and_reads_only_fixed_commit_pat
     assert "@('rev-parse','origin/master')" in command
     assert "@('rev-parse','FETCH_HEAD')" in command
     assert "@('merge-base','--is-ancestor',$beforeHead,$fetchHead)" in command
+    assert "@('rev-parse',\"$beforeHead`:src/grim_dawn_sync\")" in command
+    assert "@('rev-parse',\"$fetchHead`:src/grim_dawn_sync\")" in command
+    assert "$localPackageTree -cne $publicPackageTree" in command
     assert "$requestCommit = $fetchHead" in command
     assert '$requestLines = @(Invoke-GitLines @(\'show\',"$requestCommit`:$requestObjectPath"))' in command
     assert "$gitExitCode = $LASTEXITCODE" in command

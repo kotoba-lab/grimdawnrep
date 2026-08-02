@@ -154,6 +154,10 @@ try {
 
     $stage = 'ancestor'
     Invoke-GitQuiet @('merge-base','--is-ancestor',$beforeHead,$fetchHead)
+    $localPackageTree = Get-OneGitLine @('rev-parse',"$beforeHead`:src/grim_dawn_sync")
+    $publicPackageTree = Get-OneGitLine @('rev-parse',"$fetchHead`:src/grim_dawn_sync")
+    if ($localPackageTree -cnotmatch $oidPattern -or $publicPackageTree -cnotmatch $oidPattern -or
+        $localPackageTree -cne $publicPackageTree) { throw 'invalid' }
     $requestCommit = $fetchHead
 
     $stage = 'blob'
@@ -175,17 +179,17 @@ try {
     if (-not ($request.schema_version -is [string]) -or $request.schema_version -cne '1.0.0' -or
         -not ($request.kind -is [string]) -or
         $request.kind -cne 'grim_dawn_terminal_diagnostic_request' -or
-        -not ($request.sequence -is [int]) -or $request.sequence -ne 11 -or
+        -not ($request.sequence -is [int]) -or $request.sequence -ne 12 -or
         -not ($request.target_machine_id -is [string]) -or $request.target_machine_id -cne $machineId -or
         -not ($request.leg -is [string]) -or -not ($request.observed_code -is [string]) -or
         -not ($request.action -is [string]) -or -not ($request.response_sentinel -is [string]) -or
         -not ($request.request_id -is [string]) -or
         $request.leg -cne 'A1' -or $request.observed_code -cne 'remote_changed_or_unknown' -or
-        $request.action -cne 'package_artifact_substage_readonly' -or
-        $request.response_sentinel -cne 'TERMINAL_A_PACKAGE_ARTIFACT_PROBE') { throw 'invalid' }
-    Assert-ExactArray $request.checks @('two_pass_package_artifact_observation')
-    Assert-ExactArray $request.constraints @('installed_local_fixed_block_only','no_python_cli_git_network_com_ui_input_process_kill_or_write',
-        'no_save_state_config_vault_remote_ref_mutation','no_fetched_code_execution')
+        $request.action -cne 'source_path_runtime_repair' -or
+        $request.response_sentinel -cne 'TERMINAL_A_SOURCE_PATH_REPAIR') { throw 'invalid' }
+    Assert-ExactArray $request.checks @('validated_public_source_tree','exact_pth_contract','post_repair_import_and_invariants')
+    Assert-ExactArray $request.constraints @('fixed_local_pth_only','no_pip_network_git_com_ui_input_process_kill_or_write',
+        'no_source_config_state_save_vault_shortcut_remote_ref_mutation','no_fetched_code_execution','atomic_pth_write_with_exact_rollback')
     $requestGuid = [Guid]::Empty
     if (-not [Guid]::TryParse([string]$request.request_id, [ref]$requestGuid) -or
         $requestGuid.ToString() -cne [string]$request.request_id) { throw 'invalid' }
@@ -235,7 +239,7 @@ public static class StageProbeWindow { delegate bool P(IntPtr h,IntPtr l); [DllI
 function Bucket($n){if($null -eq $n){'unknown'}elseif($n -eq 0){'zero'}elseif($n -eq 1){'one'}else{'two_or_more'}}
 function Digest($p){if(!(Test-Path -LiteralPath $p -PathType Leaf)){throw 'required_local_artifact_missing'};$h=[Security.Cryptography.SHA256]::Create();try{([BitConverter]::ToString($h.ComputeHash([IO.File]::ReadAllBytes($p)))).Replace('-','')}finally{$h.Dispose()}}
 function TreeDigest($root){if(!(Test-Path -LiteralPath $root -PathType Container)){throw 'required_local_artifact_missing'};$base=[IO.Path]::GetFullPath($root).TrimEnd([char[]]'\')+'\';$rows=@();foreach($i in @(Get-ChildItem -LiteralPath $root -Recurse -File -Force -ErrorAction Stop|Sort-Object FullName)){$full=[IO.Path]::GetFullPath($i.FullName);if(!$full.StartsWith($base,[StringComparison]::OrdinalIgnoreCase)){throw 'post_invariant_changed'};$rows+=$full.Substring($base.Length)+'='+$i.Length+'='+(Digest $full)};$h=[Security.Cryptography.SHA256]::Create();try{$bytes=[Text.Encoding]::UTF8.GetBytes(($rows-join"`n"));([BitConverter]::ToString($h.ComputeHash($bytes))).Replace('-','')}finally{$h.Dispose()}}
-function ToolIdentity($p){$pkg=Join-Path ([IO.Path]::GetDirectoryName([IO.Path]::GetDirectoryName($p))) 'Lib\site-packages\grim_dawn_sync';if(!(Test-Path -LiteralPath $pkg -PathType Container)){throw 'required_local_artifact_missing'};$rows=@(Get-ChildItem -LiteralPath $pkg -Recurse -File -Filter *.py|Sort-Object FullName|ForEach-Object{$_.FullName.Substring($pkg.Length)+'='+(Digest $_.FullName)});if($rows.Count-eq 0){throw 'required_local_artifact_missing'};$m=Get-Item -LiteralPath $p;([IO.Path]::GetFullPath($p))+[char]0+$m.Length+[char]0+$m.LastWriteTimeUtc.Ticks+[char]0+($rows-join"`n")}
+function ToolIdentity($p,$sourceRoot){$site=Join-Path ([IO.Path]::GetDirectoryName([IO.Path]::GetDirectoryName($p))) 'Lib\site-packages';$pth=Join-Path $site 'grim_dawn_sync_source.pth';$src=Join-Path $sourceRoot 'src';$entry=Join-Path $src 'grim_dawn_sync\__main__.py';if(!(Test-Path -LiteralPath $entry -PathType Leaf)){throw 'required_local_artifact_missing'};$actual=[IO.File]::ReadAllBytes($pth);$expected=(New-Object Text.UTF8Encoding($false)).GetBytes($src+[Environment]::NewLine);if($actual.Length-ne$expected.Length){throw 'required_local_artifact_missing'};for($i=0;$i-lt$actual.Length;$i++){if($actual[$i]-ne$expected[$i]){throw 'required_local_artifact_missing'}};$m=Get-Item -LiteralPath $p;([IO.Path]::GetFullPath($p))+[char]0+$m.Length+[char]0+$m.LastWriteTimeUtc.Ticks+[char]0+(Digest $pth)}
 function Q($s){'"'+([string]$s).Replace('"','\"')+'"'}
 function StopTree($targetPid){$psi=New-Object Diagnostics.ProcessStartInfo;$psi.FileName=(Join-Path $env:SystemRoot 'System32\taskkill.exe');$psi.Arguments='/PID '+[int]$targetPid+' /T /F';$psi.UseShellExecute=$false;$psi.CreateNoWindow=$true;$psi.RedirectStandardOutput=$true;$psi.RedirectStandardError=$true;$p=New-Object Diagnostics.Process;$p.StartInfo=$psi;if($p.Start()){[void]$p.WaitForExit(5000);if(!$p.HasExited){$p.Kill()}}}
 function Native($f,[string[]]$a,$code){$psi=New-Object Diagnostics.ProcessStartInfo;$psi.FileName=$f;$psi.Arguments=(($a|ForEach-Object{Q $_})-join ' ');$psi.UseShellExecute=$false;$psi.CreateNoWindow=$true;$psi.RedirectStandardOutput=$true;$psi.RedirectStandardError=$true;$psi.EnvironmentVariables['GIT_TERMINAL_PROMPT']='0';$psi.EnvironmentVariables['GCM_INTERACTIVE']='Never';$p=New-Object Diagnostics.Process;$p.StartInfo=$psi;if(!$p.Start()){throw $code};$o=$p.StandardOutput.ReadToEndAsync();$e=$p.StandardError.ReadToEndAsync();if(!$p.WaitForExit(60000)){StopTree $p.Id;throw $code};[void]$e.GetAwaiter().GetResult();$v=$o.GetAwaiter().GetResult();if($p.ExitCode-ne 0){throw $code};@($v-split"`r?`n"|Where-Object{$_-ne''})}
@@ -251,7 +255,7 @@ $stage='bootstrap';try{
  if(!(Test-Path -LiteralPath $python -PathType Leaf)){throw 'required_local_artifact_missing'}
  $stage='config';if(!(Test-Path -LiteralPath $config -PathType Leaf)){throw 'required_local_artifact_missing'};try{$cfg=Get-Content -LiteralPath $config -Raw -Encoding utf8|ConvertFrom-Json -ErrorAction Stop}catch{throw 'required_local_artifact_missing'};if($cfg.machine_id-cne$machineId -or $cfg.vault_repo -isnot [string] -or $cfg.save_root -isnot [string]){throw 'machine_id_unexpected'};$vault=[string]$cfg.vault_repo;$live=[string]$cfg.save_root;$state=Join-Path ([IO.Path]::GetDirectoryName($config)) 'state.json'
  $shortcut=Join-Path (Join-Path $env:USERPROFILE 'Desktop') 'Grim Dawn (DPYes + Save Selection).lnk'
- $stage='package';$before=@((ToolIdentity $python),(Digest $config),(Digest $state),(Digest $shortcut),(TreeDigest $live));$installed=InstalledRoot $live
+ $stage='package';$before=@((ToolIdentity $python $source),(Digest $config),(Digest $state),(Digest $shortcut),(TreeDigest $live));$installed=InstalledRoot $live
  $stage='source';$beforeSource=RepoMark $source 'source_probe_failed'
  $stage='vault';$beforeVault=RepoMark $vault 'vault_probe_failed'
  $stage='status_first';$s1=Json 'status' 'status_command_failed';$sp1=StatusProjection $s1
@@ -262,36 +266,64 @@ $stage='bootstrap';try{
  $stage='status_second';$s2=Json 'status' 'status_command_failed';try{$sp2=StatusProjection $s2}catch{throw 'status_not_stable'};if($sp1-cne$sp2){throw 'status_not_stable'}
  $stage='doctor_second';$d2=Json 'doctor' 'doctor_command_failed';try{$dp2=DoctorProjection $d2}catch{throw 'doctor_not_stable'};if($dp1-cne$dp2){throw 'doctor_not_stable'}
  $stage='semantic';if($d1.machine_id-cne$machineId){throw 'machine_id_unexpected'};if($s1.readiness-notin@('blocked','ready')){throw 'status_readiness_unexpected'};if($s1.vault_relation-notin@('equal','remote_changed_or_unknown','unborn','remote_missing')){throw 'vault_relation_unexpected'};if($null-ne$s1.active_lock -or $null-ne$s1.recovery_phase){throw 'lock_or_recovery_present'}
- $stage='post_invariant';$after=@((ToolIdentity $python),(Digest $config),(Digest $state),(Digest $shortcut),(TreeDigest $live));$afterSource=RepoMark $source 'source_probe_failed';$afterVault=RepoMark $vault 'vault_probe_failed';$lateDoctor=Json 'doctor' 'doctor_command_failed';[void](DoctorProjection $lateDoctor);$lateInstalled=InstalledRoot $live;if((($before -join [char]0) -cne ($after -join [char]0)) -or ($beforeSource -cne $afterSource) -or ($beforeVault -cne $afterVault) -or ([string]$lateDoctor.checks.save_root.manifest.root_hash-cne[string]$d1.checks.save_root.manifest.root_hash) -or ($lateInstalled-cne$installed)){throw 'post_invariant_changed'}
+ $stage='post_invariant';$after=@((ToolIdentity $python $source),(Digest $config),(Digest $state),(Digest $shortcut),(TreeDigest $live));$afterSource=RepoMark $source 'source_probe_failed';$afterVault=RepoMark $vault 'vault_probe_failed';$lateDoctor=Json 'doctor' 'doctor_command_failed';[void](DoctorProjection $lateDoctor);$lateInstalled=InstalledRoot $live;if((($before -join [char]0) -cne ($after -join [char]0)) -or ($beforeSource -cne $afterSource) -or ($beforeVault -cne $afterVault) -or ([string]$lateDoctor.checks.save_root.manifest.root_hash-cne[string]$d1.checks.save_root.manifest.root_hash) -or ($lateInstalled-cne$installed)){throw 'post_invariant_changed'}
  $finalRemote=Remote $vault;if($finalRemote.raw-cne$r1.raw){throw 'remote_advertisement_invalid'}
  $stage='final_process_window';try{$finalAll=@(Get-CimInstance Win32_Process -ErrorAction Stop);$finalGames=@($finalAll|Where-Object{$_.Name-in@('Grim Dawn.exe','DPYes.exe')});$wins=[StageProbeWindow]::Count($selectorTitle)}catch{throw 'process_observation_inconclusive'};if($finalGames.Count-ne 0){throw 'process_status_unexpected'}
  $relation=if($s1.vault_relation-eq'remote_changed_or_unknown'){'unknown'}else{[string]$s1.vault_relation};Write-Output (Out 'complete' 'complete' 'stage_probe_complete' $relation $finalRemote.lock 'clear' (Bucket $wins));exit 0
 }catch{$code=[string]$_.Exception.Message;$allowed=@('required_local_artifact_missing','source_probe_failed','vault_probe_failed','status_command_failed','status_shape_invalid','doctor_command_failed','doctor_shape_invalid','installed_manifest_mismatch','status_not_stable','doctor_not_stable','status_readiness_unexpected','vault_relation_unexpected','lock_or_recovery_present','process_status_unexpected','machine_id_unexpected','remote_advertisement_invalid','process_observation_inconclusive','post_invariant_changed','unexpected_failed');if($code-notin$allowed){$code='unexpected_failed'};Write-Output (Out 'blocked' $stage $code $null $null $null $null);exit 1}
 ```
 
-## Package artifact substage probe (sequence 11)
+## Retired package artifact substage probe (sequence 11; DO NOT RUN)
 
-Run this installed local block only after the sequence 11 request block exits
-zero.  It is deliberately narrower than sequence 10: it observes only the six
-local artifacts that gate the `package` stage, twice, and does not invoke the
-application, a CLI, Git, networking, COM, a shortcut, UI input, or process
-control.  Its only output is a six-key, privacy-safe sentinel.
+Sequence 11 incorrectly treated an absent
+`.venv\Lib\site-packages\grim_dawn_sync` directory as a missing deployment.
+The supported deployment instead imports the verified worktree through
+`purelib\grim_dawn_sync_source.pth`.  The reported
+`installed_package_directory/artifact_missing` result was therefore a false
+diagnostic.  The executable block has been removed; do not reconstruct or run
+it.
+
+## Source-path runtime repair (sequence 12)
+
+Run this installed local block only after the sequence 12 request validation
+block exits zero.  That validation proves the clean local
+`HEAD:src/grim_dawn_sync` tree is byte-identical to the fetched canonical
+public tree without checking out or executing fetched content.  This block
+uses the fixed venv interpreter to locate its `purelib` directory.  It makes no
+change when `grim_dawn_sync_source.pth` already contains the exact official
+UTF-8-without-BOM bytes (`<source>\src` plus `Environment.NewLine`).  Otherwise
+it atomically replaces only that `.pth` file, verifies import with bytecode
+writes disabled, and restores the exact old bytes (or deletes a newly created
+file) if import fails.  It does not use pip, Git, networking, COM, shortcuts,
+UI input, or process control, and does not read or modify config, state, saves,
+Vault, or remote refs.
 
 ```powershell
 $ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue'
-$machineId='desktop-a';$toolRoot=Join-Path $env:LOCALAPPDATA 'GrimDawnSaveSyncTool'
-$config=Join-Path $env:LOCALAPPDATA 'GrimDawnSaveSync\config.local.json'
-$shortcut=Join-Path (Join-Path $env:USERPROFILE 'Desktop') 'Grim Dawn (DPYes + Save Selection).lnk'
-function Out($status,$stage,$code){[ordered]@{sentinel='TERMINAL_A_PACKAGE_ARTIFACT_PROBE';status=$status;leg='A1';machine_id=$machineId;stage=$stage;code=$code}|ConvertTo-Json -Compress}
-function Missing($p,$type){if(!(Test-Path -LiteralPath $p -PathType $type)){throw 'artifact_missing'}}
-function Digest($p){Missing $p 'Leaf';try{$h=[Security.Cryptography.SHA256]::Create();try{([BitConverter]::ToString($h.ComputeHash([IO.File]::ReadAllBytes($p)))).Replace('-','')}finally{$h.Dispose()}}catch{throw 'artifact_unreadable'}}
-function ToolDirectory(){try{$pkg=Join-Path $toolRoot '.venv\Lib\site-packages\grim_dawn_sync';Missing $pkg 'Container';[void](Get-ChildItem -LiteralPath $pkg -Force -ErrorAction Stop);[IO.Path]::GetFullPath($pkg)}catch{$code=[string]$_.Exception.Message;if($code-eq'artifact_missing'){throw $code};throw 'artifact_unreadable'}}
-function ToolIdentity(){try{$pkg=Join-Path $toolRoot '.venv\Lib\site-packages\grim_dawn_sync';Missing $pkg 'Container';$rows=@(Get-ChildItem -LiteralPath $pkg -Recurse -File -Filter *.py -ErrorAction Stop|Sort-Object FullName|ForEach-Object{$_.FullName.Substring($pkg.Length)+'='+(Digest $_.FullName)});if($rows.Count-eq 0){throw 'artifact_missing'};$h=[Security.Cryptography.SHA256]::Create();try{$bytes=[Text.Encoding]::UTF8.GetBytes($rows-join"`n");([BitConverter]::ToString($h.ComputeHash($bytes)).Replace('-',''))}finally{$h.Dispose()}}catch{$code=[string]$_.Exception.Message;if($code-in@('artifact_missing','artifact_unreadable')){throw $code};throw 'artifact_unreadable'}}
-function ConfigIdentity(){try{$raw=Digest $config;$v=Get-Content -LiteralPath $config -Raw -Encoding utf8|ConvertFrom-Json -ErrorAction Stop;if($v.save_root-isnot [string] -or [string]::IsNullOrWhiteSpace([string]$v.save_root)){throw 'artifact_unreadable'};[pscustomobject]@{value=$raw;live=[string]$v.save_root;state=Join-Path ([IO.Path]::GetDirectoryName($config)) 'state.json'}}catch{$code=[string]$_.Exception.Message;if($code-in@('artifact_missing','artifact_unreadable')){throw $code};throw 'artifact_unreadable'}}
-function TreeDigest($root){Missing $root 'Container';try{$base=[IO.Path]::GetFullPath($root).TrimEnd([char[]]'\')+'\';$rows=@();foreach($item in @(Get-ChildItem -LiteralPath $root -Recurse -File -Force -ErrorAction Stop|Sort-Object FullName)){$full=[IO.Path]::GetFullPath($item.FullName);if(!$full.StartsWith($base,[StringComparison]::OrdinalIgnoreCase)){throw 'artifact_unreadable'};$rows+=$full.Substring($base.Length)+'='+$item.Length+'='+(Digest $full)};$h=[Security.Cryptography.SHA256]::Create();try{$bytes=[Text.Encoding]::UTF8.GetBytes($rows-join"`n");([BitConverter]::ToString($h.ComputeHash($bytes))).Replace('-','')}finally{$h.Dispose()}}catch{$code=[string]$_.Exception.Message;if($code-in@('artifact_missing','artifact_unreadable')){throw $code};throw 'artifact_unreadable'}}
-function Observe(){ $x=[ordered]@{};$script:stage='installed_package_directory';$x.directory=ToolDirectory;$script:stage='installed_package_sources';$x.sources=ToolIdentity;$script:stage='config_file';$cfg=ConfigIdentity;$x.config=$cfg.value;$script:stage='state_file';$x.state=Digest $cfg.state;$script:stage='shortcut_file';$x.shortcut=Digest $shortcut;$script:stage='live_save_root';$x.live=TreeDigest $cfg.live;[pscustomobject]@{mark=($x.Values-join[char]0);stage=$script:stage} }
-$stage='bootstrap';try{$first=Observe;$stage='post_invariant';try{$second=Observe}catch{$script:stage='post_invariant';throw 'artifact_changed'};if($first.mark-cne$second.mark){$script:stage='post_invariant';throw 'artifact_changed'};Write-Output (Out 'complete' 'complete' 'package_artifact_probe_complete');exit 0}catch{$code=[string]$_.Exception.Message;$allowed=@('artifact_missing','artifact_unreadable','artifact_changed','unexpected_failed');if($code-notin$allowed){$code='unexpected_failed'};Write-Output (Out 'blocked' $stage $code);exit 1}
+$machineId='desktop-a';$source=Join-Path $env:USERPROFILE 'grimdawnrep';$toolRoot=Join-Path $env:LOCALAPPDATA 'GrimDawnSaveSyncTool'
+$python=Join-Path $toolRoot '.venv\Scripts\python.exe';$sourceRoot=Join-Path $source 'src';$entry=Join-Path $sourceRoot 'grim_dawn_sync\__main__.py'
+$stage='bootstrap';$temp=$null;$rollback=$null;$pth=$null;$changed=$false;$success=$false;$oldExists=$false;$oldBytes=$null;$expected=$null
+function Out($status,$stage,$code){[ordered]@{sentinel='TERMINAL_A_SOURCE_PATH_REPAIR';status=$status;leg='A1';machine_id=$machineId;stage=$stage;code=$code}|ConvertTo-Json -Compress}
+function SameBytes([byte[]]$a,[byte[]]$b){if($null-eq$a-or$null-eq$b-or$a.Length-ne$b.Length){return $false};for($i=0;$i-lt$a.Length;$i++){if($a[$i]-ne$b[$i]){return $false}};return $true}
+function Digest($p){if(!(Test-Path -LiteralPath $p -PathType Leaf)){throw 'artifact_missing'};$h=[Security.Cryptography.SHA256]::Create();try{([BitConverter]::ToString($h.ComputeHash([IO.File]::ReadAllBytes($p)))).Replace('-','')}finally{$h.Dispose()}}
+function TreeDigest($root){if(!(Test-Path -LiteralPath $root -PathType Container)){throw 'artifact_missing'};$base=[IO.Path]::GetFullPath($root).TrimEnd([char[]]'\')+'\';$rows=@();foreach($item in @(Get-ChildItem -LiteralPath $root -Recurse -File -Force -ErrorAction Stop|Where-Object{$_.FullName-notmatch'[\\/]__pycache__[\\/]' -and $_.Extension-cne'.pyc'}|Sort-Object FullName)){$full=[IO.Path]::GetFullPath($item.FullName);if(!$full.StartsWith($base,[StringComparison]::OrdinalIgnoreCase)){throw 'artifact_unreadable'};$rows+=$full.Substring($base.Length)+'='+$item.Length+'='+(Digest $full)};$h=[Security.Cryptography.SHA256]::Create();try{([BitConverter]::ToString($h.ComputeHash([Text.Encoding]::UTF8.GetBytes($rows-join"`n")))).Replace('-','')}finally{$h.Dispose()}}
+function Python([string[]]$a,$code){$prior=$ErrorActionPreference;try{$ErrorActionPreference='Continue';$lines=@(& $python @a 2>$null);$exitCode=$LASTEXITCODE}finally{$ErrorActionPreference=$prior};if($exitCode-ne0){throw $code};@($lines)}
+function AtomicSet([byte[]]$bytes,[string]$target,[ref]$scratch,[ref]$backup){$scratch.Value=Join-Path ([IO.Path]::GetDirectoryName($target)) ('.grim_dawn_sync_source.'+[Guid]::NewGuid().ToString('N')+'.tmp');[IO.File]::WriteAllBytes($scratch.Value,$bytes);if(!(SameBytes ([IO.File]::ReadAllBytes($scratch.Value)) $bytes)){throw 'source_path_write_failed'};if(Test-Path -LiteralPath $target -PathType Leaf){$backup.Value=Join-Path ([IO.Path]::GetDirectoryName($target)) ('.grim_dawn_sync_source.'+[Guid]::NewGuid().ToString('N')+'.rollback');[IO.File]::Replace($scratch.Value,$target,$backup.Value)}elseif(Test-Path -LiteralPath $target){throw 'source_path_unreadable'}else{[IO.File]::Move($scratch.Value,$target)};$scratch.Value=$null}
+try{
+ $stage='bootstrap';if(!(Test-Path -LiteralPath $python -PathType Leaf)){throw 'python_missing'}
+ $stage='source_package';if(!(Test-Path -LiteralPath $entry -PathType Leaf)){throw 'source_package_missing'};$sourceMark=TreeDigest $sourceRoot;$pythonMark=Digest $python
+ $stage='purelib';$purelibLines=@(Python @('-B','-c','import sysconfig; print(sysconfig.get_path(chr(112)+chr(117)+chr(114)+chr(101)+chr(108)+chr(105)+chr(98)))') 'purelib_invalid');if($purelibLines.Count-ne1){throw 'purelib_invalid'};$purelib=[IO.Path]::GetFullPath(([string]$purelibLines[0]).Trim());$fixedPurelib=[IO.Path]::GetFullPath((Join-Path $toolRoot '.venv\Lib\site-packages'));if($purelib-cne$fixedPurelib-or!(Test-Path -LiteralPath $purelib -PathType Container)){throw 'purelib_invalid'}
+ $stage='source_path';$pth=Join-Path $purelib 'grim_dawn_sync_source.pth';if(Test-Path -LiteralPath $pth){try{if(!(Test-Path -LiteralPath $pth -PathType Leaf)-or((Get-Item -LiteralPath $pth -Force).Attributes-band[IO.FileAttributes]::ReparsePoint)){throw 'source_path_unreadable'};$oldExists=$true;$oldBytes=[IO.File]::ReadAllBytes($pth)}catch{throw 'source_path_unreadable'}};$expected=(New-Object Text.UTF8Encoding($false)).GetBytes($sourceRoot+[Environment]::NewLine);$already=SameBytes $oldBytes $expected
+ if(!$already){try{AtomicSet $expected $pth ([ref]$temp) ([ref]$rollback);$changed=$true}catch{throw 'source_path_write_failed'}}
+ $stage='import';try{$importLines=@(Python @('-B','-c','from pathlib import Path; import grim_dawn_sync, grim_dawn_sync.__main__, sys; actual=Path(grim_dawn_sync.__file__).resolve(); expected=Path(sys.argv[1]).resolve(); raise SystemExit(0 if expected in actual.parents else 3)',(Join-Path $sourceRoot 'grim_dawn_sync')) 'source_package_import_failed');if($importLines.Count-ne0){throw 'source_package_import_failed'}}catch{throw 'source_package_import_failed'}
+ $stage='post_invariant';if(!(SameBytes ([IO.File]::ReadAllBytes($pth)) $expected)-or(TreeDigest $sourceRoot)-cne$sourceMark-or(Digest $python)-cne$pythonMark){throw 'post_invariant_changed'}
+ $success=$true;Write-Output (Out 'complete' 'complete' $(if($already){'pth_already_current'}else{'pth_repaired'}));exit 0
+}catch{$failedStage=$stage;$code=[string]$_.Exception.Message;if($changed-and!$success){$stage='rollback';try{if(!(Test-Path -LiteralPath $pth -PathType Leaf)-or!(SameBytes ([IO.File]::ReadAllBytes($pth)) $expected)){throw 'rollback_failed'};if($oldExists){if(!$rollback-or!(Test-Path -LiteralPath $rollback -PathType Leaf)-or!(SameBytes ([IO.File]::ReadAllBytes($rollback)) $oldBytes)){throw 'rollback_failed'};$temp=Join-Path ([IO.Path]::GetDirectoryName($pth)) ('.grim_dawn_sync_source.'+[Guid]::NewGuid().ToString('N')+'.discard');[IO.File]::Replace($rollback,$pth,$temp);$rollback=$null;if(!(SameBytes ([IO.File]::ReadAllBytes($pth)) $oldBytes)){throw 'rollback_failed'}}else{$rollback=Join-Path ([IO.Path]::GetDirectoryName($pth)) ('.grim_dawn_sync_source.'+[Guid]::NewGuid().ToString('N')+'.rollback');[IO.File]::Move($pth,$rollback);if(Test-Path -LiteralPath $pth){throw 'rollback_failed'}};$changed=$false;$stage=$failedStage}catch{$code='rollback_failed'}};$allowed=@('python_missing','source_package_missing','purelib_invalid','source_path_unreadable','source_path_write_failed','source_package_import_failed','rollback_failed','post_invariant_changed','artifact_missing','artifact_unreadable','unexpected_failed');if($code-notin$allowed){$code='unexpected_failed'};Write-Output (Out 'blocked' $stage $code);exit 1}finally{foreach($scratch in @($temp,$rollback)){if($scratch-and(Test-Path -LiteralPath $scratch -PathType Leaf)){[IO.File]::Delete($scratch)}}}
 ```
+
+Report exactly the single JSON line.  `pth_already_current` and `pth_repaired`
+are both successful, idempotent outcomes.  Any blocked result is fail-closed;
+do not launch the shortcut or run another repair.
 
 ## Retired selector cancel/reload automation (sequence 8; DO NOT RUN)
 

@@ -50,7 +50,7 @@ def _git(cwd: Path, *args: str) -> str:
 
 
 def _request_payload(
-    *, sequence: int = 11, expired: bool = False, bad_schema: bool = False
+    *, sequence: int = 12, expired: bool = False, bad_schema: bool = False
 ) -> dict[str, object]:
     payload = json.loads(REQUEST.read_text(encoding="utf-8"))
     now = datetime.now(timezone.utc).replace(microsecond=0)
@@ -125,19 +125,23 @@ def _setup_case(
     _run(REAL_GIT, "init", "-b", "master", str(seed))
     _git(seed, "config", "user.name", "Test Operator")
     _git(seed, "config", "user.email", "operator@example.invalid")
-    # The checked-in request is sequence 11. Seed the clone with the older
+    # The checked-in request is sequence 12. Seed the clone with the older
     # request so the test proves the canonical remote update is accepted.
-    initial_payload = _request_payload(sequence=10)
+    initial_payload = _request_payload(sequence=11)
     initial_payload["request_id"] = "00000000-0000-0000-0000-000000000001"
     _write_request(seed, initial_payload)
-    _git(seed, "add", "ops/handoff/terminal-a-diagnostic-request.v1.json")
+    package = seed / "src" / "grim_dawn_sync"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("\n", encoding="ascii")
+    (package / "__main__.py").write_text("\n", encoding="ascii")
+    _git(seed, "add", "ops/handoff/terminal-a-diagnostic-request.v1.json", "src/grim_dawn_sync")
     _git(seed, "commit", "-m", "initial request")
     _git(seed, "remote", "add", "origin", str(remote))
     _git(seed, "push", "-u", "origin", "master")
     _run(REAL_GIT, "clone", str(remote), str(terminal))
 
-    updated_payload = _request_payload(sequence=11, expired=expired, bad_schema=bad_schema)
-    assert initial_payload["sequence"] == 10 < updated_payload["sequence"] == 11
+    updated_payload = _request_payload(sequence=12, expired=expired, bad_schema=bad_schema)
+    assert initial_payload["sequence"] == 11 < updated_payload["sequence"] == 12
     if timestamp_fault == "malformed":
         updated_payload["issued_at"] = "2026-08-01T09:46:11+00:00"
     _write_request(seed, updated_payload)
@@ -226,10 +230,10 @@ def _stage_probe_script(base: Path) -> Path:
     return path
 
 
-def _package_artifact_probe_script(base: Path) -> Path:
-    section = RUNBOOK.read_text(encoding="utf-8").split("## Package artifact substage probe (sequence 11)", 1)[1]
+def _source_path_repair_script(base: Path) -> Path:
+    section = RUNBOOK.read_text(encoding="utf-8").split("## Source-path runtime repair (sequence 12)", 1)[1]
     command = section.split("```powershell", 1)[1].split("```", 1)[0]
-    path = base / "package-artifact-probe.ps1"
+    path = base / "source-path-repair.ps1"
     path.write_text(command, encoding="utf-8-sig", newline="\n")
     return path
 
@@ -1103,12 +1107,21 @@ def test_sequence_9_request_block_parses_in_windows_powershell_51() -> None:
 
 def _prepare_stage_case(base: Path) -> tuple[dict[str, str], dict[str, str]]:
     env, paths = _summary_case(base, remote_files={"main/Hero/player.gdc": b"next"})
+    source = Path(paths["source"])
+    source_package = source / "src" / "grim_dawn_sync"
+    source_package.mkdir(parents=True)
+    shutil.copy2(base / "stub" / "grim_dawn_sync" / "__init__.py", source_package / "__init__.py")
+    shutil.copy2(base / "stub" / "grim_dawn_sync" / "__main__.py", source_package / "__main__.py")
+    _git(source, "add", "src/grim_dawn_sync")
+    _git(source, "commit", "-m", "source package")
     package = base / "localappdata" / "GrimDawnSaveSyncTool" / ".venv" / "Lib" / "site-packages" / "grim_dawn_sync"
     package.mkdir(parents=True)
     shutil.copy2(base / "stub" / "grim_dawn_sync" / "__init__.py", package / "__init__.py")
     shutil.copy2(base / "stub" / "grim_dawn_sync" / "__main__.py", package / "__main__.py")
+    pth = package.parent / "grim_dawn_sync_source.pth"
+    pth.write_bytes(str(source / "src").encode("utf-8") + os.linesep.encode("ascii"))
     env["PYTHONPATH"] = str(package.parent) + os.pathsep + str(ROOT / "src")
-    env["GIT_PROBE_PACKAGE_MAIN"] = str(package / "__main__.py")
+    env["GIT_PROBE_PACKAGE_MAIN"] = str(pth)
     env["PATH"] = os.environ["PATH"]
     shortcut = base / "profile" / "Desktop" / "Grim Dawn (DPYes + Save Selection).lnk"
     shortcut.parent.mkdir(parents=True, exist_ok=True); shortcut.write_bytes(b"fixture")
@@ -1258,63 +1271,66 @@ def test_sequence_10_stage_probe_parses_in_windows_powershell_51() -> None:
         assert result.returncode == 0, result.stdout + result.stderr
 
 
-def _assert_package_artifact_failure(result: subprocess.CompletedProcess[str], stage: str, code: str) -> None:
+def _prepare_source_path_repair_case(
+    base: Path, *, existing_pth: bytes | None = None, import_fails: bool = False
+) -> tuple[dict[str, str], Path]:
+    profile = base / "profile"
+    source_package = profile / "grimdawnrep" / "src" / "grim_dawn_sync"
+    source_package.mkdir(parents=True)
+    (source_package / "__init__.py").write_text("\n", encoding="ascii")
+    main = "raise RuntimeError('fixture')\n" if import_fails else "\n"
+    (source_package / "__main__.py").write_text(main, encoding="ascii")
+    venv = base / "localappdata" / "GrimDawnSaveSyncTool" / ".venv"
+    _run(sys.executable, "-m", "venv", "--without-pip", str(venv))
+    pth = venv / "Lib" / "site-packages" / "grim_dawn_sync_source.pth"
+    if existing_pth is not None:
+        pth.write_bytes(existing_pth)
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+    env.pop("PYTHONHOME", None)
+    env.update(USERPROFILE=str(profile), LOCALAPPDATA=str(base / "localappdata"))
+    return env, pth
+
+
+def _assert_source_path_failure(result: subprocess.CompletedProcess[str], stage: str, code: str) -> None:
     assert result.returncode == 1 and result.stderr == ""
     assert result.stdout.count("\n") == 1
-    assert json.loads(result.stdout) == {"sentinel":"TERMINAL_A_PACKAGE_ARTIFACT_PROBE","status":"blocked","leg":"A1","machine_id":"desktop-a","stage":stage,"code":code}
+    assert json.loads(result.stdout) == {"sentinel":"TERMINAL_A_SOURCE_PATH_REPAIR","status":"blocked","leg":"A1","machine_id":"desktop-a","stage":stage,"code":code}
 
 
-def test_sequence_11_package_artifact_probe_success_and_privacy() -> None:
-    with tempfile.TemporaryDirectory(prefix="terminal-a-package-success-") as raw:
-        base = Path(raw); env, paths = _prepare_stage_case(base)
-        result = _invoke(_package_artifact_probe_script(base), env)
+def test_sequence_12_source_path_repair_is_atomic_and_idempotent() -> None:
+    with tempfile.TemporaryDirectory(prefix="terminal-a-source-path-success-") as raw:
+        base = Path(raw); env, pth = _prepare_source_path_repair_case(base, existing_pth=b"wrong\r\n")
+        script = _source_path_repair_script(base)
+        result = _invoke(script, env)
         assert result.returncode == 0 and result.stderr == "" and result.stdout.count("\n") == 1
-        assert json.loads(result.stdout) == {"sentinel":"TERMINAL_A_PACKAGE_ARTIFACT_PROBE","status":"complete","leg":"A1","machine_id":"desktop-a","stage":"complete","code":"package_artifact_probe_complete"}
-        for secret in (str(base), str(base / "live"), paths["config"], "root_hash"):
+        assert json.loads(result.stdout) == {"sentinel":"TERMINAL_A_SOURCE_PATH_REPAIR","status":"complete","leg":"A1","machine_id":"desktop-a","stage":"complete","code":"pth_repaired"}
+        expected = str(base / "profile" / "grimdawnrep" / "src").encode("utf-8") + os.linesep.encode("ascii")
+        assert pth.read_bytes() == expected
+        before = (pth.stat().st_mtime_ns, pth.read_bytes())
+        second = _invoke(script, env)
+        assert second.returncode == 0 and json.loads(second.stdout)["code"] == "pth_already_current"
+        assert (pth.stat().st_mtime_ns, pth.read_bytes()) == before
+        for secret in (str(base), str(pth), "grim_dawn_sync_source.pth"):
             assert secret not in result.stdout
 
 
-@pytest.mark.parametrize(("target", "stage"), [
-    ("package_dir", "installed_package_directory"), ("package_py", "installed_package_sources"),
-    ("config", "config_file"), ("state", "state_file"), ("shortcut", "shortcut_file"),
-    ("live", "live_save_root"),
-])
-def test_sequence_11_package_artifact_probe_maps_each_missing_artifact(target: str, stage: str) -> None:
-    with tempfile.TemporaryDirectory(prefix=f"terminal-a-package-missing-{target}-") as raw:
-        base = Path(raw); env, paths = _prepare_stage_case(base)
-        package = base / "localappdata" / "GrimDawnSaveSyncTool" / ".venv" / "Lib" / "site-packages" / "grim_dawn_sync"
-        selected = {"package_dir": package, "config": Path(paths["config"]), "state": Path(paths["state"]), "shortcut": base / "profile" / "Desktop" / "Grim Dawn (DPYes + Save Selection).lnk", "live": base / "live"}.get(target)
-        if target == "package_py":
-            for source in package.rglob("*.py"):
-                source.unlink()
-        elif selected is not None and selected.is_dir():
-            shutil.rmtree(selected)
-        elif selected is not None:
-            selected.unlink()
-        _assert_package_artifact_failure(_invoke(_package_artifact_probe_script(base), env), stage, "artifact_missing")
+@pytest.mark.parametrize("old", [None, b"old bytes must return exactly\x00\xff"])
+def test_sequence_12_source_path_repair_rolls_back_exactly_when_import_fails(old: bytes | None) -> None:
+    with tempfile.TemporaryDirectory(prefix="terminal-a-source-path-rollback-") as raw:
+        base = Path(raw); env, pth = _prepare_source_path_repair_case(base, existing_pth=old, import_fails=True)
+        result = _invoke(_source_path_repair_script(base), env)
+        _assert_source_path_failure(result, "import", "source_package_import_failed")
+        if old is None:
+            assert not pth.exists()
+        else:
+            assert pth.read_bytes() == old
+        assert list(pth.parent.glob(".grim_dawn_sync_source.*")) == []
 
 
-def test_sequence_11_package_artifact_probe_maps_config_parse_and_invalid_root() -> None:
-    for content in ("{", json.dumps({"machine_id":"desktop-a", "save_root": 7})):
-        with tempfile.TemporaryDirectory(prefix="terminal-a-package-config-") as raw:
-            base = Path(raw); env, paths = _prepare_stage_case(base)
-            Path(paths["config"]).write_text(content, encoding="utf-8")
-            _assert_package_artifact_failure(_invoke(_package_artifact_probe_script(base), env), "config_file", "artifact_unreadable")
-
-
-def test_sequence_11_package_artifact_probe_marks_second_pass_change() -> None:
-    with tempfile.TemporaryDirectory(prefix="terminal-a-package-race-") as raw:
-        base = Path(raw); env, paths = _prepare_stage_case(base); script = _package_artifact_probe_script(base)
-        text = script.read_text(encoding="utf-8-sig")
-        text = text.replace("$second=Observe", "Add-Content -LiteralPath $env:PACKAGE_RACE_FILE -Value x;$second=Observe")
-        script.write_text(text, encoding="utf-8-sig")
-        env["PACKAGE_RACE_FILE"] = paths["state"]
-        _assert_package_artifact_failure(_invoke(script, env), "post_invariant", "artifact_changed")
-
-
-def test_sequence_11_package_artifact_probe_parses_in_windows_powershell_51() -> None:
-    with tempfile.TemporaryDirectory(prefix="terminal-a-package-parse-") as raw:
-        base=Path(raw); script=_package_artifact_probe_script(base); parser=base/"parse.ps1"
+def test_sequence_12_source_path_repair_parses_in_windows_powershell_51() -> None:
+    with tempfile.TemporaryDirectory(prefix="terminal-a-source-path-parse-") as raw:
+        base=Path(raw); script=_source_path_repair_script(base); parser=base/"parse.ps1"
         parser.write_text("$t=$null;$e=$null;[void][System.Management.Automation.Language.Parser]::ParseFile($args[0],[ref]$t,[ref]$e);if($e.Count){$e|ForEach-Object{$_.Message};exit 1}",encoding="utf-8-sig")
         result=subprocess.run([str(POWERSHELL),"-NoProfile","-NonInteractive","-ExecutionPolicy","Bypass","-File",str(parser),str(script)],capture_output=True,text=True,encoding="utf-8")
         assert result.returncode == 0, result.stdout + result.stderr

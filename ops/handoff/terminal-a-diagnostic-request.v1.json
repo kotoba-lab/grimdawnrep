@@ -1,23 +1,26 @@
 {
-  "action": "package_artifact_substage_readonly",
+  "action": "source_path_runtime_repair",
   "checks": [
-    "two_pass_package_artifact_observation"
+    "validated_public_source_tree",
+    "exact_pth_contract",
+    "post_repair_import_and_invariants"
   ],
   "constraints": [
-    "installed_local_fixed_block_only",
-    "no_python_cli_git_network_com_ui_input_process_kill_or_write",
-    "no_save_state_config_vault_remote_ref_mutation",
-    "no_fetched_code_execution"
+    "fixed_local_pth_only",
+    "no_pip_network_git_com_ui_input_process_kill_or_write",
+    "no_source_config_state_save_vault_shortcut_remote_ref_mutation",
+    "no_fetched_code_execution",
+    "atomic_pth_write_with_exact_rollback"
   ],
-  "expires_at": "2026-08-02T05:37:00Z",
-  "issued_at": "2026-08-02T04:22:00Z",
+  "expires_at": "2026-08-02T06:35:00Z",
+  "issued_at": "2026-08-02T05:20:00Z",
   "kind": "grim_dawn_terminal_diagnostic_request",
   "leg": "A1",
-  "not_before": "2026-08-02T04:22:00Z",
+  "not_before": "2026-08-02T05:20:00Z",
   "observed_code": "remote_changed_or_unknown",
-  "request_id": "6a79b8d4-e4f0-454a-88ca-734fdad8a2dd",
-  "response_sentinel": "TERMINAL_A_PACKAGE_ARTIFACT_PROBE",
+  "request_id": "79fbbdbb-6f6e-421a-aa91-9e069cbf93f1",
+  "response_sentinel": "TERMINAL_A_SOURCE_PATH_REPAIR",
   "schema_version": "1.0.0",
-  "sequence": 11,
+  "sequence": 12,
   "target_machine_id": "desktop-a"
 }
