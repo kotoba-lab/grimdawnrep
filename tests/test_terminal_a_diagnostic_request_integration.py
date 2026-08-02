@@ -50,7 +50,7 @@ def _git(cwd: Path, *args: str) -> str:
 
 
 def _request_payload(
-    *, sequence: int = 8, expired: bool = False, bad_schema: bool = False
+    *, sequence: int = 10, expired: bool = False, bad_schema: bool = False
 ) -> dict[str, object]:
     payload = json.loads(REQUEST.read_text(encoding="utf-8"))
     now = datetime.now(timezone.utc).replace(microsecond=0)
@@ -125,9 +125,9 @@ def _setup_case(
     _run(REAL_GIT, "init", "-b", "master", str(seed))
     _git(seed, "config", "user.name", "Test Operator")
     _git(seed, "config", "user.email", "operator@example.invalid")
-    # The checked-in request is sequence 8.  Seed the clone with the older
+    # The checked-in request is sequence 10.  Seed the clone with the older
     # request so the test proves the canonical remote update is accepted.
-    initial_payload = _request_payload(sequence=7)
+    initial_payload = _request_payload(sequence=9)
     initial_payload["request_id"] = "00000000-0000-0000-0000-000000000001"
     _write_request(seed, initial_payload)
     _git(seed, "add", "ops/handoff/terminal-a-diagnostic-request.v1.json")
@@ -136,8 +136,8 @@ def _setup_case(
     _git(seed, "push", "-u", "origin", "master")
     _run(REAL_GIT, "clone", str(remote), str(terminal))
 
-    updated_payload = _request_payload(sequence=8, expired=expired, bad_schema=bad_schema)
-    assert initial_payload["sequence"] == 7 < updated_payload["sequence"] == 8
+    updated_payload = _request_payload(sequence=10, expired=expired, bad_schema=bad_schema)
+    assert initial_payload["sequence"] == 9 < updated_payload["sequence"] == 10
     if timestamp_fault == "malformed":
         updated_payload["issued_at"] = "2026-08-01T09:46:11+00:00"
     _write_request(seed, updated_payload)
@@ -214,6 +214,14 @@ def _post_failure_probe_script(base: Path) -> Path:
     section = RUNBOOK.read_text(encoding="utf-8").split("## Post-selector-failure readonly probe", 1)[1]
     command = section.split("```powershell", 1)[1].split("```", 1)[0]
     path = base / "post-selector-failure-probe.ps1"
+    path.write_text(command, encoding="utf-8-sig", newline="\n")
+    return path
+
+
+def _stage_probe_script(base: Path) -> Path:
+    section = RUNBOOK.read_text(encoding="utf-8").split("## Post-selector-failure stage probe (sequence 10)", 1)[1]
+    command = section.split("```powershell", 1)[1].split("```", 1)[0]
+    path = base / "stage-probe.ps1"
     path.write_text(command, encoding="utf-8-sig", newline="\n")
     return path
 
@@ -719,18 +727,20 @@ def _summary_case(base: Path, *, remote_files: dict[str, bytes], corrupt: str | 
     (package / "__main__.py").write_text(
         "import json,os,subprocess,sys\nfrom pathlib import Path\ncmd=sys.argv[-1]\n"
         f"root={live_root!r}\nhead={baseline!r}\n"
-        "hook=os.environ.get('GIT_PROBE_HOOK',''); counter=os.environ.get('GIT_PROBE_COUNTER','')\n"
+        "hook=os.environ.get('GIT_PROBE_HOOK',''); fault=os.environ.get('STAGE_PROBE_FAULT',''); counter=os.environ.get('GIT_PROBE_COUNTER','')\n"
         "count=int(open(counter).read()) if counter and os.path.exists(counter) else 0\n"
         "if cmd in ('status','doctor') and counter: open(counter,'w').write(str(count+1))\n"
-        "trigger=bool(hook) and count==2 and cmd=='status'\n"
-        "if cmd=='status': print(json.dumps({'readiness':'blocked','vault_relation':'remote_changed_or_unknown','active_lock':None,'recovery_phase':None,'processes':{'status':'clear'},'last_pushed_commit':head}))\n"
-        "elif cmd=='doctor': print(json.dumps({'machine_id':'desktop-a','checks':{'save_root':{'manifest':{'root_hash':root}}}}))\n"
+        "trigger=(bool(hook) or fault=='post_invariant_changed') and count==2 and cmd=='status'\n"
+        "if (fault=='status_command_failed' and cmd=='status') or (fault=='doctor_command_failed' and cmd=='doctor'): raise SystemExit(2)\n"
+        "if cmd=='status': print(json.dumps({} if fault=='status_shape_invalid' else {'schema_version':('2.0.0' if fault=='status_schema_drift' and count>=2 else '1.0.0'),'command':('doctor' if fault=='status_command_drift' and count>=2 else 'status'),'readiness':('ready' if fault=='status_not_stable' and count>=2 else 'blocked'),'vault_relation':'remote_changed_or_unknown','active_lock':None,'recovery_phase':None,'processes':{'complete':not(fault=='process_complete_drift' and count>=2),'status':'clear'},'volatile':count,'last_pushed_commit':head}))\n"
+        "elif cmd=='doctor': print(json.dumps({} if fault=='doctor_shape_invalid' else {'schema_version':'1.0.0','command':'doctor','read_only':not(fault=='doctor_read_only_drift' and count>=3),'machine_id':('desktop-b' if fault=='doctor_not_stable' and count>=3 else 'desktop-a'),'passed':True,'volatile':count,'checks':{'save_root':{'manifest':{'root_hash':('0'*64 if fault=='installed_manifest_mismatch' or fault=='late_doctor_root' and count>=4 else root)}}}}))\n"
         "else: raise SystemExit(2)\n"
         "if trigger:\n"
         " git=os.environ['REAL_GIT']\n"
-        " if hook=='config': open(os.environ['GIT_PROBE_CONFIG'],'a').write('x')\n"
+        " if hook=='config' or fault=='post_invariant_changed': open(os.environ['GIT_PROBE_CONFIG'],'a').write('x')\n"
         " elif hook=='state': open(os.environ['GIT_PROBE_STATE'],'a').write('x')\n"
         " elif hook=='live': open(os.path.join(os.environ['GIT_PROBE_LIVE'],'race.bin'),'wb').write(b'x')\n"
+        " elif hook=='package_py': open(os.environ['GIT_PROBE_PACKAGE_MAIN'],'a').write('\\n# race')\n"
         " elif hook=='source_ref': subprocess.run([git,'-C',os.environ['GIT_PROBE_SOURCE'],'update-ref','refs/heads/probe',os.environ['GIT_PROBE_SOURCE_HEAD']],check=True)\n"
         " elif hook=='vault_ref': subprocess.run([git,'-C',os.environ['GIT_PROBE_VAULT'],'update-ref','refs/test/probe-race',os.environ['GIT_PROBE_VAULT_HEAD']],check=True); assert subprocess.check_output([git,'-C',os.environ['GIT_PROBE_VAULT'],'for-each-ref','--format=%(refname)','refs/test/probe-race'],text=True).strip() == 'refs/test/probe-race'\n"
         " elif hook=='source_fetch_head': open(os.environ['GIT_PROBE_SOURCE_FETCH_HEAD'],'w').write('1'*40)\n"
@@ -768,14 +778,14 @@ def _summary_case(base: Path, *, remote_files: dict[str, bytes], corrupt: str | 
     # local mock CLI after its second status/doctor reply, so the production
     # Git invocation path is never intercepted.
     counter = base / "probe-count"
-    env=os.environ.copy(); env.update(USERPROFILE=str(profile), LOCALAPPDATA=str(local), PYTHONPATH=str(stub)+os.pathsep+str(ROOT / "src"), PYTHONHOME=str(interp), PATH=str(wrapper)+os.pathsep+env["PATH"], GIT_SHIM_DIR=str(wrapper), REAL_GIT=str(REAL_GIT), GIT_SUMMARY_HOOK="", GIT_SUMMARY_CONFIG=str(config), GIT_SUMMARY_STATE=str(state), GIT_SUMMARY_GIT=str(REAL_GIT), GIT_SUMMARY_SOURCE=str(source), GIT_SUMMARY_VAULT=str(vault), GIT_SUMMARY_SEED=str(seed), GIT_PROBE_HOOK="", GIT_PROBE_SOURCE=str(source), GIT_PROBE_VAULT=str(vault), GIT_PROBE_SOURCE_HEAD=_git(source, "rev-parse", "HEAD"), GIT_PROBE_VAULT_HEAD=_git(vault, "rev-parse", "HEAD"), GIT_PROBE_SEED=str(seed), GIT_PROBE_CONFIG=str(config), GIT_PROBE_STATE=str(state), GIT_PROBE_LIVE=str(live), GIT_PROBE_COUNTER=str(counter), GIT_PROBE_SOURCE_FETCH_HEAD=str(source / ".git" / "FETCH_HEAD"), GIT_PROBE_VAULT_FETCH_HEAD=str(vault / ".git" / "FETCH_HEAD"))
+    env=os.environ.copy(); env.update(USERPROFILE=str(profile), LOCALAPPDATA=str(local), PYTHONPATH=str(stub)+os.pathsep+str(ROOT / "src"), PYTHONHOME=str(interp), PATH=str(wrapper)+os.pathsep+env["PATH"], GIT_SHIM_DIR=str(wrapper), REAL_GIT=str(REAL_GIT), STAGE_PROBE_FAULT="", GIT_SUMMARY_HOOK="", GIT_SUMMARY_CONFIG=str(config), GIT_SUMMARY_STATE=str(state), GIT_SUMMARY_GIT=str(REAL_GIT), GIT_SUMMARY_SOURCE=str(source), GIT_SUMMARY_VAULT=str(vault), GIT_SUMMARY_SEED=str(seed), GIT_PROBE_HOOK="", GIT_PROBE_SOURCE=str(source), GIT_PROBE_VAULT=str(vault), GIT_PROBE_SOURCE_HEAD=_git(source, "rev-parse", "HEAD"), GIT_PROBE_VAULT_HEAD=_git(vault, "rev-parse", "HEAD"), GIT_PROBE_SEED=str(seed), GIT_PROBE_CONFIG=str(config), GIT_PROBE_STATE=str(state), GIT_PROBE_LIVE=str(live), GIT_PROBE_PACKAGE_MAIN=str(package / "__main__.py"), GIT_PROBE_COUNTER=str(counter), GIT_PROBE_SOURCE_FETCH_HEAD=str(source / ".git" / "FETCH_HEAD"), GIT_PROBE_VAULT_FETCH_HEAD=str(vault / ".git" / "FETCH_HEAD"))
     for command in ("status", "doctor"):
         checked = subprocess.run([str(tool_python), "-m", "grim_dawn_sync", "--config", str(config), "--json", command], env=env, capture_output=True, text=True, encoding="utf-8")
         assert checked.returncode == 0, checked.stderr
         payload = json.loads(checked.stdout)
         if command == "status":
-            assert payload == {"readiness":"blocked", "vault_relation":"remote_changed_or_unknown", "active_lock":None, "recovery_phase":None, "processes":{"status":"clear"}, "last_pushed_commit":baseline}
-        else: assert payload["machine_id"] == "desktop-a" and payload["checks"]["save_root"]["manifest"]["root_hash"] == live_root
+            assert {key: payload[key] for key in ("schema_version","command","readiness","vault_relation","active_lock","recovery_phase","processes","last_pushed_commit")} == {"schema_version":"1.0.0","command":"status","readiness":"blocked", "vault_relation":"remote_changed_or_unknown", "active_lock":None, "recovery_phase":None, "processes":{"complete":True,"status":"clear"}, "last_pushed_commit":baseline}
+        else: assert payload["schema_version"] == "1.0.0" and payload["command"] == "doctor" and payload["read_only"] is True and payload["machine_id"] == "desktop-a" and payload["passed"] is True and payload["checks"]["save_root"]["manifest"]["root_hash"] == live_root
     counter.write_text("0", encoding="ascii")
     env["GIT_PROBE_DOCTOR_ROOT"] = live_root
     return env, {"vault":str(vault),"config":str(config),"state":str(state),"source":str(source),"remote":str(remote),"baseline":baseline,"remote_head":remote_head,"remote_root":remote_root,"live_root":live_root}
@@ -1004,3 +1014,137 @@ def test_sequence_9_request_block_parses_in_windows_powershell_51() -> None:
         parser.write_text("$tokens=$null;$errors=$null;[void][System.Management.Automation.Language.Parser]::ParseFile($args[0],[ref]$tokens,[ref]$errors);if($errors.Count){exit 1}", encoding="utf-8-sig")
         result = subprocess.run([str(POWERSHELL), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(parser), str(script)], capture_output=True, text=True, encoding="utf-8")
         assert result.returncode == 0, result.stderr
+
+
+def _prepare_stage_case(base: Path) -> tuple[dict[str, str], dict[str, str]]:
+    env, paths = _summary_case(base, remote_files={"main/Hero/player.gdc": b"next"})
+    package = base / "localappdata" / "GrimDawnSaveSyncTool" / ".venv" / "Lib" / "site-packages" / "grim_dawn_sync"
+    package.mkdir(parents=True)
+    shutil.copy2(base / "stub" / "grim_dawn_sync" / "__init__.py", package / "__init__.py")
+    shutil.copy2(base / "stub" / "grim_dawn_sync" / "__main__.py", package / "__main__.py")
+    env["PYTHONPATH"] = str(package.parent) + os.pathsep + str(ROOT / "src")
+    env["GIT_PROBE_PACKAGE_MAIN"] = str(package / "__main__.py")
+    env["PATH"] = os.environ["PATH"]
+    shortcut = base / "profile" / "Desktop" / "Grim Dawn (DPYes + Save Selection).lnk"
+    shortcut.parent.mkdir(parents=True, exist_ok=True); shortcut.write_bytes(b"fixture")
+    return env, paths
+
+
+def _assert_stage_failure(result: subprocess.CompletedProcess[str], stage: str, code: str) -> None:
+    assert result.returncode == 1 and result.stderr == ""
+    assert result.stdout.count("\n") == 1
+    row = json.loads(result.stdout)
+    assert row == {"sentinel":"TERMINAL_A_POST_SELECTOR_FAILURE_STAGE_PROBE","status":"blocked","leg":"A1","machine_id":"desktop-a","stage":stage,"code":code}
+
+
+def test_sequence_10_stage_probe_accepts_volatile_fields_with_same_semantic_projection() -> None:
+    with tempfile.TemporaryDirectory(prefix="terminal-a-stage-success-") as raw:
+        base = Path(raw); env, paths = _prepare_stage_case(base)
+        script = _stage_probe_script(base)
+        block = script.read_text(encoding="utf-8-sig")
+        for forbidden in ("Start-Process", "SendKeys", "CloseMainWindow", " fetch ", " push ", " checkout ", "update-ref"):
+            assert forbidden not in block
+        result = _invoke(script, env)
+        assert result.returncode == 0 and result.stderr == "" and result.stdout.count("\n") == 1
+        row = json.loads(result.stdout)
+        assert row == {"sentinel":"TERMINAL_A_POST_SELECTOR_FAILURE_STAGE_PROBE","status":"complete","leg":"A1","machine_id":"desktop-a","stage":"complete","code":"stage_probe_complete","relation":"unknown","remote_lock":"clear","processes":"clear","selector_window_count_bucket":"zero"}
+        for secret in (str(base), paths["remote"], paths["baseline"], "stderr"): assert secret not in result.stdout
+
+
+@pytest.mark.parametrize(("fault","stage","code"), [
+    ("status_command_failed","status_first","status_command_failed"),
+    ("status_shape_invalid","status_first","status_shape_invalid"),
+    ("doctor_command_failed","doctor_first","doctor_command_failed"),
+    ("doctor_shape_invalid","doctor_first","doctor_shape_invalid"),
+    ("installed_manifest_mismatch","live_manifest","installed_manifest_mismatch"),
+    ("status_not_stable","status_second","status_not_stable"),
+    ("status_schema_drift","status_second","status_not_stable"),
+    ("status_command_drift","status_second","status_not_stable"),
+    ("process_complete_drift","status_second","status_not_stable"),
+    ("doctor_not_stable","doctor_second","doctor_not_stable"),
+    ("doctor_read_only_drift","doctor_second","doctor_not_stable"),
+    ("post_invariant_changed","post_invariant","post_invariant_changed"),
+])
+def test_sequence_10_stage_probe_maps_cli_and_invariant_failures(fault: str, stage: str, code: str) -> None:
+    with tempfile.TemporaryDirectory(prefix=f"terminal-a-stage-{fault}-") as raw:
+        base = Path(raw); env, _paths = _prepare_stage_case(base); env["STAGE_PROBE_FAULT"] = fault
+        _assert_stage_failure(_invoke(_stage_probe_script(base), env), stage, code)
+
+
+def test_sequence_10_stage_probe_maps_remote_lock_and_process_observation() -> None:
+    for fault in ("remote_missing", "remote_lock", "process"):
+        with tempfile.TemporaryDirectory(prefix=f"terminal-a-stage-{fault}-") as raw:
+            base = Path(raw); env, _paths = _prepare_stage_case(base); script = _stage_probe_script(base)
+            if fault == "remote_missing":
+                _git(Path(_paths["remote"]), "update-ref", "-d", "refs/heads/main")
+                expected = ("remote_advertisement", "remote_advertisement_invalid")
+            elif fault == "remote_lock":
+                _git(Path(env["GIT_PROBE_SEED"]), "tag", "grim-dawn-sync-active")
+                _git(Path(env["GIT_PROBE_SEED"]), "push", "origin", "refs/tags/grim-dawn-sync-active")
+                expected = ("remote_advertisement", "remote_advertisement_invalid")
+            else:
+                script.write_text(script.read_text(encoding="utf-8-sig").replace("Get-CimInstance Win32_Process -ErrorAction Stop", "throw 'fixture'"), encoding="utf-8-sig")
+                expected = ("process_window", "process_observation_inconclusive")
+            _assert_stage_failure(_invoke(script, env), *expected)
+
+
+@pytest.mark.parametrize(("hook","code"), [
+    ("source_detached","post_invariant_changed"),
+    ("vault_detached","post_invariant_changed"),
+    ("source_fetch_head","post_invariant_changed"),
+    ("vault_fetch_head","post_invariant_changed"),
+    ("live","post_invariant_changed"),
+    ("package_py","post_invariant_changed"),
+    ("remote_main","remote_advertisement_invalid"),
+    ("remote_lock","remote_advertisement_invalid"),
+])
+def test_sequence_10_stage_probe_detects_late_mutations(hook: str, code: str) -> None:
+    with tempfile.TemporaryDirectory(prefix=f"terminal-a-stage-late-{hook}-") as raw:
+        base=Path(raw); env,_paths=_prepare_stage_case(base); script=_stage_probe_script(base)
+        if hook in {"remote_main","remote_lock"}:
+            env["GIT_PROBE_REMOTE"]=_paths["remote"]
+            if hook=="remote_main":
+                env["GIT_PROBE_BASELINE"]=_paths["baseline"]
+                command="& $env:REAL_GIT -C $env:GIT_PROBE_REMOTE update-ref refs/heads/main $env:GIT_PROBE_BASELINE 1>$null 2>$null"
+            else:
+                command="$oid=@(& $env:REAL_GIT -C $env:GIT_PROBE_REMOTE rev-parse refs/heads/main)[0];& $env:REAL_GIT -C $env:GIT_PROBE_REMOTE update-ref refs/tags/grim-dawn-sync-active $oid 1>$null 2>$null"
+            injection = command+";$finalRemote=Remote $vault"
+            script.write_text(script.read_text(encoding="utf-8-sig").replace("$finalRemote=Remote $vault",injection),encoding="utf-8-sig")
+        else:
+            env["GIT_PROBE_HOOK"]=hook
+        _assert_stage_failure(_invoke(script,env),"post_invariant",code)
+
+
+def test_sequence_10_stage_probe_detects_late_doctor_root_and_final_selector_count() -> None:
+    with tempfile.TemporaryDirectory(prefix="terminal-a-stage-late-doctor-") as raw:
+        base=Path(raw); env,_paths=_prepare_stage_case(base); env["STAGE_PROBE_FAULT"]="late_doctor_root"
+        _assert_stage_failure(_invoke(_stage_probe_script(base),env),"post_invariant","post_invariant_changed")
+    with tempfile.TemporaryDirectory(prefix="terminal-a-stage-window-") as raw:
+        base=Path(raw); env,_paths=_prepare_stage_case(base); script=_stage_probe_script(base)
+        script.write_text(script.read_text(encoding="utf-8-sig").replace("[StageProbeWindow]::Count($selectorTitle)","1"),encoding="utf-8-sig")
+        result=_invoke(script,env); row=json.loads(result.stdout)
+        assert result.returncode==0 and result.stderr=="" and row["selector_window_count_bucket"]=="one"
+
+
+def test_sequence_10_native_timeout_kills_mock_child_and_descendant() -> None:
+    with tempfile.TemporaryDirectory(prefix="terminal-a-stage-timeout-") as raw:
+        base=Path(raw); pidfile=base/"pids"; hang=base/"hang.py"
+        hang.write_text("import os,subprocess,sys,time\np=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,stdin=subprocess.DEVNULL)\nopen(sys.argv[1],'w').write(str(os.getpid())+' '+str(p.pid))\ntime.sleep(60)\n",encoding="ascii")
+        block=RUNBOOK.read_text(encoding="utf-8").split("## Post-selector-failure stage probe (sequence 10)",1)[1].split("```powershell",1)[1].split("```",1)[0]
+        helpers=block[block.index("function Q"):block.index("function Git")].replace("WaitForExit(60000)","WaitForExit(250)")
+        script=base/"timeout.ps1"; script.write_text(helpers+"\ntry{Native $env:TIMEOUT_PYTHON @($env:TIMEOUT_HANG,$env:TIMEOUT_PIDS) 'timeout_blocked'}catch{Write-Output $_.Exception.Message;exit 1}\n",encoding="utf-8-sig")
+        env=os.environ.copy(); env.update(TIMEOUT_PYTHON=sys.executable,TIMEOUT_HANG=str(hang),TIMEOUT_PIDS=str(pidfile))
+        result=_invoke(script,env)
+        assert result.returncode==1 and result.stderr=="" and result.stdout=="timeout_blocked\n"
+        pids=[int(value) for value in pidfile.read_text(encoding="ascii").split()]; assert len(pids)==2
+        for pid in pids:
+            check=subprocess.run([str(POWERSHELL),"-NoProfile","-NonInteractive","-Command",f"if(Get-Process -Id {pid} -ErrorAction SilentlyContinue){{exit 1}}"],capture_output=True,text=True,encoding="utf-8")
+            assert check.returncode==0
+
+
+def test_sequence_10_stage_probe_parses_in_windows_powershell_51() -> None:
+    with tempfile.TemporaryDirectory(prefix="terminal-a-stage-parse-") as raw:
+        base=Path(raw); script=_stage_probe_script(base); parser=base/"parse.ps1"
+        parser.write_text("$t=$null;$e=$null;[void][System.Management.Automation.Language.Parser]::ParseFile($args[0],[ref]$t,[ref]$e);if($e.Count){$e|ForEach-Object{$_.Message};exit 1}",encoding="utf-8-sig")
+        result=subprocess.run([str(POWERSHELL),"-NoProfile","-NonInteractive","-ExecutionPolicy","Bypass","-File",str(parser),str(script)],capture_output=True,text=True,encoding="utf-8")
+        assert result.returncode == 0, result.stdout + result.stderr

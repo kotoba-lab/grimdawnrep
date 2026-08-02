@@ -169,16 +169,16 @@ try {
     if (-not ($request.schema_version -is [string]) -or $request.schema_version -cne '1.0.0' -or
         -not ($request.kind -is [string]) -or
         $request.kind -cne 'grim_dawn_terminal_diagnostic_request' -or
-        -not ($request.sequence -is [int]) -or $request.sequence -ne 9 -or
+        -not ($request.sequence -is [int]) -or $request.sequence -ne 10 -or
         -not ($request.target_machine_id -is [string]) -or $request.target_machine_id -cne $machineId -or
         -not ($request.leg -is [string]) -or -not ($request.observed_code -is [string]) -or
         -not ($request.action -is [string]) -or -not ($request.response_sentinel -is [string]) -or
         -not ($request.request_id -is [string]) -or
         $request.leg -cne 'A1' -or $request.observed_code -cne 'remote_changed_or_unknown' -or
-        $request.action -cne 'post_selector_failure_readonly_probe' -or
-        $request.response_sentinel -cne 'TERMINAL_A_POST_SELECTOR_FAILURE_PROBE') { throw 'invalid' }
-    Assert-ExactArray $request.checks @('double_status_doctor','deployment_fingerprints','vault_source_live_state_invariants',
-        'stable_remote_main_and_lock','residual_selector_and_process_observation')
+        $request.action -cne 'post_selector_failure_stage_probe_readonly' -or
+        $request.response_sentinel -cne 'TERMINAL_A_POST_SELECTOR_FAILURE_STAGE_PROBE') { throw 'invalid' }
+    Assert-ExactArray $request.checks @('stage_mapped_status_doctor','deployment_fingerprints','vault_source_live_state_invariants',
+        'stable_remote_main_and_lock','bounded_remote_and_process_window_observation')
     Assert-ExactArray $request.constraints @('installed_local_fixed_block_only','no_shortcut_ui_input_close_kill_or_game_start',
         'no_fetch_or_vault_ref_write','no_lock_recover_restore_snapshot_bookmark_promote','no_commit_push_merge_rebase_reset_checkout',
         'no_state_config_save_remote_ref_write',
@@ -209,6 +209,59 @@ catch {
     Write-Output (Write-RequestBlocked)
     exit 1
 }
+```
+
+## Post-selector-failure stage probe (sequence 10)
+
+Run this **installed local block only** after the sequence 10 request block
+exits zero.  It is a bounded, read-only diagnosis: it does not open a shortcut,
+touch a window, send input, fetch, alter refs, or change a process.  Its output
+contains only the failing stage and fixed allow-listed code; successful output
+adds only aggregate relation, lock, process, and exact-title window buckets.
+
+```powershell
+$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue'
+$toolRoot=Join-Path $env:LOCALAPPDATA 'GrimDawnSaveSyncTool';$python=Join-Path $toolRoot '.venv\Scripts\python.exe'
+$config=Join-Path $env:LOCALAPPDATA 'GrimDawnSaveSync\config.local.json';$source=Join-Path $env:USERPROFILE 'grimdawnrep';$machineId='desktop-a';$selectorTitle='Grim Dawn Save Selection'
+Add-Type @'
+using System;using System.Text;using System.Collections.Generic;using System.Runtime.InteropServices;
+public static class StageProbeWindow { delegate bool P(IntPtr h,IntPtr l); [DllImport("user32.dll")] static extern bool EnumWindows(P p,IntPtr l); [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h); [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern int GetWindowText(IntPtr h,StringBuilder b,int n); public static int Count(string t){int n=0;EnumWindows(delegate(IntPtr h,IntPtr l){if(IsWindowVisible(h)){var b=new StringBuilder(512);GetWindowText(h,b,b.Capacity);if(String.Equals(b.ToString(),t,StringComparison.Ordinal)){n++;}}return true;},IntPtr.Zero);return n;} }
+'@
+function Bucket($n){if($null -eq $n){'unknown'}elseif($n -eq 0){'zero'}elseif($n -eq 1){'one'}else{'two_or_more'}}
+function Digest($p){if(!(Test-Path -LiteralPath $p -PathType Leaf)){throw 'required_local_artifact_missing'};$h=[Security.Cryptography.SHA256]::Create();try{([BitConverter]::ToString($h.ComputeHash([IO.File]::ReadAllBytes($p)))).Replace('-','')}finally{$h.Dispose()}}
+function TreeDigest($root){if(!(Test-Path -LiteralPath $root -PathType Container)){throw 'required_local_artifact_missing'};$base=[IO.Path]::GetFullPath($root).TrimEnd([char[]]'\')+'\';$rows=@();foreach($i in @(Get-ChildItem -LiteralPath $root -Recurse -File -Force -ErrorAction Stop|Sort-Object FullName)){$full=[IO.Path]::GetFullPath($i.FullName);if(!$full.StartsWith($base,[StringComparison]::OrdinalIgnoreCase)){throw 'post_invariant_changed'};$rows+=$full.Substring($base.Length)+'='+$i.Length+'='+(Digest $full)};$h=[Security.Cryptography.SHA256]::Create();try{$bytes=[Text.Encoding]::UTF8.GetBytes(($rows-join"`n"));([BitConverter]::ToString($h.ComputeHash($bytes))).Replace('-','')}finally{$h.Dispose()}}
+function ToolIdentity($p){$pkg=Join-Path ([IO.Path]::GetDirectoryName([IO.Path]::GetDirectoryName($p))) 'Lib\site-packages\grim_dawn_sync';if(!(Test-Path -LiteralPath $pkg -PathType Container)){throw 'required_local_artifact_missing'};$rows=@(Get-ChildItem -LiteralPath $pkg -Recurse -File -Filter *.py|Sort-Object FullName|ForEach-Object{$_.FullName.Substring($pkg.Length)+'='+(Digest $_.FullName)});if($rows.Count-eq 0){throw 'required_local_artifact_missing'};$m=Get-Item -LiteralPath $p;([IO.Path]::GetFullPath($p))+[char]0+$m.Length+[char]0+$m.LastWriteTimeUtc.Ticks+[char]0+($rows-join"`n")}
+function Q($s){'"'+([string]$s).Replace('"','\"')+'"'}
+function StopTree($targetPid){$psi=New-Object Diagnostics.ProcessStartInfo;$psi.FileName=(Join-Path $env:SystemRoot 'System32\taskkill.exe');$psi.Arguments='/PID '+[int]$targetPid+' /T /F';$psi.UseShellExecute=$false;$psi.CreateNoWindow=$true;$psi.RedirectStandardOutput=$true;$psi.RedirectStandardError=$true;$p=New-Object Diagnostics.Process;$p.StartInfo=$psi;if($p.Start()){[void]$p.WaitForExit(5000);if(!$p.HasExited){$p.Kill()}}}
+function Native($f,[string[]]$a,$code){$psi=New-Object Diagnostics.ProcessStartInfo;$psi.FileName=$f;$psi.Arguments=(($a|ForEach-Object{Q $_})-join ' ');$psi.UseShellExecute=$false;$psi.CreateNoWindow=$true;$psi.RedirectStandardOutput=$true;$psi.RedirectStandardError=$true;$psi.EnvironmentVariables['GIT_TERMINAL_PROMPT']='0';$psi.EnvironmentVariables['GCM_INTERACTIVE']='Never';$p=New-Object Diagnostics.Process;$p.StartInfo=$psi;if(!$p.Start()){throw $code};$o=$p.StandardOutput.ReadToEndAsync();$e=$p.StandardError.ReadToEndAsync();if(!$p.WaitForExit(60000)){StopTree $p.Id;throw $code};[void]$e.GetAwaiter().GetResult();$v=$o.GetAwaiter().GetResult();if($p.ExitCode-ne 0){throw $code};@($v-split"`r?`n"|Where-Object{$_-ne''})}
+function Git($r,[string[]]$a,$code){@(Native 'git' (@('-C',$r)+$a) $code)}
+function RepoMark($r,$code){$a=@(Git $r @('rev-parse','HEAD') $code);$n=@(Git $r @('rev-parse','--symbolic-full-name','HEAD') $code);$b=@(Git $r @('status','--porcelain=v1','--untracked-files=all') $code);$c=@(Git $r @('for-each-ref','--sort=refname','--format=%(refname) %(objectname)') $code);if($a.Count-ne 1 -or $n.Count-ne 1){throw $code};$head=if($n[0]-eq'HEAD'){'DETACHED'}elseif($n[0]-match'^refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]*$'){'BRANCH='+$n[0]}else{throw $code};$fetch=Join-Path (Join-Path $r '.git') 'FETCH_HEAD';$f=if(Test-Path -LiteralPath $fetch -PathType Leaf){'present='+(Get-Content -LiteralPath $fetch -Raw -Encoding utf8)}else{'absent'};$h=[Security.Cryptography.SHA256]::Create();try{$text=([string]$a[0])+[char]0+$head+[char]0+($b-join"`n")+[char]0+($c-join"`n")+[char]0+$f;$bytes=[Text.Encoding]::UTF8.GetBytes($text);([BitConverter]::ToString($h.ComputeHash($bytes))).Replace('-','')}finally{$h.Dispose()}}
+function Json($arg,$code){try{$r=@(Native $python @('-m','grim_dawn_sync','--config',$config,'--json',$arg) $code);if($r.Count-ne 1){throw $code};$r[0]|ConvertFrom-Json -ErrorAction Stop}catch{throw $code}}
+function StatusProjection($v){if($null-eq$v -or $v.schema_version-cne'1.0.0' -or $v.command-cne'status' -or $v.readiness-isnot[string] -or $v.vault_relation-isnot[string] -or $null-eq$v.processes -or $v.processes.complete-ne$true -or $v.processes.status-isnot[string]){throw 'status_shape_invalid'};([string]$v.schema_version)+'|'+([string]$v.command)+'|'+([string]$v.readiness)+'|'+([string]$v.vault_relation)+'|'+[string]($null-ne$v.active_lock)+'|'+[string]($null-ne$v.recovery_phase)+'|'+[string]$v.processes.complete+'|'+[string]$v.processes.status}
+function DoctorProjection($v){try{if($v.schema_version-cne'1.0.0' -or $v.command-cne'doctor' -or $v.read_only-ne$true -or $v.machine_id-isnot[string] -or $v.checks.save_root.manifest.root_hash-notmatch'^[0-9a-f]{64}$' -or $v.passed-ne$true){throw 'doctor_shape_invalid'};([string]$v.schema_version)+'|'+([string]$v.command)+'|'+[string]$v.read_only+'|'+[string]$v.machine_id+'|'+[string]$v.passed+'|'+[string]$v.checks.save_root.manifest.root_hash}catch{throw 'doctor_shape_invalid'}}
+function InstalledRoot($root){$code='from pathlib import Path; import re,sys; from grim_dawn_sync.manifest import build_manifest; x=build_manifest(Path(sys.argv[1]),machine_id=sys.argv[2]).get("root_hash"); sys.exit(2) if not isinstance(x,str) or re.fullmatch(r"[0-9a-f]{64}",x) is None else print(x)';$v=@(Native $python @('-c',$code,$root,$machineId) 'installed_manifest_mismatch');if($v.Count-ne 1 -or $v[0]-notmatch '^[0-9a-f]{64}$'){throw 'installed_manifest_mismatch'};[string]$v[0]}
+function Remote($vault){$r=@(Git $vault @('ls-remote','--refs','origin','refs/heads/main','refs/tags/grim-dawn-sync-active') 'remote_advertisement_invalid');$m=@($r|Where-Object{$_ -match '^[0-9a-f]{40}\trefs/heads/main$'});$l=@($r|Where-Object{$_ -match '^[0-9a-f]{40}\trefs/tags/grim-dawn-sync-active$'});if($m.Count-ne 1 -or $l.Count-ne 0 -or $r.Count-ne 1){throw 'remote_advertisement_invalid'};[pscustomobject]@{raw=$r-join"`n";lock='clear'}}
+function Out($status,$stage,$code,$relation,$lock,$processes,$windows){$x=[ordered]@{sentinel='TERMINAL_A_POST_SELECTOR_FAILURE_STAGE_PROBE';status=$status;leg='A1';machine_id=$machineId;stage=$stage;code=$code};if($status-eq'complete'){$x.relation=$relation;$x.remote_lock=$lock;$x.processes=$processes;$x.selector_window_count_bucket=$windows};$x|ConvertTo-Json -Compress}
+$stage='bootstrap';try{
+ if(!(Test-Path -LiteralPath $python -PathType Leaf)){throw 'required_local_artifact_missing'}
+ $stage='config';if(!(Test-Path -LiteralPath $config -PathType Leaf)){throw 'required_local_artifact_missing'};try{$cfg=Get-Content -LiteralPath $config -Raw -Encoding utf8|ConvertFrom-Json -ErrorAction Stop}catch{throw 'required_local_artifact_missing'};if($cfg.machine_id-cne$machineId -or $cfg.vault_repo -isnot [string] -or $cfg.save_root -isnot [string]){throw 'machine_id_unexpected'};$vault=[string]$cfg.vault_repo;$live=[string]$cfg.save_root;$state=Join-Path ([IO.Path]::GetDirectoryName($config)) 'state.json'
+ $shortcut=Join-Path (Join-Path $env:USERPROFILE 'Desktop') 'Grim Dawn (DPYes + Save Selection).lnk'
+ $stage='package';$before=@((ToolIdentity $python),(Digest $config),(Digest $state),(Digest $shortcut),(TreeDigest $live));$installed=InstalledRoot $live
+ $stage='source';$beforeSource=RepoMark $source 'source_probe_failed'
+ $stage='vault';$beforeVault=RepoMark $vault 'vault_probe_failed'
+ $stage='status_first';$s1=Json 'status' 'status_command_failed';$sp1=StatusProjection $s1
+ $stage='doctor_first';$d1=Json 'doctor' 'doctor_command_failed';$dp1=DoctorProjection $d1
+ $stage='live_manifest';if($installed-cne[string]$d1.checks.save_root.manifest.root_hash){throw 'installed_manifest_mismatch'}
+ $stage='remote_advertisement';$r1=Remote $vault;$r2=Remote $vault;if($r1.raw-cne$r2.raw){throw 'remote_advertisement_invalid'}
+ $stage='process_window';try{$all=@(Get-CimInstance Win32_Process -ErrorAction Stop);$games=@($all|Where-Object{$_.Name-in@('Grim Dawn.exe','DPYes.exe')})}catch{throw 'process_observation_inconclusive'};if($games.Count-ne 0){throw 'process_status_unexpected'}
+ $stage='status_second';$s2=Json 'status' 'status_command_failed';try{$sp2=StatusProjection $s2}catch{throw 'status_not_stable'};if($sp1-cne$sp2){throw 'status_not_stable'}
+ $stage='doctor_second';$d2=Json 'doctor' 'doctor_command_failed';try{$dp2=DoctorProjection $d2}catch{throw 'doctor_not_stable'};if($dp1-cne$dp2){throw 'doctor_not_stable'}
+ if($d1.machine_id-cne$machineId){throw 'machine_id_unexpected'};if($s1.readiness-notin@('blocked','ready')){throw 'status_readiness_unexpected'};if($s1.vault_relation-notin@('equal','remote_ahead','local_ahead','diverged','unknown','remote_changed_or_unknown')){throw 'vault_relation_unexpected'};if($null-ne$s1.active_lock -or $null-ne$s1.recovery_phase){throw 'lock_or_recovery_present'}
+ $stage='post_invariant';$after=@((ToolIdentity $python),(Digest $config),(Digest $state),(Digest $shortcut),(TreeDigest $live));$afterSource=RepoMark $source 'source_probe_failed';$afterVault=RepoMark $vault 'vault_probe_failed';$lateDoctor=Json 'doctor' 'doctor_command_failed';[void](DoctorProjection $lateDoctor);$lateInstalled=InstalledRoot $live;if((($before -join [char]0) -cne ($after -join [char]0)) -or ($beforeSource -cne $afterSource) -or ($beforeVault -cne $afterVault) -or ([string]$lateDoctor.checks.save_root.manifest.root_hash-cne[string]$d1.checks.save_root.manifest.root_hash) -or ($lateInstalled-cne$installed)){throw 'post_invariant_changed'}
+ $finalRemote=Remote $vault;if($finalRemote.raw-cne$r1.raw){throw 'remote_advertisement_invalid'}
+ try{$wins=[StageProbeWindow]::Count($selectorTitle)}catch{throw 'process_observation_inconclusive'}
+ $relation=if($s1.vault_relation-eq'remote_changed_or_unknown'){'unknown'}else{[string]$s1.vault_relation};Write-Output (Out 'complete' 'complete' 'stage_probe_complete' $relation $finalRemote.lock 'clear' (Bucket $wins));exit 0
+}catch{$code=[string]$_.Exception.Message;$allowed=@('required_local_artifact_missing','source_probe_failed','vault_probe_failed','status_command_failed','status_shape_invalid','doctor_command_failed','doctor_shape_invalid','installed_manifest_mismatch','status_not_stable','doctor_not_stable','status_readiness_unexpected','vault_relation_unexpected','lock_or_recovery_present','process_status_unexpected','machine_id_unexpected','remote_advertisement_invalid','process_observation_inconclusive','post_invariant_changed','unexpected_failed');if($code-notin$allowed){$code='unexpected_failed'};Write-Output (Out 'blocked' $stage $code $null $null $null $null);exit 1}
 ```
 
 ## Selector cancel/reload dry-run block

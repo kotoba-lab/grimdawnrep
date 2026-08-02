@@ -28,9 +28,9 @@ EXPECTED_KEYS = {
     "expires_at",
 }
 EXPECTED_CHECKS = [
-    "double_status_doctor", "deployment_fingerprints",
+    "stage_mapped_status_doctor", "deployment_fingerprints",
     "vault_source_live_state_invariants", "stable_remote_main_and_lock",
-    "residual_selector_and_process_observation",
+    "bounded_remote_and_process_window_observation",
 ]
 EXPECTED_CONSTRAINTS = [
     "installed_local_fixed_block_only",
@@ -82,12 +82,12 @@ def test_terminal_a_request_has_exact_schema_identity_and_readonly_action() -> N
     assert set(payload) == EXPECTED_KEYS
     assert payload["schema_version"] == "1.0.0"
     assert payload["kind"] == "grim_dawn_terminal_diagnostic_request"
-    assert payload["sequence"] == 9
+    assert payload["sequence"] == 10
     assert payload["target_machine_id"] == "desktop-a"
     assert payload["leg"] == "A1" and payload["observed_code"] == "remote_changed_or_unknown"
-    assert payload["action"] == "post_selector_failure_readonly_probe"
-    assert payload["response_sentinel"] == "TERMINAL_A_POST_SELECTOR_FAILURE_PROBE"
-    assert payload["request_id"] == "c4de6a93-1493-4bb6-b2c0-8f9ea406e2fd"
+    assert payload["action"] == "post_selector_failure_stage_probe_readonly"
+    assert payload["response_sentinel"] == "TERMINAL_A_POST_SELECTOR_FAILURE_STAGE_PROBE"
+    assert payload["request_id"] == "794cb2d0-b62f-4e9d-8aa8-2ba6714994bb"
     parsed_id = uuid.UUID(str(payload["request_id"]))
     assert str(parsed_id) == payload["request_id"]
 
@@ -114,9 +114,33 @@ def test_terminal_a_request_has_strict_utc_window_of_at_most_seventy_five_minute
         values[field] = parsed
     assert values["issued_at"] <= values["not_before"] < values["expires_at"]
     assert (values["expires_at"] - values["not_before"]).total_seconds() <= 4500
-    assert payload["issued_at"] == payload["not_before"] == "2026-08-02T00:50:37Z"
-    assert payload["expires_at"] == "2026-08-02T02:05:37Z"
+    assert payload["issued_at"] == payload["not_before"] == "2026-08-02T02:03:24Z"
+    assert payload["expires_at"] == "2026-08-02T03:18:24Z"
     assert (values["expires_at"] - values["not_before"]).total_seconds() == 4500
+
+
+def test_sequence_10_stage_probe_has_closed_stages_codes_and_readonly_surface() -> None:
+    runbook = RUNBOOK_PATH.read_text(encoding="utf-8")
+    block = runbook.split("## Post-selector-failure stage probe (sequence 10)", 1)[1].split("```powershell", 1)[1].split("```", 1)[0]
+
+    stages = ("bootstrap", "config", "package", "source", "vault", "status_first", "doctor_first",
+              "live_manifest", "remote_advertisement", "process_window", "status_second", "doctor_second",
+              "post_invariant", "complete")
+    codes = ("required_local_artifact_missing", "source_probe_failed", "vault_probe_failed",
+             "status_command_failed", "status_shape_invalid", "doctor_command_failed", "doctor_shape_invalid",
+             "installed_manifest_mismatch", "status_not_stable", "doctor_not_stable",
+             "status_readiness_unexpected", "vault_relation_unexpected", "lock_or_recovery_present",
+             "process_status_unexpected", "machine_id_unexpected", "remote_advertisement_invalid",
+             "process_observation_inconclusive", "post_invariant_changed", "unexpected_failed")
+    assert all(f"'{value}'" in block for value in stages)
+    assert all(f"'{value}'" in block for value in codes)
+    assert "stage_probe_complete" in block and "TERMINAL_A_POST_SELECTOR_FAILURE_STAGE_PROBE" in block
+    assert "StatusProjection" in block and "DoctorProjection" in block
+    assert "ConvertTo-Json -Depth" not in block
+    assert "ls-remote','--refs','origin','refs/heads/main','refs/tags/grim-dawn-sync-active" in block
+    for forbidden in ("Start-Process", "SendKeys", "PostMessage", "SetForegroundWindow", " taskkill", "Stop-Process",
+                      " fetch", " update-ref", " commit", " push", " checkout", " reset", " recover", " restore"):
+        assert forbidden.lower() not in block.lower()
 
 
 def test_remote_handoff_fetches_canonical_master_and_reads_only_fixed_commit_path() -> None:

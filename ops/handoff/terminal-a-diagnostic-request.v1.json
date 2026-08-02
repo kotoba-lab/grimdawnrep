@@ -1,11 +1,11 @@
 {
-  "action": "post_selector_failure_readonly_probe",
+  "action": "post_selector_failure_stage_probe_readonly",
   "checks": [
-    "double_status_doctor",
+    "stage_mapped_status_doctor",
     "deployment_fingerprints",
     "vault_source_live_state_invariants",
     "stable_remote_main_and_lock",
-    "residual_selector_and_process_observation"
+    "bounded_remote_and_process_window_observation"
   ],
   "constraints": [
     "installed_local_fixed_block_only",
@@ -16,15 +16,15 @@
     "no_state_config_save_remote_ref_write",
     "no_fetched_code_execution"
   ],
-  "expires_at": "2026-08-02T02:05:37Z",
-  "issued_at": "2026-08-02T00:50:37Z",
+  "expires_at": "2026-08-02T03:18:24Z",
+  "issued_at": "2026-08-02T02:03:24Z",
   "kind": "grim_dawn_terminal_diagnostic_request",
   "leg": "A1",
-  "not_before": "2026-08-02T00:50:37Z",
+  "not_before": "2026-08-02T02:03:24Z",
   "observed_code": "remote_changed_or_unknown",
-  "request_id": "c4de6a93-1493-4bb6-b2c0-8f9ea406e2fd",
-  "response_sentinel": "TERMINAL_A_POST_SELECTOR_FAILURE_PROBE",
+  "request_id": "794cb2d0-b62f-4e9d-8aa8-2ba6714994bb",
+  "response_sentinel": "TERMINAL_A_POST_SELECTOR_FAILURE_STAGE_PROBE",
   "schema_version": "1.0.0",
-  "sequence": 9,
+  "sequence": 10,
   "target_machine_id": "desktop-a"
 }
