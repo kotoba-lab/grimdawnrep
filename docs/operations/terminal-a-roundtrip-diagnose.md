@@ -175,20 +175,17 @@ try {
     if (-not ($request.schema_version -is [string]) -or $request.schema_version -cne '1.0.0' -or
         -not ($request.kind -is [string]) -or
         $request.kind -cne 'grim_dawn_terminal_diagnostic_request' -or
-        -not ($request.sequence -is [int]) -or $request.sequence -ne 10 -or
+        -not ($request.sequence -is [int]) -or $request.sequence -ne 11 -or
         -not ($request.target_machine_id -is [string]) -or $request.target_machine_id -cne $machineId -or
         -not ($request.leg -is [string]) -or -not ($request.observed_code -is [string]) -or
         -not ($request.action -is [string]) -or -not ($request.response_sentinel -is [string]) -or
         -not ($request.request_id -is [string]) -or
         $request.leg -cne 'A1' -or $request.observed_code -cne 'remote_changed_or_unknown' -or
-        $request.action -cne 'post_selector_failure_stage_probe_readonly' -or
-        $request.response_sentinel -cne 'TERMINAL_A_POST_SELECTOR_FAILURE_STAGE_PROBE') { throw 'invalid' }
-    Assert-ExactArray $request.checks @('stage_mapped_status_doctor','deployment_fingerprints','vault_source_live_state_invariants',
-        'stable_remote_main_and_lock','bounded_remote_and_process_window_observation')
-    Assert-ExactArray $request.constraints @('installed_local_fixed_block_only','no_shortcut_ui_input_close_kill_or_game_start',
-        'no_fetch_or_vault_ref_write','no_lock_recover_restore_snapshot_bookmark_promote','no_commit_push_merge_rebase_reset_checkout',
-        'no_state_config_save_remote_ref_write',
-        'no_fetched_code_execution')
+        $request.action -cne 'package_artifact_substage_readonly' -or
+        $request.response_sentinel -cne 'TERMINAL_A_PACKAGE_ARTIFACT_PROBE') { throw 'invalid' }
+    Assert-ExactArray $request.checks @('two_pass_package_artifact_observation')
+    Assert-ExactArray $request.constraints @('installed_local_fixed_block_only','no_python_cli_git_network_com_ui_input_process_kill_or_write',
+        'no_save_state_config_vault_remote_ref_mutation','no_fetched_code_execution')
     $requestGuid = [Guid]::Empty
     if (-not [Guid]::TryParse([string]$request.request_id, [ref]$requestGuid) -or
         $requestGuid.ToString() -cne [string]$request.request_id) { throw 'invalid' }
@@ -270,6 +267,30 @@ $stage='bootstrap';try{
  $stage='final_process_window';try{$finalAll=@(Get-CimInstance Win32_Process -ErrorAction Stop);$finalGames=@($finalAll|Where-Object{$_.Name-in@('Grim Dawn.exe','DPYes.exe')});$wins=[StageProbeWindow]::Count($selectorTitle)}catch{throw 'process_observation_inconclusive'};if($finalGames.Count-ne 0){throw 'process_status_unexpected'}
  $relation=if($s1.vault_relation-eq'remote_changed_or_unknown'){'unknown'}else{[string]$s1.vault_relation};Write-Output (Out 'complete' 'complete' 'stage_probe_complete' $relation $finalRemote.lock 'clear' (Bucket $wins));exit 0
 }catch{$code=[string]$_.Exception.Message;$allowed=@('required_local_artifact_missing','source_probe_failed','vault_probe_failed','status_command_failed','status_shape_invalid','doctor_command_failed','doctor_shape_invalid','installed_manifest_mismatch','status_not_stable','doctor_not_stable','status_readiness_unexpected','vault_relation_unexpected','lock_or_recovery_present','process_status_unexpected','machine_id_unexpected','remote_advertisement_invalid','process_observation_inconclusive','post_invariant_changed','unexpected_failed');if($code-notin$allowed){$code='unexpected_failed'};Write-Output (Out 'blocked' $stage $code $null $null $null $null);exit 1}
+```
+
+## Package artifact substage probe (sequence 11)
+
+Run this installed local block only after the sequence 11 request block exits
+zero.  It is deliberately narrower than sequence 10: it observes only the six
+local artifacts that gate the `package` stage, twice, and does not invoke the
+application, a CLI, Git, networking, COM, a shortcut, UI input, or process
+control.  Its only output is a six-key, privacy-safe sentinel.
+
+```powershell
+$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue'
+$machineId='desktop-a';$toolRoot=Join-Path $env:LOCALAPPDATA 'GrimDawnSaveSyncTool'
+$config=Join-Path $env:LOCALAPPDATA 'GrimDawnSaveSync\config.local.json'
+$shortcut=Join-Path (Join-Path $env:USERPROFILE 'Desktop') 'Grim Dawn (DPYes + Save Selection).lnk'
+function Out($status,$stage,$code){[ordered]@{sentinel='TERMINAL_A_PACKAGE_ARTIFACT_PROBE';status=$status;leg='A1';machine_id=$machineId;stage=$stage;code=$code}|ConvertTo-Json -Compress}
+function Missing($p,$type){if(!(Test-Path -LiteralPath $p -PathType $type)){throw 'artifact_missing'}}
+function Digest($p){Missing $p 'Leaf';try{$h=[Security.Cryptography.SHA256]::Create();try{([BitConverter]::ToString($h.ComputeHash([IO.File]::ReadAllBytes($p)))).Replace('-','')}finally{$h.Dispose()}}catch{throw 'artifact_unreadable'}}
+function ToolDirectory(){try{$pkg=Join-Path $toolRoot '.venv\Lib\site-packages\grim_dawn_sync';Missing $pkg 'Container';[void](Get-ChildItem -LiteralPath $pkg -Force -ErrorAction Stop);[IO.Path]::GetFullPath($pkg)}catch{$code=[string]$_.Exception.Message;if($code-eq'artifact_missing'){throw $code};throw 'artifact_unreadable'}}
+function ToolIdentity(){try{$pkg=Join-Path $toolRoot '.venv\Lib\site-packages\grim_dawn_sync';Missing $pkg 'Container';$rows=@(Get-ChildItem -LiteralPath $pkg -Recurse -File -Filter *.py -ErrorAction Stop|Sort-Object FullName|ForEach-Object{$_.FullName.Substring($pkg.Length)+'='+(Digest $_.FullName)});if($rows.Count-eq 0){throw 'artifact_missing'};$h=[Security.Cryptography.SHA256]::Create();try{$bytes=[Text.Encoding]::UTF8.GetBytes($rows-join"`n");([BitConverter]::ToString($h.ComputeHash($bytes)).Replace('-',''))}finally{$h.Dispose()}}catch{$code=[string]$_.Exception.Message;if($code-in@('artifact_missing','artifact_unreadable')){throw $code};throw 'artifact_unreadable'}}
+function ConfigIdentity(){try{$raw=Digest $config;$v=Get-Content -LiteralPath $config -Raw -Encoding utf8|ConvertFrom-Json -ErrorAction Stop;if($v.save_root-isnot [string] -or [string]::IsNullOrWhiteSpace([string]$v.save_root)){throw 'artifact_unreadable'};[pscustomobject]@{value=$raw;live=[string]$v.save_root;state=Join-Path ([IO.Path]::GetDirectoryName($config)) 'state.json'}}catch{$code=[string]$_.Exception.Message;if($code-in@('artifact_missing','artifact_unreadable')){throw $code};throw 'artifact_unreadable'}}
+function TreeDigest($root){Missing $root 'Container';try{$base=[IO.Path]::GetFullPath($root).TrimEnd([char[]]'\')+'\';$rows=@();foreach($item in @(Get-ChildItem -LiteralPath $root -Recurse -File -Force -ErrorAction Stop|Sort-Object FullName)){$full=[IO.Path]::GetFullPath($item.FullName);if(!$full.StartsWith($base,[StringComparison]::OrdinalIgnoreCase)){throw 'artifact_unreadable'};$rows+=$full.Substring($base.Length)+'='+$item.Length+'='+(Digest $full)};$h=[Security.Cryptography.SHA256]::Create();try{$bytes=[Text.Encoding]::UTF8.GetBytes($rows-join"`n");([BitConverter]::ToString($h.ComputeHash($bytes))).Replace('-','')}finally{$h.Dispose()}}catch{$code=[string]$_.Exception.Message;if($code-in@('artifact_missing','artifact_unreadable')){throw $code};throw 'artifact_unreadable'}}
+function Observe(){ $x=[ordered]@{};$script:stage='installed_package_directory';$x.directory=ToolDirectory;$script:stage='installed_package_sources';$x.sources=ToolIdentity;$script:stage='config_file';$cfg=ConfigIdentity;$x.config=$cfg.value;$script:stage='state_file';$x.state=Digest $cfg.state;$script:stage='shortcut_file';$x.shortcut=Digest $shortcut;$script:stage='live_save_root';$x.live=TreeDigest $cfg.live;[pscustomobject]@{mark=($x.Values-join[char]0);stage=$script:stage} }
+$stage='bootstrap';try{$first=Observe;$stage='post_invariant';try{$second=Observe}catch{$script:stage='post_invariant';throw 'artifact_changed'};if($first.mark-cne$second.mark){$script:stage='post_invariant';throw 'artifact_changed'};Write-Output (Out 'complete' 'complete' 'package_artifact_probe_complete');exit 0}catch{$code=[string]$_.Exception.Message;$allowed=@('artifact_missing','artifact_unreadable','artifact_changed','unexpected_failed');if($code-notin$allowed){$code='unexpected_failed'};Write-Output (Out 'blocked' $stage $code);exit 1}
 ```
 
 ## Retired selector cancel/reload automation (sequence 8; DO NOT RUN)

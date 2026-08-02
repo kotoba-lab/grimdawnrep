@@ -1,30 +1,23 @@
 {
-  "action": "post_selector_failure_stage_probe_readonly",
+  "action": "package_artifact_substage_readonly",
   "checks": [
-    "stage_mapped_status_doctor",
-    "deployment_fingerprints",
-    "vault_source_live_state_invariants",
-    "stable_remote_main_and_lock",
-    "bounded_remote_and_process_window_observation"
+    "two_pass_package_artifact_observation"
   ],
   "constraints": [
     "installed_local_fixed_block_only",
-    "no_shortcut_ui_input_close_kill_or_game_start",
-    "no_fetch_or_vault_ref_write",
-    "no_lock_recover_restore_snapshot_bookmark_promote",
-    "no_commit_push_merge_rebase_reset_checkout",
-    "no_state_config_save_remote_ref_write",
+    "no_python_cli_git_network_com_ui_input_process_kill_or_write",
+    "no_save_state_config_vault_remote_ref_mutation",
     "no_fetched_code_execution"
   ],
-  "expires_at": "2026-08-02T05:05:53Z",
-  "issued_at": "2026-08-02T03:50:53Z",
+  "expires_at": "2026-08-02T05:37:00Z",
+  "issued_at": "2026-08-02T04:22:00Z",
   "kind": "grim_dawn_terminal_diagnostic_request",
   "leg": "A1",
-  "not_before": "2026-08-02T03:50:53Z",
+  "not_before": "2026-08-02T04:22:00Z",
   "observed_code": "remote_changed_or_unknown",
-  "request_id": "4e229b3f-664a-4907-8db2-5682bd557d90",
-  "response_sentinel": "TERMINAL_A_POST_SELECTOR_FAILURE_STAGE_PROBE",
+  "request_id": "6a79b8d4-e4f0-454a-88ca-734fdad8a2dd",
+  "response_sentinel": "TERMINAL_A_PACKAGE_ARTIFACT_PROBE",
   "schema_version": "1.0.0",
-  "sequence": 10,
+  "sequence": 11,
   "target_machine_id": "desktop-a"
 }

@@ -27,18 +27,11 @@ EXPECTED_KEYS = {
     "not_before",
     "expires_at",
 }
-EXPECTED_CHECKS = [
-    "stage_mapped_status_doctor", "deployment_fingerprints",
-    "vault_source_live_state_invariants", "stable_remote_main_and_lock",
-    "bounded_remote_and_process_window_observation",
-]
+EXPECTED_CHECKS = ["two_pass_package_artifact_observation"]
 EXPECTED_CONSTRAINTS = [
     "installed_local_fixed_block_only",
-    "no_shortcut_ui_input_close_kill_or_game_start",
-    "no_fetch_or_vault_ref_write",
-    "no_lock_recover_restore_snapshot_bookmark_promote",
-    "no_commit_push_merge_rebase_reset_checkout",
-    "no_state_config_save_remote_ref_write",
+    "no_python_cli_git_network_com_ui_input_process_kill_or_write",
+    "no_save_state_config_vault_remote_ref_mutation",
     "no_fetched_code_execution",
 ]
 FORBIDDEN_FIELDS = {
@@ -82,12 +75,12 @@ def test_terminal_a_request_has_exact_schema_identity_and_readonly_action() -> N
     assert set(payload) == EXPECTED_KEYS
     assert payload["schema_version"] == "1.0.0"
     assert payload["kind"] == "grim_dawn_terminal_diagnostic_request"
-    assert payload["sequence"] == 10
+    assert payload["sequence"] == 11
     assert payload["target_machine_id"] == "desktop-a"
     assert payload["leg"] == "A1" and payload["observed_code"] == "remote_changed_or_unknown"
-    assert payload["action"] == "post_selector_failure_stage_probe_readonly"
-    assert payload["response_sentinel"] == "TERMINAL_A_POST_SELECTOR_FAILURE_STAGE_PROBE"
-    assert payload["request_id"] == "4e229b3f-664a-4907-8db2-5682bd557d90"
+    assert payload["action"] == "package_artifact_substage_readonly"
+    assert payload["response_sentinel"] == "TERMINAL_A_PACKAGE_ARTIFACT_PROBE"
+    assert payload["request_id"] == "6a79b8d4-e4f0-454a-88ca-734fdad8a2dd"
     parsed_id = uuid.UUID(str(payload["request_id"]))
     assert str(parsed_id) == payload["request_id"]
 
@@ -114,9 +107,24 @@ def test_terminal_a_request_has_strict_utc_window_of_at_most_seventy_five_minute
         values[field] = parsed
     assert values["issued_at"] <= values["not_before"] < values["expires_at"]
     assert (values["expires_at"] - values["not_before"]).total_seconds() <= 4500
-    assert payload["issued_at"] == payload["not_before"] == "2026-08-02T03:50:53Z"
-    assert payload["expires_at"] == "2026-08-02T05:05:53Z"
+    assert payload["issued_at"] == payload["not_before"] == "2026-08-02T04:22:00Z"
+    assert payload["expires_at"] == "2026-08-02T05:37:00Z"
     assert (values["expires_at"] - values["not_before"]).total_seconds() == 4500
+
+
+def test_sequence_11_package_artifact_probe_is_exactly_bounded_and_readonly() -> None:
+    runbook = RUNBOOK_PATH.read_text(encoding="utf-8")
+    block = runbook.split("## Package artifact substage probe (sequence 11)", 1)[1].split("```powershell", 1)[1].split("```", 1)[0]
+
+    for stage in ("installed_package_directory", "installed_package_sources", "config_file", "state_file", "shortcut_file", "live_save_root", "post_invariant", "complete"):
+        assert f"'{stage}'" in block
+    for code in ("artifact_missing", "artifact_unreadable", "artifact_changed", "unexpected_failed"):
+        assert f"'{code}'" in block
+    assert "TERMINAL_A_PACKAGE_ARTIFACT_PROBE" in block
+    assert "ToolDirectory" in block and "ToolIdentity" in block and "TreeDigest" in block
+    assert "ConvertFrom-Json" in block and "save_root" in block
+    for forbidden in ("Start-Process", "New-Object -ComObject", "SendKeys", "PostMessage", "taskkill", "Get-CimInstance", " git", "-m grim_dawn_sync", "Invoke-WebRequest", "fetch", "commit", "push", "recover", "restore"):
+        assert forbidden.lower() not in block.lower()
 
 
 def test_sequence_10_stage_probe_has_closed_stages_codes_and_readonly_surface() -> None:
