@@ -325,6 +325,28 @@ Report exactly the single JSON line.  `pth_already_current` and `pth_repaired`
 are both successful, idempotent outcomes.  Any blocked result is fail-closed;
 do not launch the shortcut or run another repair.
 
+### Operator delivery integrity for dynamic quarantine
+
+A Terminal A dynamic-quarantine attempt correctly stopped with
+`core_file_missing` before it created a quarantine root or moved any content.
+The cause was an operator-delivery defect: rich-text copy/rendering transformed
+a dotted filename in the PowerShell block into a URL-like link.  It was not a
+quarantine logic failure.
+
+Any future copyable PowerShell quarantine block must construct the two
+link-prone filenames at runtime; do not emit either as a bare dotted filename
+in the block.  Use this form when building the required core-file list:
+
+```powershell
+$coreFiles = @(
+    ('SKILL'+[char]46+'md'),
+    (Join-Path 'agents' ('openai'+[char]46+'yaml'))
+)
+```
+
+This is a delivery-layer safeguard only.  The snapshot, manifest,
+`[IO.Directory]::Move`, and verification logic remain unchanged.
+
 ## Retired selector cancel/reload automation (sequence 8; DO NOT RUN)
 
 Sequence 8 is retained below only as a non-executable failure record.  It has

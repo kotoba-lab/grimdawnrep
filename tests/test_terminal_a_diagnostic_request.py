@@ -81,7 +81,7 @@ def test_terminal_a_request_has_exact_schema_identity_and_bounded_repair_action(
     assert payload["leg"] == "A1" and payload["observed_code"] == "remote_changed_or_unknown"
     assert payload["action"] == "source_path_runtime_repair"
     assert payload["response_sentinel"] == "TERMINAL_A_SOURCE_PATH_REPAIR"
-    assert payload["request_id"] == "79fbbdbb-6f6e-421a-aa91-9e069cbf93f1"
+    assert payload["request_id"] == "dd053eb5-3863-4250-bcdf-21e41e8fb5be"
     parsed_id = uuid.UUID(str(payload["request_id"]))
     assert str(parsed_id) == payload["request_id"]
 
@@ -108,8 +108,8 @@ def test_terminal_a_request_has_strict_utc_window_of_at_most_seventy_five_minute
         values[field] = parsed
     assert values["issued_at"] <= values["not_before"] < values["expires_at"]
     assert (values["expires_at"] - values["not_before"]).total_seconds() <= 4500
-    assert payload["issued_at"] == payload["not_before"] == "2026-08-02T05:20:00Z"
-    assert payload["expires_at"] == "2026-08-02T06:35:00Z"
+    assert payload["issued_at"] == payload["not_before"] == "2026-08-02T07:12:04Z"
+    assert payload["expires_at"] == "2026-08-02T08:27:04Z"
     assert (values["expires_at"] - values["not_before"]).total_seconds() == 4500
 
 
@@ -130,6 +130,18 @@ def test_sequence_11_false_diagnostic_is_retired_and_sequence_12_is_exactly_boun
     assert "if($changed-and!$success)" in block and "[IO.File]::Move($pth,$rollback)" in block
     for forbidden in ("pip", "Start-Process", "New-Object -ComObject", "SendKeys", "PostMessage", "taskkill", "Get-CimInstance", " git", "Invoke-WebRequest", "fetch", "commit", "push", "config.local", "state.json", "save_root", "vault_repo"):
         assert forbidden.lower() not in block.lower()
+
+
+def test_dynamic_quarantine_operator_delivery_constructs_link_prone_filenames() -> None:
+    runbook = RUNBOOK_PATH.read_text(encoding="utf-8")
+    delivery = runbook.split("### Operator delivery integrity for dynamic quarantine", 1)[1].split(
+        "## Retired selector cancel/reload automation", 1
+    )[0]
+
+    assert "('SKILL'+[char]46+'md')" in delivery
+    assert "(Join-Path 'agents' ('openai'+[char]46+'yaml'))" in delivery
+    assert "SKILL.md" not in delivery
+    assert "openai.yaml" not in delivery
 
 
 def test_sequence_10_stage_probe_has_closed_stages_codes_and_readonly_surface() -> None:
