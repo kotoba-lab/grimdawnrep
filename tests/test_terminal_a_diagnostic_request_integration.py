@@ -870,7 +870,7 @@ def test_post_selector_failure_probe_rejects_source_or_vault_observation_drift(h
         assert result.returncode == 1 and result.stderr == ""
         assert row["code"] == "observation_changed"
         assert row["safe_to_retry"] is False
-        assert row["live_unchanged"] is False
+        assert "live_unchanged" not in row
         for secret in (str(base), paths["remote"], paths["baseline"], "FETCH_HEAD"):
             assert secret not in result.stdout
 
@@ -904,7 +904,7 @@ def test_post_selector_failure_probe_rejects_real_local_or_remote_mutation(hook:
         row = json.loads(result.stdout)
         assert result.returncode == 1 and result.stderr == ""
         assert row["code"] == "observation_changed"
-        assert row["safe_to_retry"] is False and row["live_unchanged"] is False
+        assert row["safe_to_retry"] is False and "live_unchanged" not in row
 
 
 @pytest.mark.parametrize("hook", ["remote_lock"])
@@ -970,6 +970,87 @@ def test_remote_diff_summary_block_parses_in_windows_powershell_51() -> None:
         assert result.returncode == 0, result.stderr
 
 
+@pytest.mark.parametrize(
+    ("section_marker", "function_marker", "next_function", "call"),
+    [
+        (
+            "## Operator-mediated public remote request",
+            "function Invoke-GitLines",
+            "function Get-OneGitLine",
+            "$x=@(Invoke-GitLines @('status'))",
+        ),
+        (
+            "## Copy-paste execution",
+            "function Invoke-GitLines",
+            "function Get-OneGitLine",
+            "$x=@(Invoke-GitLines -Repo $repo -CommandArgs @('status'))",
+        ),
+        (
+            "## Copy-paste execution: validated remote diff summary",
+            "function GitLines",
+            "function GitOne",
+            "$x=@(GitLines -Repo $repo -CommandArgs @('status'))",
+        ),
+    ],
+)
+def test_git_line_helpers_accept_exit_zero_stderr_in_windows_powershell_51(
+    section_marker: str, function_marker: str, next_function: str, call: str
+) -> None:
+    with tempfile.TemporaryDirectory(prefix="terminal-a-stderr-warning-") as raw:
+        base = Path(raw)
+        shim = base / "git.cmd"
+        shim.write_text(
+            "@echo off\r\necho harmless warning 1>&2\r\necho value\r\nexit /b 0\r\n",
+            encoding="ascii",
+        )
+        section = RUNBOOK.read_text(encoding="utf-8").split(section_marker, 1)[1]
+        block = section.split("```powershell", 1)[1].split("```", 1)[0]
+        helper = block[block.index(function_marker):block.index(next_function)]
+        script = base / "stderr-warning.ps1"
+        script.write_text(
+            "$ErrorActionPreference='Stop'\n$source=$env:WARNING_REPO\n$repo=$env:WARNING_REPO\n"
+            + helper
+            + "\n"
+            + call
+            + "\nif($ErrorActionPreference -cne 'Stop' -or $x.Count -ne 1 -or $x[0] -cne 'value'){exit 2}\nWrite-Output ok\n",
+            encoding="utf-8-sig",
+        )
+        env = os.environ.copy()
+        env["WARNING_REPO"] = str(base)
+        env["PATH"] = str(base) + os.pathsep + env["PATH"]
+        result = subprocess.run(
+            [str(POWERSHELL), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(script)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            env=env,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stdout == "ok\n" and result.stderr == ""
+
+
+def test_every_executable_runbook_powershell_block_parses_in_windows_powershell_51() -> None:
+    blocks = re.findall(r"```powershell\r?\n(.*?)```", RUNBOOK.read_text(encoding="utf-8"), re.DOTALL)
+    assert len(blocks) >= 5
+    with tempfile.TemporaryDirectory(prefix="terminal-a-all-parse-") as raw:
+        base = Path(raw)
+        parser = base / "parse.ps1"
+        parser.write_text(
+            "$t=$null;$e=$null;[void][System.Management.Automation.Language.Parser]::ParseFile($args[0],[ref]$t,[ref]$e);if($e.Count){$e|ForEach-Object{$_.Message};exit 1}",
+            encoding="utf-8-sig",
+        )
+        for index, block in enumerate(blocks):
+            script = base / f"block-{index}.ps1"
+            script.write_text(block, encoding="utf-8-sig")
+            result = subprocess.run(
+                [str(POWERSHELL), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(parser), str(script)],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+            )
+            assert result.returncode == 0, f"block {index}: {result.stdout}{result.stderr}"
+
+
 def test_post_failure_probe_remote_advertisement_detects_real_main_race() -> None:
     with tempfile.TemporaryDirectory(prefix="terminal-a-postfailure-main-race-") as raw:
         base = Path(raw)
@@ -995,17 +1076,13 @@ def test_post_failure_probe_remote_advertisement_detects_real_main_race() -> Non
         assert paths["remote"] not in result.stdout
 
 
-def test_selector_dry_run_blocked_output_is_unknown_in_windows_powershell_51() -> None:
-    with tempfile.TemporaryDirectory(prefix="terminal-a-dryrun-out-") as raw:
-        block = RUNBOOK.read_text(encoding="utf-8").split("## Selector cancel/reload dry-run block", 1)[1].split("```powershell", 1)[1].split("```", 1)[0]
-        function = block.split("function Json", 1)[0]
-        script = Path(raw) / "out.ps1"
-        script.write_text("$machineId='desktop-a'\n" + function + "\nOut-DryRun 'blocked' 'selector_failed' $true $true $true 'fake' 'one' $false $false\n", encoding="utf-8-sig")
-        result = subprocess.run([str(POWERSHELL), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(script)], capture_output=True, text=True, encoding="utf-8")
-        row = json.loads(result.stdout)
-        assert result.returncode == 0 and result.stderr == ""
-        assert row == {"sentinel":"TERMINAL_A_SELECTOR_DRY_RUN","status":"blocked","leg":"A1","machine_id":"desktop-a","observations_valid":False,"first_cancelled":None,"reload_completed":None,"second_cancelled":None,"selector_visible_count":None,"default_role":"unknown","candidate_count_bucket":"unknown","game_started":None,"mutations_detected":None,"code":"selector_failed"}
-        assert result.stdout.count("\n") == 1
+def test_sequence_8_selector_automation_is_not_an_executable_powershell_block() -> None:
+    section = RUNBOOK.read_text(encoding="utf-8").split(
+        "## Retired selector cancel/reload automation (sequence 8; DO NOT RUN)", 1
+    )[1].split("Continue only when", 1)[0]
+    assert "```powershell" not in section
+    assert "```text" in section
+    assert "operator must perform the visible Esc/F5 actions manually" in section
 
 
 def test_sequence_9_request_block_parses_in_windows_powershell_51() -> None:
@@ -1086,6 +1163,29 @@ def test_sequence_10_stage_probe_maps_remote_lock_and_process_observation() -> N
                 script.write_text(script.read_text(encoding="utf-8-sig").replace("Get-CimInstance Win32_Process -ErrorAction Stop", "throw 'fixture'"), encoding="utf-8-sig")
                 expected = ("process_window", "process_observation_inconclusive")
             _assert_stage_failure(_invoke(script, env), *expected)
+
+
+def test_sequence_10_stage_probe_reports_semantic_and_final_process_stages() -> None:
+    with tempfile.TemporaryDirectory(prefix="terminal-a-stage-semantic-") as raw:
+        base = Path(raw); env, _paths = _prepare_stage_case(base); script = _stage_probe_script(base)
+        text = script.read_text(encoding="utf-8-sig")
+        text = text.replace(
+            "$stage='semantic';if($d1.machine_id-cne$machineId)",
+            "$stage='semantic';$d1.machine_id='desktop-b';if($d1.machine_id-cne$machineId)",
+        )
+        script.write_text(text, encoding="utf-8-sig")
+        _assert_stage_failure(_invoke(script, env), "semantic", "machine_id_unexpected")
+
+    with tempfile.TemporaryDirectory(prefix="terminal-a-stage-final-process-") as raw:
+        base = Path(raw); env, _paths = _prepare_stage_case(base); script = _stage_probe_script(base)
+        text = script.read_text(encoding="utf-8-sig")
+        marker = "Get-CimInstance Win32_Process -ErrorAction Stop"
+        before, found, after = text.rpartition(marker)
+        assert found
+        script.write_text(before + "throw 'fixture'" + after, encoding="utf-8-sig")
+        _assert_stage_failure(
+            _invoke(script, env), "final_process_window", "process_observation_inconclusive"
+        )
 
 
 @pytest.mark.parametrize(("hook","code"), [

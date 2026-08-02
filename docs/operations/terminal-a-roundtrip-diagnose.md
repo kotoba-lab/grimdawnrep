@@ -59,8 +59,14 @@ function Write-RequestBlocked {
 }
 
 function Invoke-GitLines([string[]]$GitArgs) {
-    $lines = @(& git -C $source @GitArgs 2>$null)
-    if ($LASTEXITCODE -ne 0) { throw 'invalid' }
+    $priorErrorAction = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $lines = @(& git -C $source @GitArgs 2>$null)
+        $gitExitCode = $LASTEXITCODE
+    }
+    finally { $ErrorActionPreference = $priorErrorAction }
+    if ($gitExitCode -ne 0) { throw 'invalid' }
     return @($lines)
 }
 
@@ -151,8 +157,8 @@ try {
     $requestCommit = $fetchHead
 
     $stage = 'blob'
-    $requestLines = @(& git -C $source show "$requestCommit`:$requestObjectPath" 2>$null)
-    if ($LASTEXITCODE -ne 0 -or $requestLines.Count -eq 0) { throw 'invalid' }
+    $requestLines = @(Invoke-GitLines @('show',"$requestCommit`:$requestObjectPath"))
+    if ($requestLines.Count -eq 0) { throw 'invalid' }
     $requestRaw = @($requestLines) -join "`n"
     $requestBytes = [Text.Encoding]::UTF8.GetByteCount($requestRaw + "`n")
     if ($requestBytes -gt 4096 -or $requestRaw.Length -eq 0 -or
@@ -215,9 +221,11 @@ catch {
 
 Run this **installed local block only** after the sequence 10 request block
 exits zero.  It is a bounded, read-only diagnosis: it does not open a shortcut,
-touch a window, send input, fetch, alter refs, or change a process.  Its output
-contains only the failing stage and fixed allow-listed code; successful output
-adds only aggregate relation, lock, process, and exact-title window buckets.
+touch a window, send input, fetch, alter refs, or change any pre-existing
+process.  A timed-out native command is the sole exception: the block terminates
+only the process tree that it started for that command.  Its output contains
+only the failing stage and fixed allow-listed code; successful output adds only
+aggregate relation, lock, process, and exact-title window buckets.
 
 ```powershell
 $ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue'
@@ -256,25 +264,27 @@ $stage='bootstrap';try{
  $stage='process_window';try{$all=@(Get-CimInstance Win32_Process -ErrorAction Stop);$games=@($all|Where-Object{$_.Name-in@('Grim Dawn.exe','DPYes.exe')})}catch{throw 'process_observation_inconclusive'};if($games.Count-ne 0){throw 'process_status_unexpected'}
  $stage='status_second';$s2=Json 'status' 'status_command_failed';try{$sp2=StatusProjection $s2}catch{throw 'status_not_stable'};if($sp1-cne$sp2){throw 'status_not_stable'}
  $stage='doctor_second';$d2=Json 'doctor' 'doctor_command_failed';try{$dp2=DoctorProjection $d2}catch{throw 'doctor_not_stable'};if($dp1-cne$dp2){throw 'doctor_not_stable'}
- if($d1.machine_id-cne$machineId){throw 'machine_id_unexpected'};if($s1.readiness-notin@('blocked','ready')){throw 'status_readiness_unexpected'};if($s1.vault_relation-notin@('equal','remote_ahead','local_ahead','diverged','unknown','remote_changed_or_unknown')){throw 'vault_relation_unexpected'};if($null-ne$s1.active_lock -or $null-ne$s1.recovery_phase){throw 'lock_or_recovery_present'}
+ $stage='semantic';if($d1.machine_id-cne$machineId){throw 'machine_id_unexpected'};if($s1.readiness-notin@('blocked','ready')){throw 'status_readiness_unexpected'};if($s1.vault_relation-notin@('equal','remote_changed_or_unknown','unborn','remote_missing')){throw 'vault_relation_unexpected'};if($null-ne$s1.active_lock -or $null-ne$s1.recovery_phase){throw 'lock_or_recovery_present'}
  $stage='post_invariant';$after=@((ToolIdentity $python),(Digest $config),(Digest $state),(Digest $shortcut),(TreeDigest $live));$afterSource=RepoMark $source 'source_probe_failed';$afterVault=RepoMark $vault 'vault_probe_failed';$lateDoctor=Json 'doctor' 'doctor_command_failed';[void](DoctorProjection $lateDoctor);$lateInstalled=InstalledRoot $live;if((($before -join [char]0) -cne ($after -join [char]0)) -or ($beforeSource -cne $afterSource) -or ($beforeVault -cne $afterVault) -or ([string]$lateDoctor.checks.save_root.manifest.root_hash-cne[string]$d1.checks.save_root.manifest.root_hash) -or ($lateInstalled-cne$installed)){throw 'post_invariant_changed'}
  $finalRemote=Remote $vault;if($finalRemote.raw-cne$r1.raw){throw 'remote_advertisement_invalid'}
- try{$wins=[StageProbeWindow]::Count($selectorTitle)}catch{throw 'process_observation_inconclusive'}
+ $stage='final_process_window';try{$finalAll=@(Get-CimInstance Win32_Process -ErrorAction Stop);$finalGames=@($finalAll|Where-Object{$_.Name-in@('Grim Dawn.exe','DPYes.exe')});$wins=[StageProbeWindow]::Count($selectorTitle)}catch{throw 'process_observation_inconclusive'};if($finalGames.Count-ne 0){throw 'process_status_unexpected'}
  $relation=if($s1.vault_relation-eq'remote_changed_or_unknown'){'unknown'}else{[string]$s1.vault_relation};Write-Output (Out 'complete' 'complete' 'stage_probe_complete' $relation $finalRemote.lock 'clear' (Bucket $wins));exit 0
 }catch{$code=[string]$_.Exception.Message;$allowed=@('required_local_artifact_missing','source_probe_failed','vault_probe_failed','status_command_failed','status_shape_invalid','doctor_command_failed','doctor_shape_invalid','installed_manifest_mismatch','status_not_stable','doctor_not_stable','status_readiness_unexpected','vault_relation_unexpected','lock_or_recovery_present','process_status_unexpected','machine_id_unexpected','remote_advertisement_invalid','process_observation_inconclusive','post_invariant_changed','unexpected_failed');if($code-notin$allowed){$code='unexpected_failed'};Write-Output (Out 'blocked' $stage $code $null $null $null $null);exit 1}
 ```
 
-## Selector cancel/reload dry-run block
+## Retired selector cancel/reload automation (sequence 8; DO NOT RUN)
 
-Run this deployed, local block only after the request block exits zero. It
-uses the existing Selection shortcut exactly twice.  The first visible
-selector is cancelled; the second receives exactly one `F5`, waits for the
-rebuilt selector, then is cancelled.  Never select a row, activate Launch,
-confirm a dialog, or retry a click.  A title mismatch, timeout, second
-instance, game/DPYes process, or any observation other than the designated
-`refs/remotes/origin/main` catalog-tracking transition is blocked.
+Sequence 8 is retained below only as a non-executable failure record.  It has
+a PowerShell parse defect and its generic `EnumWindows` delegate cannot be
+marshaled by Windows PowerShell 5.1.  Do not copy, repair, or run this block.
 
-```powershell
+For T7, an operator must perform the visible Esc/F5 actions manually.  Run the
+sequence 10 read-only stage probe immediately before and after those actions to
+verify the source, Vault, state, live-save, remote-advertisement, process, and
+selector-window invariants.  Never select a row, activate Launch, or confirm a
+dialog.
+
+```text
 $ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue'
 $toolRoot=Join-Path $env:LOCALAPPDATA 'GrimDawnSaveSyncTool';$python=Join-Path $toolRoot '.venv\Scripts\python.exe'
 $config=Join-Path $env:LOCALAPPDATA 'GrimDawnSaveSync\config.local.json';$source=Join-Path $env:USERPROFILE 'grimdawnrep';$machineId='desktop-a'
@@ -380,8 +390,10 @@ function Write-Classification([string]$Status, [string]$Classification, [string]
     [ordered]@{ sentinel = 'TERMINAL_A_REMOTE_CLASSIFICATION'; status = $Status; leg = 'A1'; machine_id = $machineId; classification = $Classification; content = $Content; code = $Code } | ConvertTo-Json -Compress
 }
 function Invoke-GitLines([string]$Repo, [string[]]$CommandArgs) {
-    $lines = @(& git -C $Repo @CommandArgs 2>$null)
-    if ($LASTEXITCODE -ne 0) { throw 'invalid' }
+    $priorErrorAction = $ErrorActionPreference
+    try { $ErrorActionPreference = 'Continue'; $lines = @(& git -C $Repo @CommandArgs 2>$null); $code = $LASTEXITCODE }
+    finally { $ErrorActionPreference = $priorErrorAction }
+    if ($code -ne 0) { throw 'invalid' }
     return @($lines)
 }
 function Get-OneGitLine([string]$Repo, [string[]]$CommandArgs) {
@@ -404,8 +416,10 @@ function Test-GitAncestor([string]$Repo, [string]$Ancestor, [string]$Descendant)
     throw 'invalid'
 }
 function Get-Json([string[]]$CommandArgs) {
-    $output = @(& $python -m grim_dawn_sync --config $config --json @CommandArgs 2>$null)
-    if ($LASTEXITCODE -ne 0) { throw 'invalid' }
+    $priorErrorAction = $ErrorActionPreference
+    try { $ErrorActionPreference = 'Continue'; $output = @(& $python -m grim_dawn_sync --config $config --json @CommandArgs 2>$null); $code = $LASTEXITCODE }
+    finally { $ErrorActionPreference = $priorErrorAction }
+    if ($code -ne 0) { throw 'invalid' }
     try { return ((@($output) -join [Environment]::NewLine) | ConvertFrom-Json -ErrorAction Stop) }
     catch { throw 'invalid' }
 }
@@ -481,8 +495,7 @@ try {
     Invoke-GitQuiet -Repo $vault -CommandArgs @('fetch','--no-tags','--no-write-fetch-head','origin',$remoteHead)
     $localIsAncestor = Test-GitAncestor $vault $localHead $remoteHead
     $remoteIsAncestor = Test-GitAncestor $vault $remoteHead $localHead
-    $manifestRaw = @(& git -C $vault show "$remoteHead`:.sync/manifest.json" 2>$null) -join "`n"
-    if ($LASTEXITCODE -ne 0) { throw 'invalid' }
+    $manifestRaw = @(Invoke-GitLines -Repo $vault -CommandArgs @('show',"$remoteHead`:.sync/manifest.json")) -join "`n"
     $remoteManifest = $manifestRaw | ConvertFrom-Json -ErrorAction Stop
     $liveRoot = [string]$doctor.checks.save_root.manifest.root_hash
     if ($liveRoot -notmatch '^[0-9a-f]{64}$' -or $remoteManifest.root_hash -notmatch '^[0-9a-f]{64}$') { throw 'invalid' }
@@ -525,11 +538,11 @@ function Out-Summary($Status,$Code,$Live,$Base,$Core,$Other,$Outside) {
     else{$row[$entry[0]]=$entry[1]}}
   $row|ConvertTo-Json -Compress -Depth 4
 }
-function GitLines($Repo,[string[]]$CommandArgs){$x=@(& git -C $Repo @CommandArgs 2>$null);if($LASTEXITCODE -ne 0){throw 'invalid'};return @($x)}
+function GitLines($Repo,[string[]]$CommandArgs){$old=$ErrorActionPreference;try{$ErrorActionPreference='Continue';$x=@(& git -C $Repo @CommandArgs 2>$null);$rc=$LASTEXITCODE}finally{$ErrorActionPreference=$old};if($rc -ne 0){throw 'invalid'};return @($x)}
 function GitOne($Repo,[string[]]$CommandArgs){$x=@(GitLines -Repo $Repo -CommandArgs $CommandArgs);if($x.Count -ne 1){throw 'invalid'};return ([string]$x[0]).Trim()}
 function GitQuiet($Repo,[string[]]$CommandArgs){$old=$ErrorActionPreference;try{$ErrorActionPreference='Continue';& git -C $Repo @CommandArgs 1>$null 2>$null;$rc=$LASTEXITCODE}finally{$ErrorActionPreference=$old};if($rc -ne 0){throw 'invalid'}}
 function HashFile($Path){if(!(Test-Path -LiteralPath $Path -PathType Leaf)){return 'missing'};$s=[IO.File]::Open($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read);$h=[Security.Cryptography.SHA256]::Create();try{return([BitConverter]::ToString($h.ComputeHash($s))).Replace('-','')}finally{$h.Dispose();$s.Dispose()}}
- function Json([string[]]$CommandArgs){$x=@(& $python -m grim_dawn_sync --config $config --json @CommandArgs 2>$null);if($LASTEXITCODE -ne 0){throw 'invalid'};try{return (($x -join [Environment]::NewLine)|ConvertFrom-Json -ErrorAction Stop)}catch{throw 'invalid'}}
+ function Json([string[]]$CommandArgs){$old=$ErrorActionPreference;try{$ErrorActionPreference='Continue';$x=@(& $python -m grim_dawn_sync --config $config --json @CommandArgs 2>$null);$rc=$LASTEXITCODE}finally{$ErrorActionPreference=$old};if($rc -ne 0){throw 'invalid'};try{return (($x -join [Environment]::NewLine)|ConvertFrom-Json -ErrorAction Stop)}catch{throw 'invalid'}}
  function FetchMark($Vault){$p=GitOne -Repo $Vault -CommandArgs @('rev-parse','--git-path','FETCH_HEAD');if(![IO.Path]::IsPathRooted($p)){$p=Join-Path $Vault $p};return (HashFile $p)}
  function LocalMark($Vault,$State){return (@((GitOne -Repo $source -CommandArgs @('symbolic-ref','--quiet','HEAD')),(GitOne -Repo $source -CommandArgs @('rev-parse','HEAD')),((GitLines -Repo $source -CommandArgs @('status','--porcelain=v1','--untracked-files=all'))-join "`n"),(HashFile $python),(HashFile $config),(HashFile $State),((GitLines -Repo $Vault -CommandArgs @('status','--porcelain=v1','--untracked-files=all'))-join "`n"),(GitOne -Repo $Vault -CommandArgs @('rev-parse','HEAD')),((GitLines -Repo $Vault -CommandArgs @('for-each-ref','--sort=refname','--format=%(refname) %(objectname)','refs'))-join "`n"),(FetchMark $Vault)) -join "`0")}
 function Manifest($Vault,$Commit){
@@ -538,7 +551,7 @@ function Manifest($Vault,$Commit){
   # root hash and verifies every declared blob plus save-tree exactness.
   $probe='from pathlib import Path; from grim_dawn_sync.git_vault import GitVault; import sys; GitVault(Path(sys.argv[1])).validate_commit_snapshot(sys.argv[2])'
   $prior=$ErrorActionPreference;try{$ErrorActionPreference='Continue';& $python -c $probe $Vault $Commit 1>$null 2>$null;$rc=$LASTEXITCODE}finally{$ErrorActionPreference=$prior};if($rc -ne 0){throw 'invalid'}
-  $raw=@(& git -C $Vault show "$Commit`:.sync/manifest.json" 2>$null)-join "`n";if($LASTEXITCODE -ne 0 -or !$raw){throw 'invalid'}
+  $raw=@(GitLines -Repo $Vault -CommandArgs @('show',"$Commit`:.sync/manifest.json"))-join "`n";if(!$raw){throw 'invalid'}
   try{$m=$raw|ConvertFrom-Json -ErrorAction Stop}catch{throw 'invalid'}
   if($m.root_hash -notmatch '^[0-9a-f]{64}$' -or !($m.files -is [array]) -or $m.file_count -ne $m.files.Count){throw 'invalid'}
   return $m
@@ -691,9 +704,12 @@ or a proposed recovery command.
 
 Run this **installed local block only** after the sequence 9 request block
 exits zero.  It neither opens the shortcut nor sends input.  It never fetches,
-closes or kills a process, and it does not write any source, Vault, state,
-configuration, save, or remote ref.  A residual selector is reported and left
-untouched.  The sole output is aggregate buckets and booleans.
+closes or kills a pre-existing process, and it does not write any source,
+Vault, state, configuration, save, or remote ref.  A timed-out native command
+is cleaned up by terminating only the process tree started for that command.
+A residual selector is reported and left untouched.  Blocked output contains
+only the decision and allow-listed code; aggregate observations are emitted
+only after the complete path validates them.
 
 ```powershell
 $ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue'
@@ -719,7 +735,7 @@ function TreeDigest([string]$root){
   finally{$h.Dispose()}
 }
 function Q($s){return '"'+([string]$s).Replace('"','\"')+'"'}
-function StopTree($pid){$psi=New-Object Diagnostics.ProcessStartInfo;$psi.FileName=(Join-Path $env:SystemRoot 'System32\taskkill.exe');$psi.Arguments='/PID '+[int]$pid+' /T /F';$psi.UseShellExecute=$false;$psi.CreateNoWindow=$true;$psi.RedirectStandardOutput=$true;$psi.RedirectStandardError=$true;$p=New-Object Diagnostics.Process;$p.StartInfo=$psi;if($p.Start()){[void]$p.WaitForExit(5000);if(!$p.HasExited){$p.Kill()}}}
+function StopTree($targetPid){$psi=New-Object Diagnostics.ProcessStartInfo;$psi.FileName=(Join-Path $env:SystemRoot 'System32\taskkill.exe');$psi.Arguments='/PID '+[int]$targetPid+' /T /F';$psi.UseShellExecute=$false;$psi.CreateNoWindow=$true;$psi.RedirectStandardOutput=$true;$psi.RedirectStandardError=$true;$p=New-Object Diagnostics.Process;$p.StartInfo=$psi;if($p.Start()){[void]$p.WaitForExit(5000);if(!$p.HasExited){$p.Kill()}}}
 function Native($file,[string[]]$argv,$failure,$timeoutMs){$out=[IO.Path]::GetTempFileName();$err=[IO.Path]::GetTempFileName();try{$psi=New-Object Diagnostics.ProcessStartInfo;$psi.FileName=$file;$psi.Arguments=(($argv|ForEach-Object{Q $_}) -join ' ');$psi.UseShellExecute=$false;$psi.CreateNoWindow=$true;$psi.RedirectStandardOutput=$true;$psi.RedirectStandardError=$true;$psi.EnvironmentVariables['GIT_TERMINAL_PROMPT']='0';$psi.EnvironmentVariables['GCM_INTERACTIVE']='Never';$p=New-Object Diagnostics.Process;$p.StartInfo=$psi;if(!$p.Start()){throw $failure};$ot=$p.StandardOutput.ReadToEndAsync();$et=$p.StandardError.ReadToEndAsync();if(!$p.WaitForExit($timeoutMs)){StopTree $p.Id;throw $failure};$o=$ot.GetAwaiter().GetResult();$e=$et.GetAwaiter().GetResult();[IO.File]::WriteAllText($out,$o);[IO.File]::WriteAllText($err,$e);if($p.ExitCode -ne 0){throw $failure};return @($o -split "`r?`n"|Where-Object{$_ -ne ''})}finally{Remove-Item -LiteralPath $out,$err -Force -ErrorAction SilentlyContinue}}
 function Git($r,[string[]]$a){$timeout=15000;if($a -contains 'ls-remote'){$timeout=60000};return @(Native 'git' (@('-C',$r)+$a) 'observation_changed' $timeout)}
 function One($r,[string[]]$a){$v=@(Git $r $a);if($v.Count -ne 1){throw 'observation_changed'};return ([string]$v[0]).Trim()}
@@ -741,6 +757,8 @@ function RemoteAdvertisement($r){
   return ($rows -join "`n")
 }
 function Json($command){$v=@(Native $python @('-m','grim_dawn_sync','--config',$config,'--json',$command) 'precondition_failed' 60000);return (($v -join "`n")|ConvertFrom-Json -ErrorAction Stop)}
+function StatusProjection($v){if($null-eq$v -or $v.schema_version-cne'1.0.0' -or $v.command-cne'status' -or $v.readiness-isnot[string] -or $v.vault_relation-isnot[string] -or $v.last_pushed_commit-isnot[string] -or $null-eq$v.processes -or $v.processes.complete-ne$true -or $v.processes.status-isnot[string]){throw 'precondition_failed'};([string]$v.schema_version)+'|'+([string]$v.command)+'|'+([string]$v.readiness)+'|'+([string]$v.vault_relation)+'|'+([string]$v.last_pushed_commit)+'|'+[string]($null-ne$v.active_lock)+'|'+[string]($null-ne$v.recovery_phase)+'|'+[string]$v.processes.complete+'|'+[string]$v.processes.status}
+function DoctorProjection($v){if($null-eq$v -or $v.schema_version-cne'1.0.0' -or $v.command-cne'doctor' -or $v.read_only-ne$true -or $v.machine_id-isnot[string] -or $v.passed-ne$true -or $v.checks.save_root.manifest.root_hash-notmatch'^[0-9a-f]{64}$'){throw 'precondition_failed'};([string]$v.schema_version)+'|'+([string]$v.command)+'|'+[string]$v.read_only+'|'+([string]$v.machine_id)+'|'+[string]$v.passed+'|'+([string]$v.checks.save_root.manifest.root_hash)}
 function InstalledManifestRoot($root){
   # This invokes the fixed installed package, never public source code.
   $probe='from pathlib import Path; import re,sys; from grim_dawn_sync.manifest import build_manifest; v=build_manifest(Path(sys.argv[1]),machine_id=sys.argv[2]).get("root_hash"); sys.exit(2) if not isinstance(v,str) or re.fullmatch(r"[0-9a-f]{64}",v) is None else print(v)'
@@ -751,12 +769,12 @@ function InstalledManifestRoot($root){
 function ToolIdentity($p){if(!(Test-Path -LiteralPath $p -PathType Leaf)){throw 'precondition_failed'};$pkg=Join-Path ([IO.Path]::GetDirectoryName([IO.Path]::GetDirectoryName($p))) 'Lib\site-packages\grim_dawn_sync';if(!(Test-Path -LiteralPath $pkg -PathType Container)){throw 'precondition_failed'};$py=@(Get-ChildItem -LiteralPath $pkg -Recurse -File -Filter *.py|Sort-Object FullName);if($py.Count -eq 0){throw 'precondition_failed'};$rows=@($py|ForEach-Object{$rel=$_.FullName.Substring($pkg.Length);$rel+'='+(FileDigest -p $_.FullName)});$meta=Get-Item -LiteralPath $p;return @([IO.Path]::GetFullPath($p),$meta.Length,$meta.LastWriteTimeUtc.Ticks,($rows -join "`n")) -join "`0"}
 function Windows(){try{return @([ProbeWindow]::Matching($selectorTitle)|ForEach-Object{[pscustomobject]@{pid=$_}})}catch{throw 'process_observation_inconclusive'}}
 function Processes(){try{return @(Get-CimInstance Win32_Process -ErrorAction Stop)}catch{throw 'process_observation_inconclusive'}}
-function Out($status,$code,$safe,$selector,$owned,$py,$ps,$unchanged){[ordered]@{sentinel='TERMINAL_A_POST_SELECTOR_FAILURE_PROBE';status=$status;leg='A1';machine_id=$machineId;status_expected=($code -ne 'precondition_failed');lock_clear=($code -ne 'precondition_failed');recovery_clear=($code -ne 'precondition_failed');game_processes_clear=($code -ne 'process_observation_inconclusive');remote_lock_clear=($code -ne 'observation_changed');remote_stable=($code -ne 'observation_changed');live_unchanged=$unchanged;state_unchanged=$unchanged;vault_unchanged=$unchanged;source_unchanged=$unchanged;selector_window_count_bucket=(Bucket $selector);selector_owned_python_count_bucket=(Bucket $owned);all_python_count_bucket=(Bucket $py);non_operator_powershell_count_bucket=(Bucket $ps);safe_to_retry=$safe;code=$code}|ConvertTo-Json -Compress}
+function Out($status,$code,$safe,$selector,$owned,$py,$ps,$unchanged){$x=[ordered]@{sentinel='TERMINAL_A_POST_SELECTOR_FAILURE_PROBE';status=$status;leg='A1';machine_id=$machineId;safe_to_retry=$safe;code=$code};if($status-eq'complete'){$x.status_expected=$true;$x.lock_clear=$true;$x.recovery_clear=$true;$x.game_processes_clear=$true;$x.remote_lock_clear=$true;$x.remote_stable=$true;$x.live_unchanged=$unchanged;$x.state_unchanged=$unchanged;$x.vault_unchanged=$unchanged;$x.source_unchanged=$unchanged;$x.selector_window_count_bucket=(Bucket $selector);$x.selector_owned_python_count_bucket=(Bucket $owned);$x.all_python_count_bucket=(Bucket $py);$x.non_operator_powershell_count_bucket=(Bucket $ps)};$x|ConvertTo-Json -Compress}
 try {
  $stage='paths';if(!(Test-Path $python -PathType Leaf) -or !(Test-Path $config -PathType Leaf)){throw 'precondition_failed'};$cfg=Get-Content $config -Raw -Encoding utf8|ConvertFrom-Json -ErrorAction Stop;if($cfg.machine_id -cne $machineId -or !($cfg.vault_repo -is [string]) -or !($cfg.save_root -is [string])){throw 'precondition_failed'};$vault=[string]$cfg.vault_repo;$live=[string]$cfg.save_root;$state=Join-Path ([IO.Path]::GetDirectoryName($config)) 'state.json';$shortcut=Join-Path (Join-Path $env:USERPROFILE 'Desktop') 'Grim Dawn (DPYes + Save Selection).lnk'
  $stage='before';
  [string]$beforeSource=RepoFingerprint $source;[string]$beforeVault=RepoFingerprint $vault;$before=@((ToolIdentity $python),(FileDigest $config),(FileDigest $state),(FileDigest $shortcut),(TreeDigest $live),$beforeSource,$beforeVault)
- $stage='cli';$s1=Json 'status';$d1=Json 'doctor';$installedRoot1=InstalledManifestRoot $live;$s2=Json 'status';$d2=Json 'doctor';$installedRoot2=InstalledManifestRoot $live;$liveRoot=[string]$d1.checks.save_root.manifest.root_hash;if($liveRoot -notmatch '^[0-9a-f]{64}$' -or $liveRoot -cne $installedRoot1 -or $liveRoot -cne [string]$d2.checks.save_root.manifest.root_hash -or $liveRoot -cne $installedRoot2 -or ($s1|ConvertTo-Json -Depth 16 -Compress) -cne ($s2|ConvertTo-Json -Depth 16 -Compress) -or ($d1|ConvertTo-Json -Depth 16 -Compress) -cne ($d2|ConvertTo-Json -Depth 16 -Compress) -or $s1.readiness -ne 'blocked' -or $s1.vault_relation -ne 'remote_changed_or_unknown' -or $s1.active_lock -ne $null -or $s1.recovery_phase -ne $null -or $s1.processes.status -ne 'clear' -or $d1.machine_id -cne $machineId -or $d2.machine_id -cne $machineId){throw 'precondition_failed'}
+ $stage='cli';$s1=Json 'status';$sp1=StatusProjection $s1;$d1=Json 'doctor';$dp1=DoctorProjection $d1;$installedRoot1=InstalledManifestRoot $live;$s2=Json 'status';$sp2=StatusProjection $s2;$d2=Json 'doctor';$dp2=DoctorProjection $d2;$installedRoot2=InstalledManifestRoot $live;$liveRoot=[string]$d1.checks.save_root.manifest.root_hash;if($liveRoot -cne $installedRoot1 -or $liveRoot -cne $installedRoot2 -or $sp1-cne$sp2 -or $dp1-cne$dp2 -or $s1.readiness -ne 'blocked' -or $s1.vault_relation -ne 'remote_changed_or_unknown' -or $s1.active_lock -ne $null -or $s1.recovery_phase -ne $null){throw 'precondition_failed'}
  $r1=RemoteAdvertisement $vault;$r2=RemoteAdvertisement $vault;if($r1 -cne $r2){throw 'observation_changed'}
  $stage='processes';$proc=Processes;$game=@($proc|Where-Object{$_.Name -in @('Grim Dawn.exe','DPYes.exe')});$wins=@(Windows);$pys=@($proc|Where-Object{$_.Name -in @('python.exe','pythonw.exe')});$owned=@($wins|Where-Object{$pys.ProcessId -contains $_.pid});$otherPs=@($proc|Where-Object{$_.Name -in @('powershell.exe','pwsh.exe') -and $_.CommandLine -notmatch 'terminal-a-roundtrip-diagnose'})
  $stage='after';

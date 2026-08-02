@@ -125,7 +125,7 @@ def test_sequence_10_stage_probe_has_closed_stages_codes_and_readonly_surface() 
 
     stages = ("bootstrap", "config", "package", "source", "vault", "status_first", "doctor_first",
               "live_manifest", "remote_advertisement", "process_window", "status_second", "doctor_second",
-              "post_invariant", "complete")
+              "semantic", "post_invariant", "final_process_window", "complete")
     codes = ("required_local_artifact_missing", "source_probe_failed", "vault_probe_failed",
              "status_command_failed", "status_shape_invalid", "doctor_command_failed", "doctor_shape_invalid",
              "installed_manifest_mismatch", "status_not_stable", "doctor_not_stable",
@@ -138,9 +138,15 @@ def test_sequence_10_stage_probe_has_closed_stages_codes_and_readonly_surface() 
     assert "StatusProjection" in block and "DoctorProjection" in block
     assert "ConvertTo-Json -Depth" not in block
     assert "ls-remote','--refs','origin','refs/heads/main','refs/tags/grim-dawn-sync-active" in block
-    for forbidden in ("Start-Process", "SendKeys", "PostMessage", "SetForegroundWindow", " taskkill", "Stop-Process",
+    for forbidden in ("Start-Process", "SendKeys", "PostMessage", "SetForegroundWindow", "Stop-Process",
                       " fetch", " update-ref", " commit", " push", " checkout", " reset", " recover", " restore"):
         assert forbidden.lower() not in block.lower()
+    assert "System32\\taskkill.exe" in block
+    assert "$psi.Arguments='/PID '+[int]$targetPid+' /T /F'" in block
+    assert "StopTree $p.Id" in block
+    assert "change any pre-existing\nprocess" in runbook
+    assert "only the process tree that it started" in runbook
+    assert "@('equal','remote_changed_or_unknown','unborn','remote_missing')" in block
 
 
 def test_remote_handoff_fetches_canonical_master_and_reads_only_fixed_commit_path() -> None:
@@ -156,16 +162,19 @@ def test_remote_handoff_fetches_canonical_master_and_reads_only_fixed_commit_pat
     assert "@('rev-parse','FETCH_HEAD')" in command
     assert "@('merge-base','--is-ancestor',$beforeHead,$fetchHead)" in command
     assert "$requestCommit = $fetchHead" in command
-    assert 'git -C $source show "$requestCommit`:$requestObjectPath"' in command
+    assert '$requestLines = @(Invoke-GitLines @(\'show\',"$requestCommit`:$requestObjectPath"))' in command
     assert "$gitExitCode = $LASTEXITCODE" in command
     assert "if ($gitExitCode -ne 0)" in command
+    assert "$priorErrorAction = $ErrorActionPreference" in command
+    assert "$ErrorActionPreference = 'Continue'" in command
+    assert "$requestLines = @(Invoke-GitLines @('show'" in command
 
 
 def test_remote_handoff_forbids_source_mutation_execution_and_preserves_a1_boundary() -> None:
     remote_section, source_block = _remote_section_and_block()
 
     assert "@('fetch','--no-tags','origin','master:refs/remotes/origin/master')" in source_block
-    assert ' show "$requestCommit`:$requestObjectPath"' in source_block
+    assert '$requestLines = @(Invoke-GitLines @(\'show\',"$requestCommit`:$requestObjectPath"))' in source_block
     for forbidden in ("'pull'", "'checkout'", "'reset'", "'rebase'", "'push'", " -m grim_dawn_sync"):
         assert forbidden not in source_block.lower()
     assert "Do not execute or import\nfetched code" in remote_section
@@ -268,6 +277,9 @@ def test_remote_classification_block_is_read_only_and_sanitized() -> None:
     assert ".sync/manifest.json" in block
     assert "Get-LocalFingerprint" in block
     assert "Get-FetchHeadFingerprint" in block
+    assert "try { $ErrorActionPreference = 'Continue'; $lines = @(& git" in block
+    assert "try { $ErrorActionPreference = 'Continue'; $output = @(& $python" in block
+    assert "$manifestRaw = @(Invoke-GitLines -Repo $vault -CommandArgs @('show'" in block
     assert "Get-FileFingerprint $State" in block
     assert "'for-each-ref','--sort=refname','--format=%(refname) %(objectname)'" in block
     assert "refs/tags/grim-dawn-sync-active" in block
@@ -302,6 +314,8 @@ def test_remote_diff_summary_block_uses_only_trusted_local_validation_and_aggreg
     assert "GitLines -Repo $vault -CommandArgs @('ls-remote','--refs','origin')" in block
     assert "GitQuiet -Repo $vault -CommandArgs @('fetch','--no-tags','--no-write-fetch-head','origin',$remote)" in block
     assert "System.Collections.Generic.HashSet[string]" in block
+    assert "function GitLines($Repo,[string[]]$CommandArgs){$old=$ErrorActionPreference;try{$ErrorActionPreference='Continue'" in block
+    assert "$raw=@(GitLines -Repo $Vault -CommandArgs @('show'" in block
     assert "no path, character/account name, object" in runbook
 
 
@@ -314,8 +328,13 @@ def test_remote_diff_summary_block_keeps_sequence6_classification_block_availabl
 
 def test_selector_dry_run_allows_only_catalog_ref_to_advertised_remote() -> None:
     runbook = RUNBOOK_PATH.read_text(encoding="utf-8")
-    block = runbook.split("## Selector cancel/reload dry-run block", 1)[1].split("```powershell", 1)[1].split("```", 1)[0]
+    section = runbook.split("## Retired selector cancel/reload automation (sequence 8; DO NOT RUN)", 1)[1].split("Continue only when", 1)[0]
+    block = section.split("```text", 1)[1].split("```", 1)[0]
 
+    assert "PowerShell parse defect" in section
+    assert "cannot be\nmarshaled by Windows PowerShell 5.1" in section
+    assert "operator must perform the visible Esc/F5 actions manually" in section
+    assert "```powershell" not in section
     assert "TERMINAL_A_SELECTOR_DRY_RUN" in block
     assert "$catalogRef='refs/remotes/origin/main'" in block
     assert "function Stable($Vault,$Remote,$Base,$Before,$After)" in block
@@ -327,7 +346,7 @@ def test_selector_dry_run_allows_only_catalog_ref_to_advertised_remote() -> None
 
 def test_selector_dry_run_uses_exact_shortcut_contract_and_pid_bound_window_input() -> None:
     runbook = RUNBOOK_PATH.read_text(encoding="utf-8")
-    block = runbook.split("## Selector cancel/reload dry-run block", 1)[1].split("```powershell", 1)[1].split("```", 1)[0]
+    block = runbook.split("## Retired selector cancel/reload automation (sequence 8; DO NOT RUN)", 1)[1].split("```text", 1)[1].split("```", 1)[0]
 
     assert "from grim_dawn_sync.shortcut import _launch_arguments" in block
     assert "$link.Arguments -cne [string]$expectedArgs[0]" in block
@@ -341,7 +360,7 @@ def test_selector_dry_run_uses_exact_shortcut_contract_and_pid_bound_window_inpu
 
 def test_selector_dry_run_fails_closed_for_malicious_shortcut_and_window_ambiguity() -> None:
     runbook = RUNBOOK_PATH.read_text(encoding="utf-8")
-    block = runbook.split("## Selector cancel/reload dry-run block", 1)[1].split("```powershell", 1)[1].split("```", 1)[0]
+    block = runbook.split("## Retired selector cancel/reload automation (sequence 8; DO NOT RUN)", 1)[1].split("```text", 1)[1].split("```", 1)[0]
 
     # Exact equality rejects appended or substituted launch arguments.  Window
     # enumeration rejects a pre-existing title, duplicate title, or ambiguous
@@ -355,7 +374,7 @@ def test_selector_dry_run_fails_closed_for_malicious_shortcut_and_window_ambigui
 
 def test_selector_dry_run_ref_and_output_boundaries_are_privacy_safe() -> None:
     runbook = RUNBOOK_PATH.read_text(encoding="utf-8")
-    block = runbook.split("## Selector cancel/reload dry-run block", 1)[1].split("```powershell", 1)[1].split("```", 1)[0]
+    block = runbook.split("## Retired selector cancel/reload automation (sequence 8; DO NOT RUN)", 1)[1].split("```text", 1)[1].split("```", 1)[0]
 
     assert "foreach($k in $Before.Keys){if($k -cne $catalogRef" in block
     assert "foreach($k in $After.Keys){if($k -cne $catalogRef" in block
@@ -396,7 +415,7 @@ def test_post_selector_failure_probe_is_readonly_and_reports_only_aggregate_buck
     assert "$main.Count -ne 1 -or $lock.Count -ne 0 -or $rows.Count -ne 1" in block
     assert "$r1=RemoteAdvertisement $vault;$r2=RemoteAdvertisement $vault" in block
     assert "$liveRoot=[string]$d1.checks.save_root.manifest.root_hash" in block
-    assert "$liveRoot -notmatch '^[0-9a-f]{64}$'" in block
+    assert "root_hash-notmatch'^[0-9a-f]{64}$'" in block
     assert "function InstalledManifestRoot($root)" in block
     assert "from grim_dawn_sync.manifest import build_manifest" in block
     assert "Native $python @('-c',$probe,$root,$machineId)" in block
@@ -404,10 +423,12 @@ def test_post_selector_failure_probe_is_readonly_and_reports_only_aggregate_buck
     assert "$liveRoot -cne $installedRoot2" in block
     assert "$installedRoot3 -cne $liveRoot" in block
     assert "[string]$afterDoctor.checks.save_root.manifest.root_hash -cne $liveRoot" in block
-    assert "($s1|ConvertTo-Json -Depth 16 -Compress) -cne ($s2|ConvertTo-Json -Depth 16 -Compress)" in block
-    assert "($d1|ConvertTo-Json -Depth 16 -Compress) -cne ($d2|ConvertTo-Json -Depth 16 -Compress)" in block
-    for forbidden in ("Start-Process", "PostMessage", "SetForegroundWindow", " fetch", " recover", " restore", " snapshot", " bookmark", " promote", " commit", " push", " kill", " stop-process"):
+    assert "function StatusProjection($v)" in block and "$sp1-cne$sp2" in block
+    assert "function DoctorProjection($v)" in block and "$dp1-cne$dp2" in block
+    assert "ConvertTo-Json -Depth 16" not in block
+    for forbidden in ("Start-Process", "PostMessage", "SetForegroundWindow", " fetch", " recover", " restore", " snapshot", " bookmark", " promote", " commit", " push", " stop-process"):
         assert forbidden.lower() not in block.lower()
+    assert "System32\\taskkill.exe" in block and "StopTree $p.Id" in block
 
 
 def test_post_selector_failure_probe_failure_contract_is_closed_and_sanitized() -> None:
@@ -421,5 +442,7 @@ def test_post_selector_failure_probe_failure_contract_is_closed_and_sanitized() 
     assert "'selector_residual_detected' $false" in block
     assert "$code -notin @('precondition_failed','observation_changed','process_observation_inconclusive')" in block
     assert "throw 'observation_changed'" in block
-    assert "function StopTree($pid)" in block and "WaitForExit($timeoutMs)" in block
+    assert "function StopTree($targetPid)" in block and "WaitForExit($timeoutMs)" in block
+    assert "($code -ne 'precondition_failed')" not in block
+    assert "if($status-eq'complete')" in block
     assert "ConvertTo-Json -Compress" in block
