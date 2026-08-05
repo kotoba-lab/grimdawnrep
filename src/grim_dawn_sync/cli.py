@@ -52,6 +52,7 @@ from grim_dawn_sync.selector_ui import (
     SelectionRequest,
     TkSelectionPresenter,
     build_plan_from_request,
+    present_exit_disposition_confirmation,
 )
 from grim_dawn_sync.catalog_capability import (
     configuration_identity,
@@ -87,6 +88,8 @@ def build_parser() -> argparse.ArgumentParser:
     launch_parser.add_argument("--catalog-token", help="short-lived catalog capability for --select")
     launch_parser.add_argument("--confirm", action="store_true", help="second confirmation for a history/bookmark selection")
     launch_parser.add_argument("--selector", choices=["always", "on-diff"], help="override the configured selection_policy for this run")
+    launch_parser.add_argument("--exit-disposition", choices=["publish", "local-only", "restore-startup"],
+                                help="what to do after the game exits; default publish")
     subparsers.add_parser("versions", help="list verified save-version candidates")
     bookmark_parser = subparsers.add_parser("bookmark", help="create a named immutable bookmark")
     bookmark_parser.add_argument("--candidate", required=True)
@@ -544,11 +547,11 @@ def _resolve_selection_policy(config: Any, selector_override: str | None) -> str
     return normalized
 
 
-def _automatic_request(catalog: Any, mode: str) -> SelectionRequest:
+def _automatic_request(catalog: Any, mode: str, *, exit_disposition: str = "publish") -> SelectionRequest:
     candidate = next((item for item in catalog.candidates if item.kind == "live"), None)
     if candidate is None:
         raise SyncError("selection_required", "No verified automatic selection is available.", 3)
-    return SelectionRequest(candidate.candidate_id, mode)
+    return SelectionRequest(candidate.candidate_id, mode, exit_disposition=exit_disposition)
 
 
 def _execute_selection_command(
@@ -561,10 +564,14 @@ def _execute_selection_command(
     presenter: SelectionPresenter | None = None,
     confirmed: bool = False,
     selector_override: str | None = None,
+    exit_disposition_override: str | None = None,
 ) -> dict[str, Any]:
     config = load_config(config_path)
     _process_preflight(config)
     effective_policy = _resolve_selection_policy(config, selector_override)
+    # Unspecified always means "publish"; there is no implicit change and no
+    # config-level default for this per-run choice.
+    effective_exit_disposition = exit_disposition_override or "publish"
     if selected and selected != "auto-safe" and catalog_token is None:
         raise SyncError("catalog_token_required", "Explicit selection requires a current catalog capability.", 3)
     ui = presenter or TkSelectionPresenter()
@@ -621,9 +628,11 @@ def _execute_selection_command(
         registry = _registry_for_catalog(catalog); registry.register(catalog)
 
         if selected and selected != "auto-safe":
+            request_mode = "promote-only" if command == "promote" else "launch"
             request = SelectionRequest(
-                selected, "promote-only" if command == "promote" else "launch",
+                selected, request_mode,
                 confirmation_granted=(command == "promote" or confirmed),
+                exit_disposition=effective_exit_disposition if request_mode == "launch" else "publish",
             )
         elif command == "promote" and as_json:
             raise SyncError("selection_required", "Promotion requires an explicit current selection.", 3,
@@ -633,7 +642,7 @@ def _execute_selection_command(
             # EQUAL auto-selection keeps working exactly as before, while
             # selection_policy=always forces the explicit-selection path below
             # even for what would otherwise be an automatic EQUAL launch.
-            request = request or _automatic_request(catalog, "launch")
+            request = request or _automatic_request(catalog, "launch", exit_disposition=effective_exit_disposition)
         elif selected == "auto-safe" or as_json:
             raise SyncError("selection_required", "Save versions differ; an explicit current selection is required.", 3,
                            details={"remote_check": _remote_check_payload(catalog)})
@@ -719,9 +728,11 @@ def _execute_selection_command(
             return fresh_context
         setattr(revalidate_context, "after_lock", revalidate_after_lock)
         setattr(revalidate_context, "expected_pre_state", state)
+        exit_disposition_gate = present_exit_disposition_confirmation if interactive else None
         try:
             result = LaunchWorkflow(config, config_path.parent).execute_selection_plan(
                 plan, registry, context_revalidate=revalidate_context,
+                exit_disposition_gate=exit_disposition_gate,
             )
         except SyncError as error:
             if interactive and _may_retry_interactive_stale(error):
@@ -739,10 +750,11 @@ def _execute_selection_command(
 
 def launch(config_path: Path, *, as_json: bool = False, selected: str | None = None,
            catalog_token: str | None = None, presenter: SelectionPresenter | None = None,
-           confirmed: bool = False, selector: str | None = None) -> dict[str, Any]:
+           confirmed: bool = False, selector: str | None = None,
+           exit_disposition: str | None = None) -> dict[str, Any]:
     return _execute_selection_command(config_path, command="launch", as_json=as_json, selected=selected,
                                       catalog_token=catalog_token, presenter=presenter, confirmed=confirmed,
-                                      selector_override=selector)
+                                      selector_override=selector, exit_disposition_override=exit_disposition)
 
 
 def promote(config_path: Path, *, apply: bool, as_json: bool = False, selected: str | None = None,
@@ -1296,7 +1308,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command in {"enroll", "join"}: payload = enroll(args.config, apply=args.apply)
         elif args.command == "versions": payload = versions(args.config)
         elif args.command == "bookmark": payload = bookmark(args.config, args.candidate, args.name, args.note, apply=args.apply, catalog_token=args.catalog_token)
-        elif args.command == "launch": payload = launch(args.config, as_json=args.json, selected=args.select, catalog_token=args.catalog_token, confirmed=args.confirm, selector=args.selector)
+        elif args.command == "launch": payload = launch(args.config, as_json=args.json, selected=args.select, catalog_token=args.catalog_token, confirmed=args.confirm, selector=args.selector, exit_disposition=args.exit_disposition)
         elif args.command == "promote": payload = promote(args.config, apply=args.apply, as_json=args.json, selected=args.candidate, catalog_token=args.catalog_token)
         elif args.command == "install-shortcut":
             if not args.apply: payload = {"schema_version": "1.0.0", "command": "install-shortcut", "dry_run": True}

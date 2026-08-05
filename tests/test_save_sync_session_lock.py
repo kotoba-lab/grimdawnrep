@@ -14,6 +14,7 @@ from grim_dawn_sync.catalog_capability import read_remote_identity
 from grim_dawn_sync.errors import SyncError
 from grim_dawn_sync.git_vault import GitResult, GitVault
 from grim_dawn_sync.session_lock import (
+    LOCK_REF,
     Lock,
     acquire_lock,
     inspect_remote_lock,
@@ -23,8 +24,11 @@ from grim_dawn_sync.session_lock import (
     push_bootstrap,
     recover_session,
     release_lock,
+    release_without_publish,
 )
+import grim_dawn_sync.session_lock as session_lock_module
 from grim_dawn_sync.state import SyncState, load_state, save_state
+from test_save_sync_bookmarks import _ordinary_context
 
 
 def test_recover_rejects_bound_remote_identity_change_before_mutation(tmp_path: Path) -> None:
@@ -1540,4 +1544,115 @@ def test_second_stale_base_check_cleans_intent_and_local_tag(
     assert calls == 2
     assert load_state(state_path) == SyncState()
     assert inspect_remote_lock(vault) is None
+    assert not _git(vault.repo, "tag", "--list", "grim-dawn-sync-*")
+
+
+def test_release_without_publish_preserves_baseline_and_clears_lock(tmp_path: Path) -> None:
+    """T-E local-only/restore-startup: release with no commit, no push, unchanged baseline."""
+    one, vault, _manifest, base, original, state_path = _ordinary_context(tmp_path)
+    lock = acquire_lock(vault, "a", base, state_path=state_path, expected_pre_state=original)
+    release_without_publish(vault, lock, original, state_path=state_path)
+    assert load_state(state_path) == original
+    assert vault.remote_oid() == base
+    assert inspect_remote_lock(vault) is None
+    assert not _git(vault.repo, "tag", "--list", "grim-dawn-sync-*")
+
+
+def test_release_without_publish_rejects_foreign_baseline(tmp_path: Path) -> None:
+    one, vault, _manifest, base, original, state_path = _ordinary_context(tmp_path)
+    lock = acquire_lock(vault, "a", base, state_path=state_path, expected_pre_state=original)
+    forged = replace(original, last_applied_manifest_root_hash="f" * 64)
+    with pytest.raises(SyncError) as caught:
+        release_without_publish(vault, lock, forged, state_path=state_path)
+    assert caught.value.code == "unpublished_release_state_invalid"
+    # Nothing was mutated: the lock and state are exactly as acquire left them.
+    assert load_state(state_path).phase == "lock_held"
+    assert inspect_remote_lock(vault) is not None
+
+
+def test_release_without_publish_cas_conflict_preserves_foreign_state_and_lock(tmp_path, monkeypatch) -> None:
+    one, vault, _manifest, base, original, state_path = _ordinary_context(tmp_path)
+    lock = acquire_lock(vault, "a", base, state_path=state_path, expected_pre_state=original)
+    current = load_state(state_path)
+    foreign = replace(current, last_applied_manifest_root_hash="f" * 64)
+    real_cas = session_lock_module.save_state_if_unchanged
+
+    def race_release(path, expected, desired):
+        if desired.phase == "unpublished_release_pending":
+            save_state(path, foreign)
+        return real_cas(path, expected, desired)
+
+    monkeypatch.setattr(session_lock_module, "save_state_if_unchanged", race_release)
+    with pytest.raises(SyncError) as caught:
+        release_without_publish(vault, lock, original, state_path=state_path)
+    assert (caught.value.code, caught.value.exit_code) == ("unpublished_release_state_changed", 6)
+    assert load_state(state_path) == foreign
+    assert _git(one, "ls-remote", "--refs", "origin", LOCK_REF).startswith(lock.oid)
+    assert _git(one, "rev-parse", "--verify", f"refs/tags/{lock.local_tag}").strip() == lock.oid
+
+
+def test_recover_completes_unpublished_release_when_remote_lock_already_gone(tmp_path, monkeypatch) -> None:
+    """Crash after the remote tag delete lands but before local cleanup+baseline restore."""
+    one, vault, _manifest, base, original, state_path = _ordinary_context(tmp_path)
+    lock = acquire_lock(vault, "a", base, state_path=state_path, expected_pre_state=original)
+    real_run = vault.runner.run
+
+    def fail_after_remote_delete(*args, **kwargs):
+        if args and args[0] == "push" and args[1].startswith("--force-with-lease="):
+            result = real_run(*args, **kwargs)
+            raise SyncError("git_timeout", "injected timeout", 4)
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(vault.runner, "run", fail_after_remote_delete)
+    with pytest.raises(SyncError):
+        release_without_publish(vault, lock, original, state_path=state_path)
+    pending = load_state(state_path)
+    assert pending.phase == "unpublished_release_pending"
+
+    monkeypatch.setattr(vault.runner, "run", real_run)
+    assert recover_session(vault, pending, "a", state_path=state_path) == "unpublished_release_complete"
+    assert load_state(state_path) == original
+    assert vault.remote_oid() == base
+    assert not _git(vault.repo, "tag", "--list", "grim-dawn-sync-*")
+
+
+def test_recover_completes_unpublished_release_when_remote_lock_still_present(tmp_path, monkeypatch) -> None:
+    """Crash before the remote lock tag was even deleted: recover finishes the same release."""
+    one, vault, _manifest, base, original, state_path = _ordinary_context(tmp_path)
+    lock = acquire_lock(vault, "a", base, state_path=state_path, expected_pre_state=original)
+    real_run = vault.runner.run
+
+    def fail_before_remote_delete(*args, **kwargs):
+        if args and args[0] == "push" and args[1].startswith("--force-with-lease="):
+            raise SyncError("git_timeout", "injected timeout", 4)
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(vault.runner, "run", fail_before_remote_delete)
+    with pytest.raises(SyncError):
+        release_without_publish(vault, lock, original, state_path=state_path)
+    pending = load_state(state_path)
+    assert pending.phase == "unpublished_release_pending"
+    assert inspect_remote_lock(vault) is not None
+
+    monkeypatch.setattr(vault.runner, "run", real_run)
+    assert recover_session(vault, pending, "a", state_path=state_path) == "unpublished_release_complete"
+    assert load_state(state_path) == original
+    assert vault.remote_oid() == base
+    assert not _git(vault.repo, "tag", "--list", "grim-dawn-sync-*")
+
+
+def test_recover_abandons_plain_lock_before_any_unpublished_release_attempt(tmp_path) -> None:
+    """A crash before ``release_without_publish`` is even called still recovers cleanly.
+
+    This mirrors the existing abandoned-lock path used for bookmark-only
+    sessions: nothing has committed, so the vault is still exactly at the
+    lock base and recovery may abandon the lock without reinterpreting it.
+    """
+    one, vault, _manifest, base, original, state_path = _ordinary_context(tmp_path)
+    lock = acquire_lock(vault, "a", base, state_path=state_path, expected_pre_state=original)
+    state = load_state(state_path)
+    assert state.phase == "lock_held" and state.local_commit is None and state.pushed_commit is None
+    assert recover_session(vault, state, "a", state_path=state_path) == "abandoned_lock_released"
+    assert load_state(state_path) == original
+    assert vault.remote_oid() == base
     assert not _git(vault.repo, "tag", "--list", "grim-dawn-sync-*")

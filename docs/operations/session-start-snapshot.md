@@ -15,10 +15,10 @@ Every `launch` now creates one additional local archive automatically, right aft
 - **This archive is created on every launch and is never deleted automatically.** Disk usage under `archives/` grows by one save's worth of data per launch, indefinitely.
 - `grim-dawn-sync status` reports the current session-start archive count and total bytes (`session_start_usage`) so this growth is visible, but nothing is pruned on the terminal's behalf. Deleting old `save-session-start-...` directories is a manual, operator-initiated action.
 
-## Important limitation: this does not stop the end-of-session publish
+## Exit disposition now controls whether that session ever publishes
 
-**Keeping a session-start archive around does not, by itself, stop the existing unconditional publish behavior at the end of a game session.** Today, `launch` still always runs `archive_after_game -> snapshot -> push -> release` when the game exits normally, exactly as before this change. The three-way disposition split (`publish` / `local-only` / `restore-startup`) described for a later change is **not implemented yet**.
+**As of the exit-disposition split (plan section 7), the end-of-session publish is no longer unconditional.** Every `launch` decides, before the game ever starts, what happens after it exits: `publish` (the historical, and still default, behavior), `local-only`, or `restore-startup`. See `docs/operations/exit-disposition.md` for the full description of all three and how to choose one.
 
-Concretely: if you launch, play, and exit normally, your session-start snapshot preserves what the live save looked like *before* that session, but the *new* save produced by that session is still committed and pushed to remote main when the game exits, the same as it always was. There is currently no way to "try a session and discard it" using only this feature — restoring the session-start archive on a later launch (or a future `restore-startup` disposition) has not yet been extended to suppress the intervening publish that already happened.
+In short: choosing `local-only` or `restore-startup` for a launch means that launch's session-start snapshot is now actually useful for "try a session and discard it" — the game's own new save is still archived locally (never silently lost), but it is never committed or pushed to remote main. `restore-startup` goes one step further and restores this launch's session-start archive back into the live save afterward, so the terminal ends the session looking exactly as it did before the launch began, aside from the archives it leaves behind.
 
-Do not treat this feature as a duplication/rollback tool on its own until the end-of-session disposition split described above ships.
+Choosing the default `publish` disposition (or not specifying `--exit-disposition` at all) keeps the exact old behavior: `archive_after_game -> snapshot -> push -> release` runs unconditionally, same as before this feature existed.

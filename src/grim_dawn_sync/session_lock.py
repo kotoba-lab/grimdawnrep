@@ -538,6 +538,80 @@ def release_bookmark_lock(vault: GitVault, lock: Lock, original: SyncState, *, s
         ) from error
 
 
+def release_without_publish(vault: GitVault, lock: Lock, original: SyncState, *, state_path: Path) -> None:
+    """Release a lock that made no Git commit, without publishing anything.
+
+    This is the exit-disposition counterpart to ``release_bookmark_lock``: it
+    is used when a launch's ``local-only`` or ``restore-startup`` disposition
+    ends the session after ``archive_after_game`` (a local-only archive) but
+    deliberately never commits or pushes.  ``original`` must be the exact
+    pre-lock baseline, restored byte-for-byte; ``last_applied_remote_commit``
+    and ``last_applied_manifest_root_hash`` are left untouched so the next
+    launch on this terminal correctly observes ``LIVE_AHEAD``.
+    """
+    original_has_baseline = original.last_applied_remote_commit is not None
+    if (
+        original.phase is not None
+        or original_has_baseline != (original.last_applied_manifest_root_hash is not None)
+        or (original_has_baseline and original.machine_id != lock.session.machine_id)
+        or (not original_has_baseline and original != SyncState())
+    ):
+        _fail("unpublished_release_state_invalid", "Unpublished session has no inactive baseline to restore.")
+    if vault.remote_oid() != lock.session.base_commit or _remote_lock(vault) != lock.oid:
+        _fail("unpublished_release_mismatch", "Unpublished session remote state changed before release.")
+    current = load_state(state_path)
+    if (
+        current.phase not in {"lock_held", "unpublished_release_pending"}
+        or current.session_id != lock.session.session_id
+        or current.machine_id != lock.session.machine_id
+        or current.base_commit != lock.session.base_commit
+        or current.lock_oid != lock.oid
+        or current.local_tag != lock.local_tag
+        or current.last_applied_remote_commit != original.last_applied_remote_commit
+        or current.last_applied_manifest_root_hash != original.last_applied_manifest_root_hash
+        or (current.phase == "unpublished_release_pending" and current.pushed_commit != lock.session.base_commit)
+    ):
+        _fail("unpublished_release_state_invalid", "Unpublished session state does not match its lock.")
+    pending = SyncState(
+        last_applied_remote_commit=original.last_applied_remote_commit,
+        last_applied_manifest_root_hash=original.last_applied_manifest_root_hash,
+        session_id=lock.session.session_id, machine_id=lock.session.machine_id,
+        base_commit=lock.session.base_commit, lock_oid=lock.oid, local_tag=lock.local_tag,
+        phase="unpublished_release_pending", pushed_commit=lock.session.base_commit,
+    )
+    vault.assert_remote_identity()
+    try:
+        save_state_if_unchanged(state_path, current, pending)
+    except SyncError as error:
+        raise SyncError(
+            "unpublished_release_state_changed",
+            "Unpublished release state changed before lock deletion; recovery artifacts were retained.",
+            EXIT_RECOVERY_REQUIRED,
+            {**error.details, "session_id": lock.session.session_id},
+        ) from error
+    _recovery_guard(vault, state_path, pending)
+    result = vault.runner.run("push", f"--force-with-lease={LOCK_REF}:{lock.oid}", vault.remote, f":{LOCK_REF}", check=False)
+    try: after = _remote_lock(vault)
+    except SyncError: _fail("release_incomplete", "Unpublished lock deletion could not be confirmed.", EXIT_RECOVERY_REQUIRED)
+    if result.returncode or after is not None: _fail("release_incomplete", "Unpublished lock release was not confirmed.", EXIT_RECOVERY_REQUIRED)
+    if lock.local_tag:
+        _recovery_guard(vault, state_path, pending)
+        _delete_exact_local_session_ref(
+            vault, lock.local_tag, lock.oid,
+            expected_identity=(lock.session.session_id, lock.session.machine_id, lock.session.base_commit),
+        )
+    _recovery_guard(vault, state_path, pending)
+    try:
+        save_state_if_unchanged(state_path, pending, original)
+    except SyncError as error:
+        raise SyncError(
+            "unpublished_release_state_changed",
+            "Unpublished release state changed before baseline restoration.",
+            EXIT_RECOVERY_REQUIRED,
+            {**error.details, "session_id": lock.session.session_id},
+        ) from error
+
+
 def _adopt_verified_snapshot_head(
     vault: GitVault,
     state: SyncState,
@@ -768,6 +842,15 @@ def _recover_session(vault: GitVault, state: SyncState, machine_id: str, *, stat
             _recovery_guard(vault, state_path, state)
             _save_recovery_transition(state_path, state, _original_baseline(state))
             return "bookmark_complete"
+        if state.phase == "unpublished_release_pending" and main == state.base_commit:
+            _recovery_guard(vault, state_path, state)
+            _delete_exact_local_session_ref(
+                vault, state.local_tag, state.lock_oid or "",
+                expected_identity=(state.session_id, state.machine_id, state.base_commit),
+            )
+            _recovery_guard(vault, state_path, state)
+            _save_recovery_transition(state_path, state, _original_baseline(state))
+            return "unpublished_release_complete"
         if state.pushed_commit and main == state.pushed_commit:
             _recovery_guard(vault, state_path, state)
             _delete_exact_local_session_ref(
@@ -828,6 +911,14 @@ def _recover_session(vault: GitVault, state: SyncState, machine_id: str, *, stat
             state_path=state_path,
         )
         return "bookmark_released"
+    if state.phase == "unpublished_release_pending":
+        release_without_publish(
+            vault,
+            Lock(lock.session, remote, state.local_tag),
+            _original_baseline(state),
+            state_path=state_path,
+        )
+        return "unpublished_release_complete"
     if state.phase == "lock_held" and state.local_commit is None:
         # A clean vault still at the base proves that no snapshot commit was
         # started.  This is the only case in which a failed launch may abandon
@@ -871,7 +962,7 @@ def _recover_session(vault: GitVault, state: SyncState, machine_id: str, *, stat
 
 def recover_session(vault: GitVault, state: SyncState, machine_id: str, *, state_path: Path | None = None) -> str:
     """Recover a session while keeping every persisted bookmark intent recoverable."""
-    bookmark_pending = state.phase in {"bookmark_publish_pending", "bookmark_release_pending"}
+    bookmark_pending = state.phase in {"bookmark_publish_pending", "bookmark_release_pending", "unpublished_release_pending"}
     try:
         return _recover_session(vault, state, machine_id, state_path=state_path)
     except SyncError as error:

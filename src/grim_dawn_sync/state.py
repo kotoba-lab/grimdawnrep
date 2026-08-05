@@ -60,7 +60,7 @@ _OPTIONAL = (
     "bookmark_tag_oid",
     "bookmark_root_hash",
 )
-_PHASES = {None, "bootstrap_pending", "lock_held", "committed", "pushed", "release_pending", "bookmark_publish_pending", "bookmark_release_pending"}
+_PHASES = {None, "bootstrap_pending", "lock_held", "committed", "pushed", "release_pending", "bookmark_publish_pending", "bookmark_release_pending", "unpublished_release_pending"}
 _SESSION_FIELDS = ("session_id", "machine_id", "base_commit", "lock_oid", "local_tag")
 _OID = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 _HASH = re.compile(r"^[0-9a-f]{64}$")
@@ -199,6 +199,11 @@ def _validate_current_transition(
         or ((values["last_applied_remote_commit"] is None) != (values["last_applied_manifest_root_hash"] is None))
     ):
         raise SyncError("invalid_state", "Bookmark release state must preserve the exact prior baseline and unchanged main.")
+    if phase == "unpublished_release_pending" and (
+        local_commit is not None or pushed_commit != values["base_commit"]
+        or ((values["last_applied_remote_commit"] is None) != (values["last_applied_manifest_root_hash"] is None))
+    ):
+        raise SyncError("invalid_state", "Unpublished release state must preserve the exact prior baseline and unchanged main.")
     bookmark_fields = (values["bookmark_ref"], values["bookmark_tag_oid"], values["bookmark_root_hash"])
     if phase == "bookmark_publish_pending":
         if (

@@ -65,7 +65,8 @@ def _install_context(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, live: s
     class Workflow:
         def __init__(self, got_config: object, root: Path) -> None:
             assert got_config is config and root == tmp_path
-        def execute_selection_plan(self, plan: object, registry: object, *, context_revalidate=None) -> dict[str, str]:
+        def execute_selection_plan(self, plan: object, registry: object, *, context_revalidate=None,
+                                   exit_disposition_gate=None) -> dict[str, str]:
             registry.revalidate(plan, live_manifest=lambda: {"root_hash": live}, remote_head=lambda: commit)
             assert context_revalidate is not None
             context_revalidate(getattr(plan, "expected_context_digest"))
@@ -807,7 +808,7 @@ def test_interactive_stale_then_reload_rebuilds_fresh_catalog_before_reselection
     class Workflow:
         attempts = 0
         def __init__(self, *_args, **_kwargs): pass
-        def execute_selection_plan(self, _plan, _registry, *, context_revalidate=None):
+        def execute_selection_plan(self, _plan, _registry, *, context_revalidate=None, exit_disposition_gate=None):
             Workflow.attempts += 1
             if Workflow.attempts == 1:
                 assert mutations == []

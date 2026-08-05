@@ -57,6 +57,7 @@ class FakeAdapters:
         self._call("session_start"); assert session_id == "session-1"
         return "save-session-start-" + "0" * 16 + "-" + "0" * 32
     def release_unmutated_lock(self, lock): self._call("release_unmutated"); assert lock is self.lock
+    def release_without_publish(self, lock): self._call("release_without_publish"); assert lock is self.lock
     def prepare_remote_restore(self, base, session): self._call("prepare"); assert (base, session) == (self.remote, "session-1"); return "plan"
     def archive_before_restore(self, plan): self._call("archive_before"); assert plan == "plan"; return "archived-plan"
     def apply_remote_save(self, plan): self._call("apply"); assert plan == "archived-plan"; return {"ok": True}
@@ -172,6 +173,38 @@ def test_domain_release_passes_manifest_root_into_atomic_release(
         "expected_state": committed,
     }
     assert subject._committed_state is None
+
+
+def test_domain_release_without_publish_uses_the_selection_original_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    subject = DomainAdapters(config(tmp_path), tmp_path / "local")
+    lock = object()
+    original = SyncState(
+        last_applied_remote_commit="a" * 40,
+        last_applied_manifest_root_hash="b" * 64,
+        machine_id="test-machine",
+    )
+    subject._selection_original_state = original
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        "grim_dawn_sync.workflow.release_without_publish",
+        lambda vault, passed_lock, passed_original, **kwargs: captured.update(
+            vault=vault, lock=passed_lock, original=passed_original, **kwargs,
+        ),
+    )
+    subject.release_without_publish(lock)
+    assert captured == {
+        "vault": subject.vault, "lock": lock, "original": original,
+        "state_path": tmp_path / "local" / "state.json",
+    }
+
+
+def test_domain_release_without_publish_requires_selection_context(tmp_path: Path) -> None:
+    subject = DomainAdapters(config(tmp_path), tmp_path / "local")
+    with pytest.raises(SyncError) as caught:
+        subject.release_without_publish(object())
+    assert caught.value.code == "adapter_contract_invalid"
 
 
 def test_domain_mark_committed_semantic_cas_retains_foreign_state(
@@ -896,6 +929,113 @@ def test_session_start_candidate_restores_from_local_archive_not_vault(tmp_path:
     assert subject.execute_selection_plan(plan, registry)["state"] == "COMPLETE"
     assert "prepare" not in adapters.calls  # the vault-restore path must never run
     assert adapters.calls.index("prepare_local") < adapters.calls.index("apply")
+
+
+def _launch_ready(tmp_path: Path):
+    adapters = FakeAdapters(); subject, _ = run(tmp_path, adapters)
+    live, commit = "1" * 64, "a" * 40
+    item = SaveCandidate("live", "live", "live", "x", "m", live, None, 0, 0, 0, (), ManifestDiff(0, 0, 0))
+    catalog = VersionCatalog("s" * 32, commit, live, (item,)); registry = SelectionRegistry(); registry.register(catalog)
+    adapters.live_manifest = lambda: {"root_hash": live}
+    adapters.remote_oid = lambda: commit
+    adapters.bookmark_displaced_remote = lambda *_: adapters.calls.append("bookmark")
+    return adapters, subject, registry, catalog, item
+
+
+def test_exit_disposition_local_only_skips_snapshot_and_push(tmp_path: Path) -> None:
+    adapters, subject, registry, catalog, item = _launch_ready(tmp_path)
+    plan = registry.build_plan(catalog_token=catalog.token, candidate_id=item.candidate_id, mode="launch",
+                               case=ReconcileCase.LIVE_AHEAD, exit_disposition="local-only")
+    result = subject.execute_selection_plan(plan, registry)
+    assert result == {"state": "COMPLETE", "exit_disposition": "local-only"}
+    assert "archive_after_game" in adapters.calls
+    assert "release_without_publish" in adapters.calls
+    for forbidden in ("snapshot", "mark_committed", "push", "release"):
+        assert forbidden not in adapters.calls
+
+
+def test_exit_disposition_restore_startup_restores_local_archive_and_skips_push(tmp_path: Path) -> None:
+    adapters, subject, registry, catalog, item = _launch_ready(tmp_path)
+    plan = registry.build_plan(catalog_token=catalog.token, candidate_id=item.candidate_id, mode="launch",
+                               case=ReconcileCase.LIVE_AHEAD, exit_disposition="restore-startup")
+    captured_archive_id: list[str] = []
+
+    def prepare_local(archive_id, session):
+        adapters.calls.append("prepare_local")
+        captured_archive_id.append(archive_id)
+        assert session.startswith("session-1")
+        return SimpleNamespace(source_manifest={"root_hash": "startup-root"})
+
+    adapters.prepare_local_restore = prepare_local
+    adapters.archive_before_restore = lambda plan_value: (adapters.calls.append("archive_before_2") or plan_value)
+    adapters.apply_remote_save = lambda plan_value: adapters.calls.append("apply_2")
+    adapters.wait_save_stable = lambda: {"root_hash": "startup-root", "character_count": 1, "file_count": 1, "total_bytes": 1}
+
+    result = subject.execute_selection_plan(plan, registry)
+    assert result == {"state": "COMPLETE", "exit_disposition": "restore-startup"}
+    # The session-start archive created right after lock acquisition is the
+    # one restored, regardless of what the game session itself produced.
+    assert captured_archive_id == ["save-session-start-" + "0" * 16 + "-" + "0" * 32]
+    assert "archive_after_game" in adapters.calls
+    assert "release_without_publish" in adapters.calls
+    for forbidden in ("snapshot", "mark_committed", "push", "release"):
+        assert forbidden not in adapters.calls
+
+
+def test_exit_disposition_restore_startup_mismatch_requires_recovery(tmp_path: Path) -> None:
+    adapters, subject, registry, catalog, item = _launch_ready(tmp_path)
+    plan = registry.build_plan(catalog_token=catalog.token, candidate_id=item.candidate_id, mode="launch",
+                               case=ReconcileCase.LIVE_AHEAD, exit_disposition="restore-startup")
+    adapters.prepare_local_restore = lambda archive_id, session: SimpleNamespace(source_manifest={"root_hash": "expected-root"})
+    adapters.archive_before_restore = lambda plan_value: plan_value
+    adapters.apply_remote_save = lambda plan_value: None
+    adapters.wait_save_stable = lambda: {"root_hash": "wrong-root", "character_count": 1, "file_count": 1, "total_bytes": 1}
+    with pytest.raises(SyncError) as caught:
+        subject.execute_selection_plan(plan, registry)
+    assert caught.value.code == "selected_restore_mismatch"
+    assert caught.value.exit_code == EXIT_RECOVERY_REQUIRED
+    assert "release_without_publish" not in adapters.calls
+
+
+def test_exit_disposition_gate_allows_downgrade_from_publish(tmp_path: Path) -> None:
+    adapters, subject, registry, catalog, item = _launch_ready(tmp_path)
+    plan = registry.build_plan(catalog_token=catalog.token, candidate_id=item.candidate_id, mode="launch",
+                               case=ReconcileCase.LIVE_AHEAD)  # default exit_disposition="publish"
+    result = subject.execute_selection_plan(plan, registry, exit_disposition_gate=lambda _current: "local-only")
+    assert result == {"state": "COMPLETE", "exit_disposition": "local-only"}
+    assert "push" not in adapters.calls and "release_without_publish" in adapters.calls
+
+
+def test_exit_disposition_gate_cannot_move_away_from_a_downgrade(tmp_path: Path) -> None:
+    """Once a plan is local-only/restore-startup, the gate may never move it anywhere else."""
+    adapters, subject, registry, catalog, item = _launch_ready(tmp_path)
+    plan = registry.build_plan(catalog_token=catalog.token, candidate_id=item.candidate_id, mode="launch",
+                               case=ReconcileCase.LIVE_AHEAD, exit_disposition="local-only")
+    with pytest.raises(SyncError) as caught:
+        subject.execute_selection_plan(plan, registry, exit_disposition_gate=lambda _current: "publish")
+    assert caught.value.code == "exit_disposition_transition_forbidden"
+    # The lock is still held at this point, so this failure needs recover
+    # like every other post-lock failure; nothing was published or restored.
+    assert caught.value.exit_code == EXIT_RECOVERY_REQUIRED
+    assert "push" not in adapters.calls and "release_without_publish" not in adapters.calls
+
+
+def test_exit_disposition_gate_ignored_for_promote_only(tmp_path: Path) -> None:
+    """promote-only always publishes; the gate is never even consulted."""
+    adapters, subject, registry, catalog, item = _launch_ready(tmp_path)
+    plan = registry.build_plan(catalog_token=catalog.token, candidate_id=item.candidate_id, mode="promote-only",
+                               case=ReconcileCase.LIVE_AHEAD)
+    adapters.wait_save_stable = lambda: {"root_hash": "1" * 64, "character_count": 1, "file_count": 1, "total_bytes": 1}
+    adapters.validate = lambda manifest, _baseline: adapters.calls.append("validate") or manifest
+    adapters.mark_committed = lambda *_: adapters.calls.append("mark_committed")
+    adapters.remote_manifest = lambda *_: {"root_hash": "1" * 64}
+    gate_calls: list[str] = []
+    def gate(current):
+        gate_calls.append(current)
+        return "local-only"
+    result = subject.execute_selection_plan(plan, registry, exit_disposition_gate=gate)
+    assert result["state"] == "COMPLETE" and "commit" in result
+    assert gate_calls == []
 
 
 def test_lock_push_unknown_during_acquire_requires_recovery(tmp_path: Path) -> None:

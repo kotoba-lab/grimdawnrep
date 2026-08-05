@@ -47,6 +47,32 @@ def test_main_forwards_selector_override_to_launch(monkeypatch: pytest.MonkeyPat
     assert calls[-1]["selector"] == "always"
 
 
+def test_parser_exit_disposition_flag_defaults_to_none_and_accepts_only_known_values() -> None:
+    parser = cli.build_parser()
+    assert parser.parse_args(["launch"]).exit_disposition is None
+    for value in ("publish", "local-only", "restore-startup"):
+        assert parser.parse_args(["launch", "--exit-disposition", value]).exit_disposition == value
+    with pytest.raises(SystemExit):
+        parser.parse_args(["launch", "--exit-disposition", "delete-everything"])
+
+
+def test_main_forwards_exit_disposition_override_to_launch(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
+    calls: list[dict[str, object]] = []
+
+    def fake_launch(_config_path, **kwargs):
+        calls.append(kwargs)
+        return {"schema_version": "1.0.0", "command": "launch", "result": {"state": "COMPLETE"}}
+
+    monkeypatch.setattr(cli, "launch", fake_launch)
+    config = tmp_path / "config.local.json"
+    assert cli.main(["--config", str(config), "--json", "launch", "--exit-disposition", "local-only"]) == 0
+    json.loads(capsys.readouterr().out)
+    assert calls[-1]["exit_disposition"] == "local-only"
+    assert cli.main(["--config", str(config), "--json", "launch"]) == 0
+    json.loads(capsys.readouterr().out)
+    assert calls[-1]["exit_disposition"] is None
+
+
 def test_main_routes_commands_to_their_semantic_handlers(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
     calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
 

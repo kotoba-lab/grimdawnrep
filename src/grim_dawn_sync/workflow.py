@@ -18,7 +18,7 @@ from grim_dawn_sync.errors import EXIT_CONFLICT, EXIT_RECOVERY_REQUIRED, EXIT_VA
 from grim_dawn_sync.git_vault import GitVault
 from grim_dawn_sync.launcher import DPYesLauncher
 from grim_dawn_sync.manifest import _reject_unsafe, build_manifest, stable_manifest
-from grim_dawn_sync.session_lock import acquire_lock, release_bookmark_lock, release_lock
+from grim_dawn_sync.session_lock import acquire_lock, release_bookmark_lock, release_lock, release_without_publish
 from grim_dawn_sync.session_start import (
     SESSION_START_ID_PATTERN,
     create_session_start_archive,
@@ -30,7 +30,7 @@ from grim_dawn_sync.snapshot import _copy_verified, _manifest, apply_restore, ar
 from grim_dawn_sync.state import SyncState, load_state, save_state_if_unchanged
 from grim_dawn_sync.validation import destructive_change, validate_players
 from grim_dawn_sync.bookmarks import create_displaced_head_bookmark_locked
-from grim_dawn_sync.selection import SelectionPlan, SelectionRegistry
+from grim_dawn_sync.selection import SelectionPlan, SelectionRegistry, allowed_exit_disposition_transition
 
 
 class WorkflowState(str, Enum):
@@ -38,6 +38,7 @@ class WorkflowState(str, Enum):
     ARCHIVE_BEFORE_RESTORE="ARCHIVE_BEFORE_RESTORE"; APPLY_REMOTE_SAVE="APPLY_REMOTE_SAVE"; START_DPYES="START_DPYES"
     WAIT_GAME_START="WAIT_GAME_START"; WAIT_GAME_EXIT="WAIT_GAME_EXIT"; WAIT_SAVE_STABLE="WAIT_SAVE_STABLE"
     VALIDATE_SAVE="VALIDATE_SAVE"; ARCHIVE_AFTER_GAME="ARCHIVE_AFTER_GAME"; UPDATE_VAULT="UPDATE_VAULT"
+    EXIT_DISPOSITION_CONFIRM="EXIT_DISPOSITION_CONFIRM"; RESTORE_SESSION_START="RESTORE_SESSION_START"
     COMMIT="COMMIT"; PUSH="PUSH"; RELEASE_LOCK="RELEASE_LOCK"; COMPLETE="COMPLETE"
 
 
@@ -90,6 +91,7 @@ class WorkflowAdapters(Protocol):
     def mark_committed(self, lock: Any, oid: str, root_hash: str) -> None: ...
     def push(self, oid: str) -> str: ...
     def release(self, lock: Any, oid: str, manifest: dict) -> None: ...
+    def release_without_publish(self, lock: Any) -> None: ...
 
 
 class DomainAdapters:
@@ -170,6 +172,17 @@ class DomainAdapters:
         if self._selection_original_state is None:
             raise SyncError("adapter_contract_invalid", "No recoverable original state for lock release.", EXIT_RECOVERY_REQUIRED)
         release_bookmark_lock(self.vault, lock, self._selection_original_state, state_path=self.state_path)
+    def release_without_publish(self, lock: Any) -> None:
+        """Release a lock after ``local-only``/``restore-startup`` without any push.
+
+        Valid any time after ``acquire``, once every local-only mutation
+        (session-start snapshot, ``archive_after_game``, and an optional
+        restore-startup swap) is finished.  ``last_applied_remote_commit`` and
+        ``last_applied_manifest_root_hash`` are left exactly as they were.
+        """
+        if self._selection_original_state is None:
+            raise SyncError("adapter_contract_invalid", "No recoverable original state for lock release.", EXIT_RECOVERY_REQUIRED)
+        release_without_publish(self.vault, lock, self._selection_original_state, state_path=self.state_path)
     def prepare_local_restore(self, archive_id: str, session: str):
         """Stage a verified session-start archive's save tree (never its metadata sidecar)."""
         archives_root = self.local_root / "archives"
@@ -326,7 +339,7 @@ class LaunchWorkflow:
         self.last_success=state
     # Needed only by the selection path.  ``run`` never takes a session-start
     # snapshot, so these stay out of _REQUIRED_METHODS.
-    _SELECTION_REQUIRED_METHODS = ("session_start_snapshot", "release_unmutated_lock")
+    _SELECTION_REQUIRED_METHODS = ("session_start_snapshot", "release_unmutated_lock", "release_without_publish")
     def _require_adapter_contract(self, *, extra: tuple[str, ...] = ()) -> None:
         """Fail before preflight (and therefore before mutations) for incomplete fakes/adapters."""
         missing=[name for name in (*self._REQUIRED_METHODS, *extra) if not callable(getattr(self.adapters,name,None))]
@@ -354,7 +367,8 @@ class LaunchWorkflow:
         raise SyncError("reconcile_inconsistent","Save baselines are inconsistent; run recover.",EXIT_RECOVERY_REQUIRED)
 
     def execute_selection_plan(self, plan: SelectionPlan, registry: SelectionRegistry, *,
-                               context_revalidate: Callable[[str], None] | None = None) -> dict[str, str]:
+                               context_revalidate: Callable[[str], None] | None = None,
+                               exit_disposition_gate: Callable[[str], str] | None = None) -> dict[str, str]:
         """Execute one canonical selection only after its final stale check.
 
         This intentionally leaves the legacy ``run`` path intact while CLI/UI
@@ -364,6 +378,7 @@ class LaunchWorkflow:
         """
         lock = None; manifest: dict | None = None; safe_oid: str | None = None; safe_root_hash: str | None = None
         acquire_started = False
+        session_start_archive_id: str | None = None
         archive_id: str | None = None; quarantine_id: str | None = None
         archive_root: str | None = None; quarantine_root: str | None = None
         def capture_destinations() -> None:
@@ -460,7 +475,10 @@ class LaunchWorkflow:
                 # The adapter re-scans live itself (it needs the full manifest
                 # to archive, not just a root hash) and verifies that scan
                 # against this already-established root before publishing.
-                session_start_fn(
+                # Its returned archive ID is retained only for a possible
+                # later restore-startup disposition; it is never surfaced to
+                # a caller and never treated as an arbitrary path.
+                session_start_archive_id = session_start_fn(
                     canonical.expected_live_root_hash, session_id=self.session,
                     launched_from_candidate_kind=canonical.candidate_kind,
                 )
@@ -543,6 +561,56 @@ class LaunchWorkflow:
             self._at(WorkflowState.ARCHIVE_AFTER_GAME); archive_root = self._call("archive_after_game", manifest); capture_destinations()
             if canonical.mode == "promote-only" and self._call("live_manifest").get("root_hash") != canonical.selected_root_hash:
                 raise SyncError("selected_save_changed", "Selected save changed before publication.", EXIT_RECOVERY_REQUIRED)
+            # The exit disposition was fixed before the game ever launched.
+            # promote-only never launches, so it is always "publish" (enforced
+            # when the plan was built) and never reaches this gate. A launch
+            # may still be downgraded here, once, in the only safe direction:
+            # away from publishing, never back toward it.
+            final_disposition = canonical.exit_disposition
+            if canonical.mode == "launch" and exit_disposition_gate is not None:
+                self._at(WorkflowState.EXIT_DISPOSITION_CONFIRM)
+                proposed = exit_disposition_gate(final_disposition)
+                if proposed != final_disposition:
+                    if not allowed_exit_disposition_transition(final_disposition, proposed):
+                        raise SyncError(
+                            "exit_disposition_transition_forbidden",
+                            "Exit disposition may only be downgraded away from publishing.",
+                            EXIT_CONFLICT,
+                        )
+                    final_disposition = proposed
+            if final_disposition == "local-only":
+                self._at(WorkflowState.RELEASE_LOCK)
+                self.adapters.release_without_publish(lock)
+                self._at(WorkflowState.COMPLETE, safe_oid=safe_oid, safe_root_hash=safe_root_hash)
+                return {"state": "COMPLETE", "exit_disposition": "local-only"}
+            if final_disposition == "restore-startup":
+                if session_start_archive_id is None:
+                    raise SyncError(
+                        "adapter_contract_invalid",
+                        "No session-start archive is available to restore.",
+                        EXIT_RECOVERY_REQUIRED,
+                    )
+                local_restore_fn = getattr(self.adapters, "prepare_local_restore", None)
+                if not callable(local_restore_fn):
+                    raise SyncError("adapter_contract_invalid", "Selection adapter cannot restore local session-start data.", EXIT_RECOVERY_REQUIRED)
+                self._at(WorkflowState.RESTORE_SESSION_START)
+                restore_plan = local_restore_fn(session_start_archive_id, f"{self.session}-exit-restore")
+                restore_plan = self._call("archive_before_restore", restore_plan)
+                capture_destinations()
+                self._call("apply_remote_save", restore_plan)
+                try: restored = self._call("wait_save_stable")
+                except SyncError:
+                    quarantine_root = self._call("rescue_raw", None); capture_destinations(); raise
+                if restored.get("root_hash") != restore_plan.source_manifest["root_hash"]:
+                    raise SyncError(
+                        "selected_restore_mismatch",
+                        "Restored start-of-session save did not match its verified manifest.",
+                        EXIT_RECOVERY_REQUIRED,
+                    )
+                self._at(WorkflowState.RELEASE_LOCK)
+                self.adapters.release_without_publish(lock)
+                self._at(WorkflowState.COMPLETE, safe_oid=safe_oid, safe_root_hash=restored.get("root_hash"))
+                return {"state": "COMPLETE", "exit_disposition": "restore-startup"}
             oid = self._call("snapshot", self.session, manifest, lambda value: self._at(WorkflowState(value)))
             safe_oid = oid; safe_root_hash = manifest["root_hash"]; self._call("mark_committed", lock, oid, safe_root_hash)
             self._at(WorkflowState.PUSH, safe_oid=oid, safe_root_hash=manifest["root_hash"])
@@ -554,7 +622,7 @@ class LaunchWorkflow:
                     raise SyncError("selected_publish_mismatch", "Published save does not match the selected version.", EXIT_RECOVERY_REQUIRED)
             self._at(WorkflowState.RELEASE_LOCK); self._call("release", lock, pushed, manifest)
             self._at(WorkflowState.COMPLETE, safe_oid=pushed, safe_root_hash=manifest["root_hash"])
-            return {"state": "COMPLETE", "commit": pushed}
+            return {"state": "COMPLETE", "commit": pushed, "exit_disposition": "publish"}
         except SyncError as error:
             capture_destinations()
             recovery_required = self.mutated or (acquire_started and error.code == "lock_push_unknown")

@@ -105,6 +105,35 @@ def test_valid_commit_phases_round_trip(tmp_path: Path) -> None:
         assert load_state(path) == state
 
 
+def test_unpublished_release_pending_round_trips_and_preserves_baseline(tmp_path: Path) -> None:
+    """T-E: the exit-disposition release phase preserves an unchanged baseline."""
+    with_baseline = _active(
+        phase="unpublished_release_pending",
+        pushed_commit="a" * 40,  # must equal base_commit
+        last_applied_remote_commit="e" * 40,
+        last_applied_manifest_root_hash="f" * 64,
+    )
+    without_baseline = _active(phase="unpublished_release_pending", pushed_commit="a" * 40)
+    for index, state in enumerate((with_baseline, without_baseline)):
+        path = tmp_path / f"unpublished-{index}.json"
+        save_state(path, state)
+        assert load_state(path) == state
+
+
+@pytest.mark.parametrize(
+    ("state", "message"),
+    [
+        (_active(phase="unpublished_release_pending", pushed_commit="a" * 40, local_commit="c" * 40), "preserve the exact prior baseline"),
+        (_active(phase="unpublished_release_pending", pushed_commit="d" * 40), "preserve the exact prior baseline"),
+        (_active(phase="unpublished_release_pending", pushed_commit="a" * 40, last_applied_remote_commit="e" * 40), "preserve the exact prior baseline"),
+        (_active(phase="unpublished_release_pending", pushed_commit="a" * 40, bookmark_ref="grim-dawn-save-" + "0" * 32), "Only bookmark publication states"),
+    ],
+)
+def test_unpublished_release_pending_invariants_fail_closed(state: SyncState, message: str) -> None:
+    with pytest.raises(SyncError, match=message):
+        parse_state(state.as_dict())
+
+
 def test_inactive_machine_baseline_requires_complete_snapshot_and_round_trips(tmp_path: Path) -> None:
     baseline = SyncState(last_applied_remote_commit="c" * 40, last_applied_manifest_root_hash="d" * 64, machine_id="machine")
     path = tmp_path / "baseline.json"; save_state(path, baseline)

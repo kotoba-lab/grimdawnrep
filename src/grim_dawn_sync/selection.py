@@ -21,6 +21,32 @@ from grim_dawn_sync.version_catalog import SaveCandidate, VersionCatalog
 
 SelectionMode = Literal["launch", "promote-only"]
 
+ExitDisposition = Literal["publish", "local-only", "restore-startup"]
+_EXIT_DISPOSITIONS = frozenset({"publish", "local-only", "restore-startup"})
+# The only transitions permitted after a launch's exit disposition was fixed
+# and the game has already exited: downgrading away from a push, never into
+# one, and never between the two non-publishing choices (there is no safety
+# reason to prefer one over the other after the fact, so neither is granted).
+_ALLOWED_EXIT_DISPOSITION_DOWNGRADES: frozenset[tuple[str, str]] = frozenset({
+    ("publish", "local-only"), ("publish", "restore-startup"),
+})
+
+
+def allowed_exit_disposition_transition(current: str, proposed: str) -> bool:
+    """Return whether ``proposed`` may replace ``current`` after game exit.
+
+    Keeping the same value is always allowed.  Only ``publish`` may be
+    downgraded, and only to ``local-only`` or ``restore-startup``.  Every
+    other change (including any change once ``current`` is already
+    ``local-only`` or ``restore-startup``) is rejected: a push cannot be
+    undone, so nothing may move back toward ``publish`` once it left it.
+    """
+    if current not in _EXIT_DISPOSITIONS or proposed not in _EXIT_DISPOSITIONS:
+        return False
+    if proposed == current:
+        return True
+    return (current, proposed) in _ALLOWED_EXIT_DISPOSITION_DOWNGRADES
+
 
 class ReconcileCase(str, Enum):
     EQUAL = "equal"
@@ -108,6 +134,7 @@ class SelectionPlan:
     expected_context_digest: str | None
     expected_remote_identity: tuple[str, str] | None
     confirmed: bool = False
+    exit_disposition: ExitDisposition = "publish"
 
 
 @dataclass(frozen=True)
@@ -168,9 +195,16 @@ class SelectionRegistry:
         return float(value)
 
     def build_plan(self, *, catalog_token: str, candidate_id: str, mode: SelectionMode, case: ReconcileCase, display_name: str | None = None, note: str | None = None,
-                   expected_context_digest: str | None = None, expected_remote_identity: tuple[str, str] | None = None) -> SelectionPlan:
+                   expected_context_digest: str | None = None, expected_remote_identity: tuple[str, str] | None = None,
+                   exit_disposition: str = "publish") -> SelectionPlan:
         if mode not in ("launch", "promote-only"):
             raise SyncError("invalid_selection_mode", "Selection mode is invalid.", EXIT_VALIDATION)
+        if exit_disposition not in _EXIT_DISPOSITIONS:
+            raise SyncError("invalid_exit_disposition", "Exit disposition is invalid.", EXIT_VALIDATION)
+        # Exit disposition only governs what happens after a game session ends;
+        # a promote-only plan never launches the game, so it always publishes.
+        if mode == "promote-only" and exit_disposition != "publish":
+            raise SyncError("invalid_exit_disposition", "Promote-only selections always publish.", EXIT_VALIDATION)
         directive = selection_policy(case)
         operation = "launch" if mode == "launch" else "promote"
         if operation not in directive.allowed_operations:
@@ -222,6 +256,7 @@ class SelectionRegistry:
             reconcile_case=ReconcileCase(case),
             expected_context_digest=expected_context_digest,
             expected_remote_identity=expected_remote_identity,
+            exit_disposition=exit_disposition,
         )
         self._plans[plan.plan_nonce] = _PlanRecord(plan, ReconcileCase(case))
         return plan

@@ -10,6 +10,7 @@ from grim_dawn_sync.errors import SyncError
 from grim_dawn_sync.selection import (
     ReconcileCase,
     SelectionRegistry,
+    allowed_exit_disposition_transition,
     cancel_selection,
     classify_reconciliation,
     selection_policy,
@@ -254,3 +255,55 @@ def test_nonce_tampering_and_expiry_before_or_after_confirmation_are_rejected() 
     with pytest.raises(SyncError) as caught:
         fresh.revalidate(approved, live_manifest=lambda: {"root_hash": "1" * 64}, remote_head=lambda: "a" * 40)
     assert caught.value.code == "catalog_expired"
+
+
+@pytest.mark.parametrize(("current", "proposed", "expected"), [
+    ("publish", "publish", True),
+    ("publish", "local-only", True),
+    ("publish", "restore-startup", True),
+    ("local-only", "local-only", True),
+    ("restore-startup", "restore-startup", True),
+    ("local-only", "publish", False),
+    ("restore-startup", "publish", False),
+    ("local-only", "restore-startup", False),
+    ("restore-startup", "local-only", False),
+    ("publish", "bogus", False),
+    ("bogus", "publish", False),
+])
+def test_allowed_exit_disposition_transition_matrix(current, proposed, expected) -> None:
+    assert allowed_exit_disposition_transition(current, proposed) is expected
+
+
+def test_build_plan_defaults_exit_disposition_to_publish() -> None:
+    registry = SelectionRegistry(); item = candidate("live", "1" * 64, None); value = catalog(item, live="1" * 64)
+    registry.register(value)
+    plan = registry.build_plan(catalog_token=value.token, candidate_id=item.candidate_id, mode="launch", case=ReconcileCase.EQUAL)
+    assert plan.exit_disposition == "publish"
+
+
+@pytest.mark.parametrize("disposition", ["local-only", "restore-startup"])
+def test_build_plan_accepts_explicit_launch_exit_disposition(disposition: str) -> None:
+    registry = SelectionRegistry(); item = candidate("remote_head", "2" * 64, "b" * 40); value = catalog(item)
+    registry.register(value)
+    plan = registry.build_plan(catalog_token=value.token, candidate_id=item.candidate_id, mode="launch",
+                               case=ReconcileCase.REMOTE_AHEAD, exit_disposition=disposition)
+    assert plan.exit_disposition == disposition
+
+
+def test_build_plan_rejects_unknown_exit_disposition() -> None:
+    registry = SelectionRegistry(); item = candidate("remote_head", "2" * 64, "b" * 40); value = catalog(item)
+    registry.register(value)
+    with pytest.raises(SyncError) as caught:
+        registry.build_plan(catalog_token=value.token, candidate_id=item.candidate_id, mode="launch",
+                            case=ReconcileCase.REMOTE_AHEAD, exit_disposition="delete-everything")
+    assert caught.value.code == "invalid_exit_disposition"
+
+
+@pytest.mark.parametrize("disposition", ["local-only", "restore-startup"])
+def test_build_plan_forces_publish_for_promote_only(disposition: str) -> None:
+    registry = SelectionRegistry(); item = candidate("remote_head", "2" * 64, "b" * 40); value = catalog(item)
+    registry.register(value)
+    with pytest.raises(SyncError) as caught:
+        registry.build_plan(catalog_token=value.token, candidate_id=item.candidate_id, mode="promote-only",
+                            case=ReconcileCase.REMOTE_AHEAD, exit_disposition=disposition)
+    assert caught.value.code == "invalid_exit_disposition"
