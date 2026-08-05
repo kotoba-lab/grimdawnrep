@@ -209,6 +209,16 @@ class VersionCatalogBuilder:
         # ``offline_policy=deny``.  Only a caller that has explicitly opted
         # into ``remote_check_failure="report"`` gets a stale-but-marked
         # catalog instead.  Every other step here stays fail-closed.
+        #
+        # Verified on a real vault 2026-08-05: "report" does NOT by itself make
+        # this build offline-tolerant.  ``managed_bookmarks()`` below queries
+        # the remote too and raises ``bookmark_list_failed`` when it is
+        # unreachable, so a genuinely offline terminal still fails closed
+        # whichever mode it picks.  Reporting is therefore currently reachable
+        # only for a remote that answers bookmark queries but failed the fetch.
+        # Making a fully offline catalog work would require extending the same
+        # opt-in down through the bookmark/legacy tag steps; that is deliberately
+        # not done here, because ``deny`` is the only supported offline_policy.
         try:
             self.vault.fetch()
         except SyncError as error:
