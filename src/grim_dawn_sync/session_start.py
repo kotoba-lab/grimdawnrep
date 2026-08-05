@@ -160,7 +160,8 @@ def _integrity_only(_root: Path, _manifest: dict) -> dict:
 def create_session_start_archive(archives_root: Path, live_root: Path, *, manifest: dict, machine_id: str,
                                   session_id: str, launched_from_candidate_kind: str,
                                   retries: int = 1, window_seconds: float = 0,
-                                  validator: Validator = _integrity_only) -> str:
+                                  validator: Validator = _integrity_only,
+                                  now: datetime | None = None) -> str:
     """Publish a verified session-start archive; fail closed, never partially visible."""
     _reject_existing_ancestors(archives_root)
     try:
@@ -176,7 +177,7 @@ def create_session_start_archive(archives_root: Path, live_root: Path, *, manife
     _copy_verified(live_root, stage, manifest, machine_id, retries, window_seconds, validator)
     write_session_start_metadata(
         stage, root_hash=manifest["root_hash"], machine_id=machine_id, session_id=session_id,
-        launched_from_candidate_kind=launched_from_candidate_kind,
+        launched_from_candidate_kind=launched_from_candidate_kind, now=now,
     )
     try:
         stage_info = stage.lstat()

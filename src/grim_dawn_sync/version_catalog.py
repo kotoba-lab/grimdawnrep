@@ -288,8 +288,20 @@ class VersionCatalogBuilder:
         if self.archives_root is not None:
             # Local-only, opaque-id candidates: safety (link/reparse rejection,
             # schema, and root-hash re-verification) is enforced inside the scan.
-            for archive_id, manifest, _meta in scan_session_start_archives(self.archives_root, machine_id=self.machine_id):
-                candidates.append(candidate("session_start", "This launch's pre-session data", None, manifest,
+            for archive_id, manifest, meta in scan_session_start_archives(self.archives_root, machine_id=self.machine_id):
+                # Every session-start archive visible here was published by an
+                # *earlier* launch: this launch's own snapshot is only taken
+                # after the lock is acquired, which is after selection.  Naming
+                # them "this launch's" would misidentify which session a
+                # restore would roll back to.
+                #
+                # Their manifest is produced by rescanning the archive, so its
+                # created_at is the scan time, not the moment the snapshot was
+                # taken.  Use the recorded metadata time instead: several
+                # archives commonly share one root hash, and the creation time
+                # is then the only thing that tells them apart.
+                candidates.append(candidate("session_start", "Earlier launch's start-of-session data", None,
+                                            {**manifest, "created_at": meta["created_at"]},
                                             source_archive_id=archive_id))
         now = self._clock_now()
         scope = hashlib.sha256(

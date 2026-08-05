@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 import time as time_module
 import pytest
@@ -224,6 +225,34 @@ def test_catalog_lists_session_start_archive_with_no_commit_and_no_committed_at(
     assert item.committed_at is None
     assert item.root_hash == live_manifest_before_change["root_hash"]
     assert item.source_archive_id == archive_id
+
+
+def test_session_start_candidates_carry_their_recorded_creation_time_and_an_honest_name(tmp_path: Path) -> None:
+    """Found on a real machine: the rescan-derived manifest made every archive
+    report the scan time, so two archives sharing one root hash were
+    indistinguishable -- the exact T-A failure, reintroduced.  They must show
+    the time recorded in .session-start.json instead, and must not claim to
+    belong to the launch currently choosing a candidate."""
+    _, one, _ = clone_pair(tmp_path); source = save(tmp_path / "source", b"live"); vault = GitVault(one)
+    vault.push(vault.snapshot(source, machine_id="a", session_id="one", validator=valid))
+    archives = tmp_path / "archives"
+    # Two archives with identical content but different recorded creation times.
+    pre = save(tmp_path / "pre-launch", b"identical-content")
+    manifest = build_manifest(pre, machine_id="a")
+    for index, session in enumerate(("11111111-1111-1111-1111-111111111111",
+                                     "22222222-2222-2222-2222-222222222222")):
+        create_session_start_archive(archives, pre, manifest=manifest, machine_id="a", session_id=session,
+                                     launched_from_candidate_kind="live",
+                                     now=datetime(2026, 8, 5, 7 + index, 30, 0, tzinfo=timezone.utc))
+    catalog = VersionCatalogBuilder(vault, source, machine_id="a", archives_root=archives).build()
+    entries = [entry for item in catalog.candidates for entry in (item, *item.aliases)
+               if entry.kind == "session_start"]
+    assert len(entries) == 2
+    assert sorted(entry.created_at for entry in entries) == ["2026-08-05T07:30:00Z", "2026-08-05T08:30:00Z"]
+    # Same root hash, so the recorded time is the only thing distinguishing them.
+    assert len({entry.created_at for entry in entries}) == 2
+    for entry in entries:
+        assert "This launch" not in entry.display_name
 
 
 def test_catalog_without_archives_root_never_scans_local_archives(tmp_path: Path) -> None:
