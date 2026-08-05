@@ -11,7 +11,7 @@ from grim_dawn_sync.errors import SyncError
 from grim_dawn_sync.selection import CancelledSelection
 from grim_dawn_sync.selector_ui import SelectionRequest
 from grim_dawn_sync.state import SyncState
-from grim_dawn_sync.version_catalog import CandidateAlias, ManifestDiff, SaveCandidate, VersionCatalog
+from grim_dawn_sync.version_catalog import CandidateAlias, ManifestDiff, RemoteCheckReport, SaveCandidate, VersionCatalog
 
 
 def _candidate(candidate_id: str, kind: str, root: str, commit: str | None) -> SaveCandidate:
@@ -21,7 +21,8 @@ def _candidate(candidate_id: str, kind: str, root: str, commit: str | None) -> S
 
 def _install_context(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, live: str, remote: str,
                      baseline: str, token: str = "t" * 32,
-                     selection_policy: str = "on_diff") -> tuple[Path, VersionCatalog, list[object]]:
+                     selection_policy: str = "on_diff",
+                     remote_check: object | None = None) -> tuple[Path, VersionCatalog, list[object]]:
     config_path = tmp_path / "config.local.json"
     config = SimpleNamespace(save_root=tmp_path / "live", vault_repo=tmp_path / "vault", remote="origin",
                              branch="main", machine_id="machine", stable_scan_retries=1,
@@ -32,7 +33,8 @@ def _install_context(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, live: s
     items = [_candidate("live-id", "live", live, None)]
     if remote != live:
         items.append(_candidate("remote-id", "remote_head", remote, commit))
-    catalog = VersionCatalog(token, commit, live, tuple(items))
+    catalog_kwargs = {} if remote_check is None else {"remote_check": remote_check}
+    catalog = VersionCatalog(token, commit, live, tuple(items), **catalog_kwargs)
     calls: list[object] = []
 
     class Vault:
@@ -250,6 +252,64 @@ def test_versions_json_projection_does_not_expose_roots_commits_or_labels(monkey
     rendered = cli._render(result, as_json=True)
     assert live not in rendered and remote not in rendered and "a" * 40 not in rendered
     assert "machine" not in rendered and "remote_head" in rendered
+
+
+def test_versions_json_includes_remote_check_times_and_status_only(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    live, remote = "1" * 64, "2" * 64
+    report = RemoteCheckReport(status="ok", checked_at="2026-08-05T02:00:00+00:00", error_code=None,
+                               head_committed_at="2026-08-05T02:39:47+00:00")
+    config_path, _, _ = _install_context(monkeypatch, tmp_path, live=live, remote=remote, baseline=live,
+                                         remote_check=report)
+    result = cli.versions(config_path)
+    assert result["remote_check"] == {
+        "status": "ok", "checked_at": "2026-08-05T02:00:00+00:00",
+        "error_code": None, "head_committed_at": "2026-08-05T02:39:47+00:00",
+    }
+    rendered = cli._render(result, as_json=True)
+    assert live not in rendered and remote not in rendered and "a" * 40 not in rendered
+
+
+def test_headless_launch_fails_closed_when_remote_check_failed_without_confirm(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """T-B 4.2/4.4: a failed remote check must never look like a normal,
+    unwarned launch to a headless (no-UI) caller."""
+    root = "1" * 64
+    report = RemoteCheckReport(status="failed", checked_at=None, error_code="git_command_failed",
+                               head_committed_at=None)
+    config_path, _, calls = _install_context(
+        monkeypatch, tmp_path, live=root, remote=root, baseline=root, remote_check=report,
+    )
+    with pytest.raises(SyncError) as error:
+        cli.launch(config_path, as_json=True)
+    assert error.value.code == "remote_check_failed"
+    assert error.value.details["remote_check"]["status"] == "failed"
+    assert "COMPLETE" not in str(calls)
+
+
+def test_headless_launch_confirm_flag_proceeds_past_a_failed_remote_check(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    root = "1" * 64
+    report = RemoteCheckReport(status="failed", checked_at=None, error_code="git_command_failed",
+                               head_committed_at=None)
+    config_path, _, _ = _install_context(
+        monkeypatch, tmp_path, live=root, remote=root, baseline=root, remote_check=report,
+    )
+    result = cli.launch(config_path, as_json=True, confirmed=True)
+    assert result["result"]["state"] == "COMPLETE"
+
+
+def test_skipped_remote_check_does_not_block_headless_launch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A catalog that never attempted a remote check (e.g. not yet wired into
+    a caller's flow) stays non-blocking; only an attempted-and-failed check
+    is fail-closed."""
+    root = "1" * 64
+    config_path, _, _ = _install_context(monkeypatch, tmp_path, live=root, remote=root, baseline=root)
+    result = cli.launch(config_path, as_json=True)
+    assert result["result"]["state"] == "COMPLETE"
 
 
 def test_single_build_rejects_live_change_during_lightweight_close(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

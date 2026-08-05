@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+import time as time_module
 import pytest
 
 from grim_dawn_sync.git_vault import GitVault
 from grim_dawn_sync.errors import SyncError
-from grim_dawn_sync.version_catalog import VersionCatalogBuilder, _diff
+from grim_dawn_sync.version_catalog import RemoteCheckReport, VersionCatalogBuilder, _diff
 from test_save_sync_git_vault import checkout_remote_main, clone_pair, git, save, valid
 
 
@@ -95,3 +96,81 @@ def test_malformed_history_or_tag_failure_is_never_silently_skipped(tmp_path: Pa
     with pytest.raises(SyncError) as caught:
         VersionCatalogBuilder(TagVault(), source, machine_id="a").build()  # type: ignore[arg-type]
     assert caught.value.code == "malformed_legacy_tag"
+
+
+def test_remote_check_report_fields_are_independent_and_frozen() -> None:
+    """RemoteCheckReport's three timestamps are distinct axes, never coalesced."""
+    ok = RemoteCheckReport(status="ok", checked_at="2026-08-05T02:00:00+00:00", error_code=None,
+                           head_committed_at="2026-08-05T02:39:47+00:00")
+    assert ok.checked_at != ok.head_committed_at
+    assert ok.status == "ok" and ok.error_code is None
+
+    failed = RemoteCheckReport(status="failed", checked_at=None, error_code="git_command_failed", head_committed_at=None)
+    assert failed.status == "failed" and failed.checked_at is None and failed.error_code == "git_command_failed"
+    assert failed.head_committed_at is None
+
+    skipped = RemoteCheckReport(status="skipped", checked_at=None, error_code=None, head_committed_at=None)
+    assert skipped.status == "skipped" and skipped.checked_at is None and skipped.error_code is None
+
+
+def test_build_records_ok_remote_check_with_checked_at_and_head_committed_at(tmp_path: Path) -> None:
+    _, one, _ = clone_pair(tmp_path); source = save(tmp_path / "source", b"one"); vault = GitVault(one)
+    commit = vault.snapshot(source, machine_id="a", session_id="one", validator=valid); vault.push(commit)
+    catalog = VersionCatalogBuilder(vault, source, machine_id="a").build()
+    report = catalog.remote_check
+    assert report.status == "ok" and report.error_code is None
+    assert report.checked_at is not None and report.head_committed_at is not None
+    # The three timestamps are independent: the candidate's own save-creation
+    # time must not be silently substituted for either remote-check time.
+    remote_head_candidate = next(item for item in catalog.candidates if item.kind == "live")
+    assert remote_head_candidate.created_at != report.checked_at
+
+
+def test_fetch_failure_marks_remote_check_failed_without_aborting_catalog_build(tmp_path: Path) -> None:
+    """T-B 4.1: a failed remote reach must not silently disappear or hard-fail.
+
+    The catalog still builds from whatever was locally cached by a prior
+    successful fetch, but is explicitly marked unconfirmed.
+    """
+    _, one, _ = clone_pair(tmp_path); source = save(tmp_path / "source", b"one"); vault = GitVault(one)
+    commit = vault.snapshot(source, machine_id="a", session_id="one", validator=valid); vault.push(commit)
+    vault.fetch()  # populate the local remote-tracking ref once, successfully
+
+    class FetchFailsVault(GitVault):
+        def fetch(self) -> None:
+            raise SyncError("git_command_failed", "simulated network failure", 4)
+
+    failing_vault = FetchFailsVault(one)
+    catalog = VersionCatalogBuilder(failing_vault, source, machine_id="a").build()
+    report = catalog.remote_check
+    assert report.status == "failed"
+    assert report.checked_at is None
+    assert report.error_code == "git_command_failed"
+    # The stale, locally cached remote head is still readable and reported.
+    assert report.head_committed_at is not None
+    assert catalog.remote_head == commit
+    all_entries = [entry for item in catalog.candidates for entry in (item, *item.aliases)]
+    assert any(entry.commit == commit for entry in all_entries)
+
+
+def test_same_root_hash_different_commits_keep_distinct_committed_at_provenance(tmp_path: Path) -> None:
+    """T-A repro: identical save content pushed twice must stay identifiable.
+
+    Both commits share one root_hash and coalesce into one row, but their
+    committer dates (unlike ``created_at``, which merely reflects each
+    snapshot's own scan time) must remain readable per provenance entry so a
+    user can tell which commit is which.
+    """
+    _, one, _ = clone_pair(tmp_path); source = save(tmp_path / "source", b"same"); vault = GitVault(one)
+    first = vault.snapshot(source, machine_id="a", session_id="first", validator=valid); vault.push(first)
+    time_module.sleep(1.1)  # commit timestamps have one-second resolution
+    second = vault.snapshot(source, machine_id="b", session_id="second", validator=valid); vault.push(second)
+
+    catalog = VersionCatalogBuilder(vault, source, machine_id="a").build()
+    assert len(catalog.candidates) == 1
+    representative = catalog.candidates[0]
+    all_entries = [representative, *representative.aliases]
+    by_commit = {entry.commit: entry.committed_at for entry in all_entries if entry.commit is not None}
+    assert set(by_commit) == {first, second}
+    assert by_commit[first] is not None and by_commit[second] is not None
+    assert by_commit[first] != by_commit[second]

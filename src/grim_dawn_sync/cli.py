@@ -19,7 +19,7 @@ from grim_dawn_sync.config import default_config_path, load_config
 from grim_dawn_sync.errors import EXIT_OK, SyncError
 from grim_dawn_sync.manifest import stable_manifest
 from grim_dawn_sync.discovery import cloud_candidates, game_candidates, inspect_path
-from grim_dawn_sync.workflow import LaunchWorkflow
+from grim_dawn_sync.workflow import JsonlLog, LaunchWorkflow, WorkflowState
 from grim_dawn_sync.shortcut import install_shortcut, migrate_shortcut
 from grim_dawn_sync.git_vault import GitVault
 from grim_dawn_sync.session_lock import (
@@ -84,7 +84,7 @@ def build_parser() -> argparse.ArgumentParser:
     launch_parser = subparsers.add_parser("launch", help="select a verified save and run the synchronized DPYes launch workflow")
     launch_parser.add_argument("--select", help="auto-safe or an opaque candidate ID")
     launch_parser.add_argument("--catalog-token", help="short-lived catalog capability for --select")
-    launch_parser.add_argument("--confirm", action="store_true", help="second confirmation for a history/bookmark selection")
+    launch_parser.add_argument("--confirm", action="store_true", help="second confirmation for a history/bookmark selection or a failed remote check")
     launch_parser.add_argument("--selector", choices=["always", "on-diff"], help="override the configured selection_policy for this run")
     subparsers.add_parser("versions", help="list verified save-version candidates")
     bookmark_parser = subparsers.add_parser("bookmark", help="create a named immutable bookmark")
@@ -183,15 +183,34 @@ def _vault(config) -> GitVault:
     return GitVault(config.vault_repo, remote=config.remote, branch=config.branch)
 
 
+def _remote_check_payload(catalog: Any) -> dict[str, Any]:
+    """Times and status only; never the OID, root hash, or any identifier."""
+    report = catalog.remote_check
+    return {"status": report.status, "checked_at": report.checked_at, "error_code": report.error_code,
+            "head_committed_at": report.head_committed_at}
+
+
+def _log_remote_check(config_path: Path, config: Any, catalog: Any) -> None:
+    # Best-effort audit trail; logging must never block or fail a read-only scan.
+    try:
+        JsonlLog(config_path.parent / "logs" / "launch.jsonl", machine_id=config.machine_id).write(
+            WorkflowState.BUILD_CATALOG, "remote_check", remote_check_status=catalog.remote_check.status,
+        )
+    except Exception:
+        pass
+
+
 def versions(config_path: Path) -> dict[str, Any]:
     config = load_config(config_path)
     _, catalog, _, _ = _fresh_catalog(config_path, config)
+    _log_remote_check(config_path, config, catalog)
     selectable = [
         catalog.candidate(candidate_id)
         for item in catalog.candidates
         for candidate_id in (item.candidate_id, *(alias.candidate_id for alias in item.aliases))
     ]
     return {"schema_version": "1.0.0", "command": "versions", "catalog_token": catalog.token,
+            "remote_check": _remote_check_payload(catalog),
             "candidates": [{"candidate_id": item.candidate_id, "kind": item.kind,
                             "file_count": item.file_count, "character_count": item.character_count,
                             "total_bytes": item.total_bytes,
@@ -553,6 +572,7 @@ def _execute_selection_command(
                 case_value = _selection_case(config_path, catalog_value, vault_value)
                 captured.update(vault=vault_value, catalog=catalog_value, state=state_value,
                                 projection=projection_value, case=case_value)
+                _log_remote_check(config_path, config, catalog_value)
                 return catalog_value
             def directive_after_scan(_catalog: Any) -> SelectionDirective:
                 base = selection_policy(captured["case"], policy=effective_policy)
@@ -577,6 +597,19 @@ def _execute_selection_command(
                 config_path, config, supplied_token=(catalog_token if selected and selected != "auto-safe" else None),
             )
             case = _selection_case(config_path, catalog, vault)
+            _log_remote_check(config_path, config, catalog)
+            # A headless caller (as_json or an explicit --select) never sees the
+            # interactive warning banner, so a failed remote check must stay
+            # fail-closed here exactly as an unreachable remote already did
+            # before this feature existed.  --confirm (already used for
+            # history/bookmark second confirmation) is reused as the one
+            # explicit override, so no new bypass surface is introduced.
+            if catalog.remote_check.status == "failed" and not confirmed:
+                raise SyncError(
+                    "remote_check_failed",
+                    "Remote check failed; pass --confirm to proceed with the last verified candidates.",
+                    3, details={"remote_check": _remote_check_payload(catalog)},
+                )
         directive = selection_policy(case, policy=effective_policy)
         registry = _registry_for_catalog(catalog); registry.register(catalog)
 
@@ -586,7 +619,8 @@ def _execute_selection_command(
                 confirmation_granted=(command == "promote" or confirmed),
             )
         elif command == "promote" and as_json:
-            raise SyncError("selection_required", "Promotion requires an explicit current selection.", 3)
+            raise SyncError("selection_required", "Promotion requires an explicit current selection.", 3,
+                           details={"remote_check": _remote_check_payload(catalog)})
         elif not directive.show_selector:
             # Policy may only widen this to True (never narrow it): on_diff's
             # EQUAL auto-selection keeps working exactly as before, while
@@ -594,9 +628,11 @@ def _execute_selection_command(
             # even for what would otherwise be an automatic EQUAL launch.
             request = request or _automatic_request(catalog, "launch")
         elif selected == "auto-safe" or as_json:
-            raise SyncError("selection_required", "Save versions differ; an explicit current selection is required.", 3)
+            raise SyncError("selection_required", "Save versions differ; an explicit current selection is required.", 3,
+                           details={"remote_check": _remote_check_payload(catalog)})
         elif request is None:
-            raise SyncError("selection_required", "An explicit selection is required.", 3)
+            raise SyncError("selection_required", "An explicit selection is required.", 3,
+                           details={"remote_check": _remote_check_payload(catalog)})
 
         if isinstance(request, CancelledSelection):
             return {"schema_version": "1.0.0", "command": command, "result": {"state": "CANCELLED"}}

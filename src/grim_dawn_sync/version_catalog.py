@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 import hashlib
 import math
 from pathlib import Path, PurePosixPath
@@ -37,6 +38,7 @@ class CandidateAlias:
     created_at: str
     commit: str | None
     note: str | None = None
+    committed_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -55,6 +57,25 @@ class SaveCandidate:
     diff_from_live: ManifestDiff
     note: str | None = None
     aliases: tuple[CandidateAlias, ...] = ()
+    committed_at: str | None = None
+
+
+@dataclass(frozen=True)
+class RemoteCheckReport:
+    """Three independently-tracked timestamps; never coalesced into one.
+
+    ``checked_at`` is when this build actually reached (or tried to reach)
+    the remote; ``head_committed_at`` is the remote head commit's own
+    committer date.  A candidate's ``created_at`` (save creation time) is a
+    third, separate axis tracked on the candidate itself.
+    """
+    status: Literal["ok", "failed", "skipped"]
+    checked_at: str | None
+    error_code: str | None
+    head_committed_at: str | None
+
+
+_DEFAULT_REMOTE_CHECK = RemoteCheckReport(status="skipped", checked_at=None, error_code=None, head_committed_at=None)
 
 
 @dataclass(frozen=True)
@@ -64,6 +85,7 @@ class VersionCatalog:
     live_root_hash: str
     candidates: tuple[SaveCandidate, ...]
     baseline_root_hash: str | None = None
+    remote_check: RemoteCheckReport = _DEFAULT_REMOTE_CHECK
 
     def candidate(self, candidate_id: str) -> SaveCandidate:
         for item in self.candidates:
@@ -73,8 +95,12 @@ class VersionCatalog:
                 if alias.candidate_id == candidate_id:
                     return replace(item, candidate_id=alias.candidate_id, kind=alias.kind,
                                    display_name=alias.display_name, created_at=alias.created_at,
-                                   commit=alias.commit, note=alias.note, aliases=())
+                                   commit=alias.commit, note=alias.note, committed_at=alias.committed_at, aliases=())
         raise SyncError("unknown_candidate", "Selected save candidate is not in this catalog.", EXIT_VALIDATION)
+
+
+def _iso_utc(timestamp: float) -> str:
+    return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
 
 
 def _labels(manifest: dict) -> tuple[str, ...]:
@@ -125,7 +151,8 @@ def _coalesce(candidates: list[SaveCandidate]) -> tuple[SaveCandidate, ...]:
         values = groups[root]
         representative = min(values, key=lambda item: (_REPRESENTATIVE_PRIORITY[item.kind], values.index(item)))
         aliases = tuple(
-            CandidateAlias(item.candidate_id, item.kind, item.display_name, item.created_at, item.commit, item.note)
+            CandidateAlias(item.candidate_id, item.kind, item.display_name, item.created_at, item.commit,
+                           item.note, item.committed_at)
             for item in values if item is not representative
         )
         result.append(replace(representative, aliases=aliases))
@@ -147,19 +174,46 @@ class VersionCatalogBuilder:
         self.baseline_root_hash = baseline_root_hash
         self.clock = clock
 
+    def _clock_now(self) -> float:
+        try:
+            now = self.clock()
+        except Exception as error:
+            raise SyncError("catalog_clock_invalid", "Catalog clock is unavailable.", EXIT_VALIDATION) from error
+        if isinstance(now, bool) or not isinstance(now, (int, float)) or not math.isfinite(now) or now < 0:
+            raise SyncError("catalog_clock_invalid", "Catalog clock is invalid.", EXIT_VALIDATION)
+        return float(now)
+
     def build(self, *, history_limit: int = 10) -> VersionCatalog:
         # Fetch only updates the local remote-tracking ref; it neither checks
         # out nor changes live saves, sync state, locks, commits, or tags.
         live = stable_manifest(self.live_root, machine_id=self.machine_id, retries=self.retries, window_seconds=self.window_seconds)
         self.vault.preflight()
-        self.vault.fetch()
+        # The remote check itself (network fetch) is the one step allowed to
+        # fail without aborting catalog construction: a stale but locally
+        # verified view, clearly marked as unconfirmed, is safer than an
+        # opaque hard failure that leaves the user with no candidates at all.
+        # Every other step here stays fail-closed exactly as before.
+        try:
+            self.vault.fetch()
+        except SyncError as error:
+            remote_status: Literal["ok", "failed", "skipped"] = "failed"
+            remote_error_code: str | None = error.code
+            checked_at: str | None = None
+        else:
+            remote_status = "ok"
+            remote_error_code = None
+            checked_at = _iso_utc(self._clock_now())
         remote_head = self.vault._oid(self.vault.remote_ref)
         commits = self.vault.remote_history(limit=history_limit)
         if remote_head is not None and (not commits or commits[0] != remote_head):
             raise SyncError("malformed_remote_history", "Remote history does not begin at remote main.")
+        head_committed_at = self.vault.commit_committed_at(remote_head) if remote_head is not None else None
+        remote_check = RemoteCheckReport(status=remote_status, checked_at=checked_at, error_code=remote_error_code,
+                                         head_committed_at=head_committed_at)
 
         snapshots = SnapshotValidationCache()
         metadata_by_commit: dict[str, dict] = {}
+        committed_at_by_commit: dict[str, str] = {}
         diff_by_root: dict[str, ManifestDiff] = {str(live["root_hash"]): ManifestDiff(0, 0, 0)}
 
         def snapshot(commit: str) -> dict:
@@ -170,13 +224,20 @@ class VersionCatalogBuilder:
                 metadata_by_commit[commit] = self.vault.read_vault_metadata(commit)
             return metadata_by_commit[commit]
 
+        def committed_at(commit: str | None) -> str | None:
+            if commit is None:
+                return None
+            if commit not in committed_at_by_commit:
+                committed_at_by_commit[commit] = self.vault.commit_committed_at(commit)
+            return committed_at_by_commit[commit]
+
         def candidate(kind: CandidateKind, display_name: str, commit: str | None, manifest: dict,
                       *, note: str | None = None) -> SaveCandidate:
             root_hash = str(manifest["root_hash"])
             if root_hash not in diff_by_root:
                 diff_by_root[root_hash] = _diff(live, manifest)
             return self._candidate(kind, display_name, commit, manifest, live, note=note,
-                                   diff=diff_by_root[root_hash])
+                                   diff=diff_by_root[root_hash], committed_at=committed_at(commit))
 
         candidates: list[SaveCandidate] = [candidate("live", "This device's current data", None, live)]
         for index, commit in enumerate(commits):
@@ -195,12 +256,7 @@ class VersionCatalogBuilder:
         for name, commit in self.vault.legacy_annotated_tags():
             manifest = snapshot(commit)
             candidates.append(candidate("legacy", name, commit, manifest))
-        try:
-            now = self.clock()
-        except Exception as error:
-            raise SyncError("catalog_clock_invalid", "Catalog clock is unavailable.", EXIT_VALIDATION) from error
-        if isinstance(now, bool) or not isinstance(now, (int, float)) or not math.isfinite(now) or now < 0:
-            raise SyncError("catalog_clock_invalid", "Catalog clock is invalid.", EXIT_VALIDATION)
+        now = self._clock_now()
         scope = hashlib.sha256(
             (f"{int(now) // 300}\0{self.machine_id}\0{live['root_hash']}\0{remote_head or ''}\0"
              f"{self.baseline_root_hash or ''}").encode("ascii")
@@ -218,11 +274,12 @@ class VersionCatalogBuilder:
             for item in _coalesce(candidates)
         )
         return VersionCatalog(token=uuid.uuid4().hex, remote_head=remote_head, live_root_hash=str(live["root_hash"]),
-                              candidates=scoped, baseline_root_hash=self.baseline_root_hash)
+                              candidates=scoped, baseline_root_hash=self.baseline_root_hash, remote_check=remote_check)
 
     @staticmethod
     def _candidate(kind: CandidateKind, display_name: str, commit: str | None, manifest: dict, live: dict, *,
-                   note: str | None = None, diff: ManifestDiff | None = None) -> SaveCandidate:
+                   note: str | None = None, diff: ManifestDiff | None = None,
+                   committed_at: str | None = None) -> SaveCandidate:
         seed = f"{kind}\0{commit or manifest['root_hash']}\0{manifest['root_hash']}".encode("ascii")
         candidate_id = hashlib.sha256(seed).hexdigest()[:32]
-        return SaveCandidate(candidate_id, kind, display_name, str(manifest["created_at"]), str(manifest["machine_id"]), str(manifest["root_hash"]), commit, int(manifest["character_count"]), int(manifest["file_count"]), int(manifest["total_bytes"]), _labels(manifest), diff or _diff(live, manifest), note)
+        return SaveCandidate(candidate_id, kind, display_name, str(manifest["created_at"]), str(manifest["machine_id"]), str(manifest["root_hash"]), commit, int(manifest["character_count"]), int(manifest["file_count"]), int(manifest["total_bytes"]), _labels(manifest), diff or _diff(live, manifest), note, committed_at=committed_at)

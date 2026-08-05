@@ -7,6 +7,7 @@ Locking and the CLI workflow deliberately live in later tickets.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 import hashlib
 import json
 import time
@@ -1002,6 +1003,24 @@ class GitVault:
                 "Remote commit save manifest is invalid.",
                 EXIT_VALIDATION,
             ) from error
+
+    def commit_committed_at(self, commit: str) -> str:
+        """Read the committer date of an already-verified commit OID.
+
+        Only accepts a 40/64-hex OID (via ``_oid_value``); it never resolves
+        an arbitrary ref expression, so a caller cannot smuggle a ref
+        fragment sourced from outside the vault's own validated commit list.
+        """
+        commit = _oid_value(commit)
+        result = self.runner.run("log", "-1", "--format=%cI", commit, check=False)
+        if result.returncode or not result.stdout.strip():
+            raise SyncError("git_command_failed", "Commit committer date could not be read.", EXIT_CONFLICT)
+        value = result.stdout.strip().splitlines()[0]
+        try:
+            datetime.fromisoformat(value)
+        except ValueError as error:
+            raise SyncError("malformed_commit_metadata", "Commit committer date was malformed.", EXIT_CONFLICT) from error
+        return value
 
     def _read_blob_batch(self, oids: Iterable[str], cache: dict[str, tuple[int, str]]) -> None:
         """Hash validated blob OIDs through bounded ``cat-file --batch`` chunks."""

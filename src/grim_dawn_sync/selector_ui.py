@@ -31,12 +31,41 @@ class SelectionPresenter(Protocol):
     def present_builder(self, build: Callable[[], VersionCatalog], directive: SelectionDirective | Callable[[VersionCatalog], SelectionDirective]) -> SelectionRequest | CancelledSelection: ...
 
 
-def _display_time(value: str) -> str:
+def _display_time(value: str | None) -> str:
+    if value is None:
+        return "Not applicable (no commit)"
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00")); local = parsed.astimezone()
         return f"{parsed.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')} / {local.strftime('%Y-%m-%d %H:%M %Z')}"
     except (ValueError, TypeError):
         return "Verified time unavailable"
+
+
+def _remote_check_summary_lines(catalog: VersionCatalog) -> str:
+    report = catalog.remote_check
+    return (f"Remote check: {_display_time(report.checked_at)} (status: {report.status})\n"
+            f"Selected candidate's save creation: see detail pane below\n"
+            f"Remote main's latest commit: {_display_time(report.head_committed_at)}")
+
+
+def _provenance_lines(item: SaveCandidate, catalog: VersionCatalog) -> str:
+    """List every coalesced provenance's kind, save-creation, and commit time.
+
+    Several distinct commits can share one root hash (T-A: two save pushes
+    with identical content, different commit times).  Without this, they are
+    indistinguishable in the UI even though only one row is shown per root.
+    """
+    representative = next((entry for entry in catalog.candidates if entry.root_hash == item.root_hash), None)
+    if representative is None:
+        return ""
+    entries = [representative, *representative.aliases]
+    if len(entries) <= 1:
+        return ""
+    lines = "\n".join(
+        f"  - {entry.kind}: save created {_display_time(entry.created_at)}; commit dated {_display_time(entry.committed_at)}"
+        for entry in entries
+    )
+    return f"Combined provenance for this save content ({len(entries)} entries share it):\n{lines}\n"
 
 
 def _candidate_detail_text(item: SaveCandidate, catalog: VersionCatalog, directive: SelectionDirective,
@@ -52,11 +81,13 @@ def _candidate_detail_text(item: SaveCandidate, catalog: VersionCatalog, directi
                if item.kind in {"history", "bookmark", "legacy"} else "Warning: verify that this is the intended game progress before launch.")
     char_diff = (f"Character directories: +{', '.join(diff.character_dirs_added) or 'none'}; "
                  f"-{', '.join(diff.character_dirs_removed) or 'none'}; changed {', '.join(diff.character_dirs_changed) or 'none'}.")
-    return (f"Created: {_display_time(item.created_at)}\nPublished by: {item.machine_id}\n"
+    provenance = _provenance_lines(item, catalog)
+    return (f"Save created: {_display_time(item.created_at)}\nCommit dated: {_display_time(item.committed_at)}\n"
+            f"Published by: {item.machine_id}\n"
             f"Characters: {item.character_count} ({labels})\nFiles: {item.file_count}; Size: {item.total_bytes} bytes\n"
             f"Relations — live: {live_relation}; baseline: {baseline_relation}; remote main: {remote_relation}\n"
             f"Diff from live: {diff.added} added, {diff.removed} deleted, {diff.changed} changed files.\n"
-            f"{char_diff}\nNote: {item.note or 'none'}\n{reason}\n{warning}")
+            f"{char_diff}\nNote: {item.note or 'none'}\n{provenance}{reason}\n{warning}")
 
 
 def build_plan_from_request(registry: SelectionRegistry, request: SelectionRequest, *, catalog_token: str, case: ReconcileCase,
@@ -161,15 +192,26 @@ def present_tk_from_builder(build: Callable[[], VersionCatalog], directive: Sele
                 if item is None:
                     on_error(SyncError("selection_required", "No verified automatic selection is available.", EXIT_CONFLICT)); return
                 result = SelectionRequest(item.candidate_id, "launch"); close(); return
-            frame = ttk.Frame(root, padding=12); frame.grid(sticky="nsew"); frame.columnconfigure(0, weight=1); frame.rowconfigure(1, weight=1)
+            frame = ttk.Frame(root, padding=12); frame.grid(sticky="nsew"); frame.columnconfigure(0, weight=1)
             ttk.Label(frame, text="Choose the save data to use", font=("TkDefaultFont", 12, "bold")).grid(row=0, column=0, sticky="w")
-            tree = ttk.Treeview(frame, columns=("name", "kind", "time", "files", "changes"), show="headings", selectmode="browse", height=9)
-            for key, text, width in (("name", "Save version", 220), ("kind", "Type", 100), ("time", "Created", 160), ("files", "Files", 80), ("changes", "Changes", 120)):
+            remote_ok = catalog.remote_check.status == "ok"
+            summary = ttk.Label(frame, justify="left", text=_remote_check_summary_lines(catalog)); summary.grid(row=1, column=0, sticky="w", pady=(4, 0))
+            next_row = 2
+            if not remote_ok:
+                warning_text = ("Warning: the remote version could not be freshly confirmed "
+                                f"(status: {catalog.remote_check.status}). The candidates shown below may be stale.")
+                ttk.Label(frame, justify="left", foreground="#a00", text=warning_text).grid(row=next_row, column=0, sticky="w", pady=(4, 0))
+                next_row += 1
+            tree_row, detail_row, fields_row, buttons_row, destructive_row = next_row, next_row + 1, next_row + 2, next_row + 3, next_row + 4
+            frame.rowconfigure(tree_row, weight=1)
+            tree = ttk.Treeview(frame, columns=("name", "kind", "created", "committed", "files", "changes"), show="headings", selectmode="browse", height=9)
+            for key, text, width in (("name", "Save version", 200), ("kind", "Type", 90), ("created", "Save created", 150),
+                                     ("committed", "Commit", 150), ("files", "Files", 70), ("changes", "Changes", 120)):
                 tree.heading(key, text=text); tree.column(key, width=width, anchor="w")
-            tree.grid(row=1, column=0, sticky="nsew", pady=(8, 8))
-            detail = ttk.Label(frame, justify="left", wraplength=680); detail.grid(row=2, column=0, sticky="ew")
+            tree.grid(row=tree_row, column=0, sticky="nsew", pady=(8, 8))
+            detail = ttk.Label(frame, justify="left", wraplength=680); detail.grid(row=detail_row, column=0, sticky="ew")
             name_var, note_var = tk.StringVar(), tk.StringVar()
-            fields = ttk.Frame(frame); fields.grid(row=3, column=0, sticky="ew", pady=(8, 0)); fields.columnconfigure(1, weight=1)
+            fields = ttk.Frame(frame); fields.grid(row=fields_row, column=0, sticky="ew", pady=(8, 0)); fields.columnconfigure(1, weight=1)
             ttk.Label(fields, text="Bookmark name").grid(row=0, column=0, sticky="w"); ttk.Entry(fields, textvariable=name_var).grid(row=0, column=1, sticky="ew")
             ttk.Label(fields, text="Note").grid(row=1, column=0, sticky="w"); ttk.Entry(fields, textvariable=note_var).grid(row=1, column=1, sticky="ew")
             selectable = [item for representative in catalog.candidates
@@ -177,7 +219,9 @@ def present_tk_from_builder(build: Callable[[], VersionCatalog], directive: Sele
             by_id = {item.candidate_id: item for item in selectable}
             for item in selectable:
                 diff = item.diff_from_live
-                tree.insert("", "end", iid=item.candidate_id, values=(item.display_name, item.kind, _display_time(item.created_at), item.file_count, f"+{diff.added} / -{diff.removed} / ~{diff.changed}"))
+                tree.insert("", "end", iid=item.candidate_id, values=(item.display_name, item.kind, _display_time(item.created_at),
+                                                                      _display_time(item.committed_at), item.file_count,
+                                                                      f"+{diff.added} / -{diff.removed} / ~{diff.changed}"))
             def selected() -> SaveCandidate | None:
                 ids = tree.selection(); return by_id.get(ids[0]) if ids else None
             def update_detail(_event=None) -> None:
@@ -193,6 +237,12 @@ def present_tk_from_builder(build: Callable[[], VersionCatalog], directive: Sele
                 if item is None: return
                 risky = item.kind in {"history", "bookmark", "legacy"} or mode == "promote-only"
                 confirmed = False
+                if not remote_ok:
+                    unconfirmed_text = ("The remote version could not be freshly confirmed this session "
+                                        f"(status: {catalog.remote_check.status}).\n"
+                                        "The candidates shown may be out of date. Continue anyway?")
+                    if not messagebox.askyesno("Remote check unconfirmed", unconfirmed_text, parent=root): return
+                    confirmed = True
                 if risky:
                     text = ("1. The current live save may be replaced by the selected version.\n"
                             "2. The current remote main version will be preserved automatically when displaced.\n"
@@ -210,7 +260,7 @@ def present_tk_from_builder(build: Callable[[], VersionCatalog], directive: Sele
             def reload_only() -> None:
                 nonlocal result
                 result = SelectionRequest(None, None, action="reload"); close()
-            normal = ttk.Frame(frame); normal.grid(row=4, column=0, sticky="w", pady=(12, 0))
+            normal = ttk.Frame(frame); normal.grid(row=buttons_row, column=0, sticky="w", pady=(12, 0))
             launch_button = None
             if "launch" in resolved.allowed_operations:
                 launch_button = ttk.Button(normal, text="Launch with this data", command=lambda: choose("launch"), underline=0); launch_button.grid(row=0, column=0, padx=4)
@@ -221,7 +271,7 @@ def present_tk_from_builder(build: Callable[[], VersionCatalog], directive: Sele
                 ttk.Button(normal, text="Reload", command=reload_only, underline=0).grid(row=0, column=2, padx=4); root.bind("<F5>", lambda _event: reload_only())
             ttk.Button(normal, text="Cancel", command=close, underline=0).grid(row=0, column=3, padx=4); root.bind("<Escape>", lambda _event: close())
             if "promote" in resolved.allowed_operations:
-                destructive = ttk.Frame(frame, padding=(0, 18, 0, 0)); destructive.grid(row=5, column=0, sticky="e")
+                destructive = ttk.Frame(frame, padding=(0, 18, 0, 0)); destructive.grid(row=destructive_row, column=0, sticky="e")
                 ttk.Button(destructive, text="Make latest and exit", command=lambda: choose("promote-only"), underline=0).grid()
             root.protocol("WM_DELETE_WINDOW", close)
             tree.focus_set()

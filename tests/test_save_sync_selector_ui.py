@@ -7,8 +7,8 @@ import inspect
 import pytest
 
 from grim_dawn_sync.selection import CancelledSelection, ReconcileCase, SelectionDirective, SelectionRegistry
-from grim_dawn_sync.selector_ui import SelectionRequest, TkSelectionPresenter, _candidate_detail_text, build_plan_from_request, load_catalog_in_worker, present_tk, present_tk_from_builder
-from grim_dawn_sync.version_catalog import ManifestDiff, SaveCandidate, VersionCatalog
+from grim_dawn_sync.selector_ui import SelectionRequest, TkSelectionPresenter, _candidate_detail_text, _provenance_lines, _remote_check_summary_lines, build_plan_from_request, load_catalog_in_worker, present_tk, present_tk_from_builder
+from grim_dawn_sync.version_catalog import CandidateAlias, ManifestDiff, RemoteCheckReport, SaveCandidate, VersionCatalog
 
 
 def _catalog() -> VersionCatalog:
@@ -167,6 +167,43 @@ def test_detail_text_has_required_safe_comparison_fields_without_internal_ids() 
     assert item.root_hash not in text and item.commit not in text and catalog.token not in text
 
 
+def test_detail_text_makes_coalesced_same_root_provenance_distinguishable() -> None:
+    """T-A repro (selector_ui layer): two commits sharing one root_hash must
+    stay distinguishable by commit time in the detail pane, even though they
+    share ``display_name`` and one Treeview row."""
+    alias = CandidateAlias(
+        "b" * 32, "history", "Remote main snapshot", "2026-08-04T20:47:51+00:00",
+        "f0b32b72c8cb" + "0" * 28, None, "2026-08-05T05:48:36+09:00",
+    )
+    representative = SaveCandidate(
+        "a" * 32, "remote_head", "Remote main snapshot", "2026-08-05T02:39:24+00:00", "desktop-a",
+        "4" * 64, "fc61d8acb759" + "0" * 28, 1, 2, 3, (), ManifestDiff(0, 0, 0),
+        None, (alias,), "2026-08-05T11:39:47+09:00",
+    )
+    catalog = VersionCatalog("t" * 32, representative.commit, "4" * 64, (representative,))
+    text = _candidate_detail_text(representative, catalog, SelectionDirective(True, "remote_head", ("launch",), False), [representative])
+    assert representative.committed_at != alias.committed_at
+    assert "2 entries share it" in text
+    # Both commits' UTC committer times must appear, distinctly.
+    assert "2026-08-05 02:39 UTC" in text
+    assert "2026-08-04 20:48 UTC" in text
+
+
+def test_provenance_lines_empty_for_a_candidate_with_no_coalesced_siblings() -> None:
+    item = SaveCandidate("a" * 32, "live", "Live", "now", "m", "1" * 64, None, 1, 2, 3, (), ManifestDiff(0, 0, 0))
+    catalog = VersionCatalog("t" * 32, "b" * 40, "1" * 64, (item,))
+    assert _provenance_lines(item, catalog) == ""
+
+
+def test_remote_check_summary_lines_report_status_and_both_remote_times() -> None:
+    item = SaveCandidate("a" * 32, "live", "Live", "now", "m", "1" * 64, None, 1, 2, 3, (), ManifestDiff(0, 0, 0))
+    report = RemoteCheckReport(status="failed", checked_at=None, error_code="git_command_failed",
+                               head_committed_at="2026-08-05T02:39:47+00:00")
+    catalog = VersionCatalog("t" * 32, "b" * 40, "1" * 64, (item,), remote_check=report)
+    text = _remote_check_summary_lines(catalog)
+    assert "status: failed" in text and "2026-08-05 02:39 UTC" in text
+
+
 def test_close_escape_cancel_and_reload_requests_are_domain_noops() -> None:
     writes: list[object] = []
     cancelled = CancelledSelection()
@@ -179,3 +216,8 @@ def test_close_escape_cancel_and_reload_requests_are_domain_noops() -> None:
     assert "_candidate_detail_text(item, catalog, directive, selectable)" not in source
     assert source.index("root.withdraw()") < source.index("load_catalog_in_worker")
     assert source.index("if not resolved.show_selector:") < source.index("root.deiconify()")
+    # T-B 4.2: an unconfirmed remote check must show a text warning (never
+    # color-only) and gate every choice behind one extra confirmation dialog.
+    assert 'catalog.remote_check.status == "ok"' in source
+    assert "Remote check unconfirmed" in source
+    assert source.index("if not remote_ok:") < source.index("def choose(mode: SelectionMode) -> None:")
