@@ -7,6 +7,7 @@ repository; no real save or remote is ever touched.
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -90,6 +91,37 @@ def test_restore_startup_disposition_restores_live_and_keeps_post_game_archive_w
                 if (item / "main/a/player.gdc").exists()}
     assert b"played-this-session" in contents
     assert b"base" in contents  # this launch's own session-start snapshot
+
+
+def test_restore_startup_announces_each_stage_so_an_interrupted_run_is_diagnosable(tmp_path: Path) -> None:
+    """Found on a real machine: this sequence copies and rehashes the save three
+    times and can run well over a minute with nothing on screen.  Collapsing it
+    into a single state made a killed run look identical to one that never
+    began, so each stage must appear in the audit log like the launch-time
+    restore already does."""
+    publisher, adapters, config, local, base = _environment(tmp_path)
+    registry, plan, _ = _plan(adapters, config, local / "state.json", choose_kind="live",
+                              mode="launch", archives_root=local / "archives")
+    plan = registry.build_plan(catalog_token=plan.catalog_token, candidate_id=plan.candidate_id, mode="launch",
+                               case=plan.reconcile_case, exit_disposition="restore-startup")
+
+    class PlayingAdapters(SessionStartIntegrationAdapters):
+        def launch(self, hook):
+            for state in ("START_DPYES", "WAIT_GAME_START", "WAIT_GAME_EXIT"):
+                hook(state)
+            save(self.config.save_root, b"played-this-session")
+
+    LaunchWorkflow(config, local, adapters=PlayingAdapters(config, local)).execute_selection_plan(plan, registry)
+
+    rows = [json.loads(line) for line in (local / "logs" / "launch.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()]
+    states = [row["state"] for row in rows if row["event"] == "entered"]
+    for stage in ("RESTORE_SESSION_START", "ARCHIVE_BEFORE_RESTORE", "APPLY_REMOTE_SAVE"):
+        assert stage in states, stage
+    # They must appear in that order, after the exit-disposition decision.
+    tail = states[states.index("EXIT_DISPOSITION_CONFIRM"):] if "EXIT_DISPOSITION_CONFIRM" in states else states
+    ordered = [s for s in tail if s in ("RESTORE_SESSION_START", "ARCHIVE_BEFORE_RESTORE", "APPLY_REMOTE_SAVE")]
+    assert ordered == ["RESTORE_SESSION_START", "ARCHIVE_BEFORE_RESTORE", "APPLY_REMOTE_SAVE"]
 
 
 def test_local_only_recovers_from_a_post_archive_fault_before_release(tmp_path: Path, monkeypatch) -> None:

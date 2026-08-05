@@ -593,10 +593,18 @@ class LaunchWorkflow:
                 local_restore_fn = getattr(self.adapters, "prepare_local_restore", None)
                 if not callable(local_restore_fn):
                     raise SyncError("adapter_contract_invalid", "Selection adapter cannot restore local session-start data.", EXIT_RECOVERY_REQUIRED)
+                # Each stage is announced separately, exactly as the launch-time
+                # restore does.  This whole sequence copies and rehashes the
+                # save three times and can run for well over a minute with no
+                # window on screen; collapsing it into one state left an
+                # interrupted run indistinguishable in the audit log from one
+                # that never started, and gave the operator no sign of progress.
                 self._at(WorkflowState.RESTORE_SESSION_START)
                 restore_plan = local_restore_fn(session_start_archive_id, f"{self.session}-exit-restore")
+                self._at(WorkflowState.ARCHIVE_BEFORE_RESTORE)
                 restore_plan = self._call("archive_before_restore", restore_plan)
                 capture_destinations()
+                self._at(WorkflowState.APPLY_REMOTE_SAVE)
                 self._call("apply_remote_save", restore_plan)
                 try: restored = self._call("wait_save_stable")
                 except SyncError:
