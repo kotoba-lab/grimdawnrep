@@ -596,7 +596,12 @@ def _execute_selection_command(
             builder_present = getattr(ui, "present_builder", None)
             if not callable(builder_present):
                 raise SyncError("adapter_contract_invalid", "Selection presenter cannot load catalogs safely.", 2)
-            request = builder_present(build_in_worker, directive_after_scan)
+            # An explicit --exit-disposition must seed the presenter's choice.
+            # A presenter that cannot accept it would silently start at
+            # "publish" and turn an explicit do-not-publish request into a
+            # publish, so refuse rather than fall back.
+            request = builder_present(build_in_worker, directive_after_scan,
+                                      initial_exit_disposition=effective_exit_disposition)
             try:
                 vault, catalog, state, projection, case = (
                     captured["vault"], captured["catalog"], captured["state"], captured["projection"], captured["case"],

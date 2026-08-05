@@ -165,13 +165,67 @@ def test_interactive_always_policy_shows_selector_on_equal(
     )
 
     class Presenter:
-        def present_builder(self, build, directive):
+        def present_builder(self, build, directive, *, initial_exit_disposition="publish"):
             catalog = build()
             policy = directive(catalog)
             assert policy.show_selector is True
             return SelectionRequest("live-id", "launch")
 
     assert cli.launch(config_path, presenter=Presenter())["result"]["state"] == "COMPLETE"
+
+
+def test_interactive_launch_seeds_the_presenter_with_the_requested_exit_disposition(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Found on a real machine: --exit-disposition was silently dropped in the
+    interactive path, so the selector started at "publish" and an explicit
+    do-not-publish request would have published.  Plan 7.2 forbids implicit
+    changes, so the flag must reach the presenter."""
+    root = "1" * 64
+    seen: list[str] = []
+
+    class Presenter:
+        def present_builder(self, build, directive, *, initial_exit_disposition="publish"):
+            build(); seen.append(initial_exit_disposition)
+            return SelectionRequest("live-id", "launch", exit_disposition=initial_exit_disposition)
+
+    for requested in ("local-only", "restore-startup", "publish"):
+        config_path, _, _ = _install_context(monkeypatch, tmp_path, live=root, remote=root, baseline=root,
+                                             selection_policy="always")
+        result = cli.launch(config_path, presenter=Presenter(), exit_disposition=requested)
+        assert result["result"]["state"] == "COMPLETE"
+    assert seen == ["local-only", "restore-startup", "publish"]
+    # Omitting the flag still defaults to publish.
+    config_path, _, _ = _install_context(monkeypatch, tmp_path, live=root, remote=root, baseline=root,
+                                         selection_policy="always")
+    cli.launch(config_path, presenter=Presenter())
+    assert seen[-1] == "publish"
+
+
+def test_presenter_that_cannot_accept_an_exit_disposition_is_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Falling back to a call without the keyword would reintroduce the silent
+    downgrade to "publish", so an incompatible presenter must fail instead."""
+    root = "1" * 64
+    config_path, _, calls = _install_context(monkeypatch, tmp_path, live=root, remote=root, baseline=root,
+                                             selection_policy="always")
+
+    class OldPresenter:
+        def present_builder(self, build, directive):
+            return SelectionRequest("live-id", "launch")
+
+    with pytest.raises(TypeError):
+        cli.launch(config_path, presenter=OldPresenter(), exit_disposition="local-only")
+    assert "COMPLETE" not in str(calls)
+
+
+def test_tk_presenter_seeds_its_radio_group_from_the_requested_disposition() -> None:
+    import inspect
+    from grim_dawn_sync.selector_ui import present_tk_from_builder
+    source = inspect.getsource(present_tk_from_builder)
+    assert "tk.StringVar(value=initial_exit_disposition)" in source
+    assert 'tk.StringVar(value="publish")' not in source
 
 
 def test_json_and_auto_safe_refuse_different_saves_without_mutation(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -189,7 +243,7 @@ def test_interactive_selection_and_cancel_are_explicit(monkeypatch: pytest.Monke
     config_path, _, calls = _install_context(monkeypatch, tmp_path, live=live, remote=remote, baseline=live)
 
     class Presenter:
-        def present_builder(self, build, directive) -> SelectionRequest:
+        def present_builder(self, build, directive, *, initial_exit_disposition="publish") -> SelectionRequest:
             catalog = build(); directive(catalog)
             assert catalog.candidate("remote-id").kind == "remote_head"
             return SelectionRequest("remote-id", "launch")
@@ -198,7 +252,7 @@ def test_interactive_selection_and_cancel_are_explicit(monkeypatch: pytest.Monke
     assert getattr(calls[-1], "candidate_kind") == "remote_head"
 
     class Cancel:
-        def present_builder(self, _build, _directive) -> CancelledSelection:
+        def present_builder(self, _build, _directive, *, initial_exit_disposition="publish") -> CancelledSelection:
             return CancelledSelection()
 
     before = len(calls)
@@ -211,7 +265,7 @@ def test_real_cli_interactive_path_resolves_callable_directive_once(monkeypatch:
     config_path, _, _ = _install_context(monkeypatch, tmp_path, live=live, remote=remote, baseline=live)
     resolved: list[object] = []
     class Presenter:
-        def present_builder(self, build, directive):
+        def present_builder(self, build, directive, *, initial_exit_disposition="publish"):
             value = build(); resolved.append(directive(value))
             return SelectionRequest("remote-id", "launch")
     assert cli.launch(config_path, presenter=Presenter())["result"]["state"] == "COMPLETE"  # type: ignore[arg-type]
@@ -347,7 +401,7 @@ def test_interactive_builds_catalog_once_and_prelock_revalidation_does_not_rebui
     monkeypatch.setattr(cli, "VersionCatalogBuilder", CountingBuilder)
 
     class Presenter:
-        def present_builder(self, build, directive):
+        def present_builder(self, build, directive, *, initial_exit_disposition="publish"):
             catalog = build()
             policy = directive(catalog)
             if equal:
@@ -712,7 +766,7 @@ def test_gui_bookmark_action_can_name_live_candidate(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(cli, "create_live_bookmark_locked", create_live)
 
     class Presenter:
-        def present_builder(self, build, directive):
+        def present_builder(self, build, directive, *, initial_exit_disposition="publish"):
             catalog = build()
             assert "bookmark" in directive(catalog).allowed_operations
             return SelectionRequest("live-id", None, "GUI live", "note", action="bookmark")
@@ -820,7 +874,7 @@ def test_interactive_stale_then_reload_rebuilds_fresh_catalog_before_reselection
 
     class Presenter:
         calls = 0
-        def present_builder(self, build, directive):
+        def present_builder(self, build, directive, *, initial_exit_disposition="publish"):
             Presenter.calls += 1
             catalog = build(); directive(catalog)
             candidate = catalog.candidates[0]
@@ -870,7 +924,7 @@ def test_interactive_post_mutation_stale_fails_without_ui_or_build_retry(
 
     class Presenter:
         calls = 0
-        def present_builder(self, build, directive):
+        def present_builder(self, build, directive, *, initial_exit_disposition="publish"):
             Presenter.calls += 1
             catalog = build(); directive(catalog)
             return SelectionRequest("remote-id", "launch")

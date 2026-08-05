@@ -25,10 +25,15 @@ def test_presenter_is_domain_adapter(monkeypatch) -> None:
 def test_presenter_builder_uses_worker_entry(monkeypatch) -> None:
     sentinel = SelectionRequest("a" * 32, "launch")
     calls = []
-    monkeypatch.setattr("grim_dawn_sync.selector_ui.present_tk_from_builder", lambda build, directive: calls.append((build(), directive)) or sentinel)
+    monkeypatch.setattr("grim_dawn_sync.selector_ui.present_tk_from_builder",
+                        lambda build, directive, *, initial_exit_disposition="publish":
+                        calls.append((build(), directive, initial_exit_disposition)) or sentinel)
     directive = SelectionDirective(True, "remote_head", ("launch", "cancel"), False)
     assert TkSelectionPresenter().present_builder(_catalog, directive) is sentinel
-    assert calls == [(_catalog(), directive)]
+    assert calls == [(_catalog(), directive, "publish")]
+    # The requested disposition must reach the window, not be dropped on the way.
+    assert TkSelectionPresenter().present_builder(_catalog, directive, initial_exit_disposition="local-only") is sentinel
+    assert calls[-1][2] == "local-only"
 
 
 def test_tk_init_failure_is_fail_closed(monkeypatch) -> None:

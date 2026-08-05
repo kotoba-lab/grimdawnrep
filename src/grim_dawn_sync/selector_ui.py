@@ -38,7 +38,8 @@ class SelectionRequest:
 
 class SelectionPresenter(Protocol):
     def present(self, catalog: VersionCatalog, directive: SelectionDirective) -> SelectionRequest | CancelledSelection: ...
-    def present_builder(self, build: Callable[[], VersionCatalog], directive: SelectionDirective | Callable[[VersionCatalog], SelectionDirective]) -> SelectionRequest | CancelledSelection: ...
+    def present_builder(self, build: Callable[[], VersionCatalog], directive: SelectionDirective | Callable[[VersionCatalog], SelectionDirective],
+                        *, initial_exit_disposition: str = "publish") -> SelectionRequest | CancelledSelection: ...
 
 
 def _display_time(value: str | None, *, absent: str = "Not applicable (no commit)") -> str:
@@ -177,8 +178,17 @@ def load_catalog_in_worker(root: object, build: Callable[[], VersionCatalog], on
     return CatalogWorker(thread, root, state)
 
 
-def present_tk_from_builder(build: Callable[[], VersionCatalog], directive: SelectionDirective | Callable[[VersionCatalog], SelectionDirective]) -> SelectionRequest | CancelledSelection:
-    """Resolve policy off-screen and show a window only when selection is needed."""
+def present_tk_from_builder(build: Callable[[], VersionCatalog], directive: SelectionDirective | Callable[[VersionCatalog], SelectionDirective],
+                            *, initial_exit_disposition: str = "publish") -> SelectionRequest | CancelledSelection:
+    """Resolve policy off-screen and show a window only when selection is needed.
+
+    ``initial_exit_disposition`` seeds the after-exit radio group.  It must
+    carry whatever ``--exit-disposition`` asked for: silently starting at
+    "publish" when the caller explicitly requested otherwise would turn an
+    explicit do-not-publish instruction into a publish.
+    """
+    if initial_exit_disposition not in ("publish", "local-only", "restore-startup"):
+        raise SyncError("invalid_exit_disposition", "Exit disposition is invalid.", EXIT_CONFLICT)
     root = None; worker: CatalogWorker | None = None
     result: SelectionRequest | CancelledSelection = CancelledSelection()
     callback_error: BaseException | None = None
@@ -229,7 +239,7 @@ def present_tk_from_builder(build: Callable[[], VersionCatalog], directive: Sele
             tree.grid(row=tree_row, column=0, sticky="nsew", pady=(8, 8))
             detail = ttk.Label(frame, justify="left", wraplength=680); detail.grid(row=detail_row, column=0, sticky="ew")
             name_var, note_var = tk.StringVar(), tk.StringVar()
-            disposition_var = tk.StringVar(value="publish")
+            disposition_var = tk.StringVar(value=initial_exit_disposition)
             fields = ttk.Frame(frame); fields.grid(row=fields_row, column=0, sticky="ew", pady=(8, 0)); fields.columnconfigure(1, weight=1)
             ttk.Label(fields, text="Bookmark name").grid(row=0, column=0, sticky="w"); ttk.Entry(fields, textvariable=name_var).grid(row=0, column=1, sticky="ew")
             ttk.Label(fields, text="Note").grid(row=1, column=0, sticky="w"); ttk.Entry(fields, textvariable=note_var).grid(row=1, column=1, sticky="ew")
@@ -379,5 +389,6 @@ def present_tk(catalog: VersionCatalog, directive: SelectionDirective) -> Select
 class TkSelectionPresenter:
     def present(self, catalog: VersionCatalog, directive: SelectionDirective) -> SelectionRequest | CancelledSelection:
         return present_tk(catalog, directive)
-    def present_builder(self, build: Callable[[], VersionCatalog], directive: SelectionDirective | Callable[[VersionCatalog], SelectionDirective]) -> SelectionRequest | CancelledSelection:
-        return present_tk_from_builder(build, directive)
+    def present_builder(self, build: Callable[[], VersionCatalog], directive: SelectionDirective | Callable[[VersionCatalog], SelectionDirective],
+                        *, initial_exit_disposition: str = "publish") -> SelectionRequest | CancelledSelection:
+        return present_tk_from_builder(build, directive, initial_exit_disposition=initial_exit_disposition)
