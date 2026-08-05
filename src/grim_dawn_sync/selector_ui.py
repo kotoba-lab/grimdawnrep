@@ -31,9 +31,9 @@ class SelectionPresenter(Protocol):
     def present_builder(self, build: Callable[[], VersionCatalog], directive: SelectionDirective | Callable[[VersionCatalog], SelectionDirective]) -> SelectionRequest | CancelledSelection: ...
 
 
-def _display_time(value: str | None) -> str:
+def _display_time(value: str | None, *, absent: str = "Not applicable (no commit)") -> str:
     if value is None:
-        return "Not applicable (no commit)"
+        return absent
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00")); local = parsed.astimezone()
         return f"{parsed.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')} / {local.strftime('%Y-%m-%d %H:%M %Z')}"
@@ -41,11 +41,18 @@ def _display_time(value: str | None) -> str:
         return "Verified time unavailable"
 
 
-def _remote_check_summary_lines(catalog: VersionCatalog) -> str:
+def _remote_check_summary_lines(catalog: VersionCatalog, item: SaveCandidate | None = None) -> str:
+    """The three plan-mandated times, kept as three separate lines.
+
+    They are distinct axes and must never be collapsed into one value: when
+    the remote check ran, when the shown save was created, and when remote
+    main's head was committed.
+    """
     report = catalog.remote_check
-    return (f"Remote check: {_display_time(report.checked_at)} (status: {report.status})\n"
-            f"Selected candidate's save creation: see detail pane below\n"
-            f"Remote main's latest commit: {_display_time(report.head_committed_at)}")
+    return (f"Remote check: {_display_time(report.checked_at, absent='not performed')} (status: {report.status})\n"
+            f"Selected candidate's save creation: "
+            f"{_display_time(item.created_at, absent='no candidate selected') if item is not None else 'no candidate selected'}\n"
+            f"Remote main's latest commit: {_display_time(report.head_committed_at, absent='unavailable')}")
 
 
 def _provenance_lines(item: SaveCandidate, catalog: VersionCatalog) -> str:
@@ -226,6 +233,9 @@ def present_tk_from_builder(build: Callable[[], VersionCatalog], directive: Sele
                 ids = tree.selection(); return by_id.get(ids[0]) if ids else None
             def update_detail(_event=None) -> None:
                 item = selected()
+                # The summary's save-creation line tracks the selection so the
+                # three mandated times stay readable together at all times.
+                summary.configure(text=_remote_check_summary_lines(catalog, item))
                 if item is None: detail.configure(text="Select a version to see its comparison."); return
                 detail.configure(text=_candidate_detail_text(item, catalog, resolved, selectable))
             tree.bind("<<TreeviewSelect>>", update_detail)
@@ -241,8 +251,11 @@ def present_tk_from_builder(build: Callable[[], VersionCatalog], directive: Sele
                     unconfirmed_text = ("The remote version could not be freshly confirmed this session "
                                         f"(status: {catalog.remote_check.status}).\n"
                                         "The candidates shown may be out of date. Continue anyway?")
+                    # Acknowledging staleness is a separate question from the
+                    # risky-candidate second confirmation, so it deliberately
+                    # does not set ``confirmed``: answering yes here must never
+                    # authorize a history/bookmark restore on its own.
                     if not messagebox.askyesno("Remote check unconfirmed", unconfirmed_text, parent=root): return
-                    confirmed = True
                 if risky:
                     text = ("1. The current live save may be replaced by the selected version.\n"
                             "2. The current remote main version will be preserved automatically when displaced.\n"

@@ -204,6 +204,47 @@ def test_remote_check_summary_lines_report_status_and_both_remote_times() -> Non
     assert "status: failed" in text and "2026-08-05 02:39 UTC" in text
 
 
+def test_summary_shows_all_three_times_as_three_separate_lines() -> None:
+    """Plan 4.2/12.1: remote-check time, save-creation time, and remote head's
+    commit time are three independent axes and must each be readable."""
+    item = SaveCandidate("a" * 32, "remote_head", "Sync destination latest", "2026-08-04T20:47:51+00:00",
+                         "m", "1" * 64, "c" * 40, 1, 2, 3, (), ManifestDiff(0, 0, 0),
+                         None, (), "2026-08-05T05:48:36+09:00")
+    report = RemoteCheckReport(status="ok", checked_at="2026-08-05T09:15:00+00:00", error_code=None,
+                               head_committed_at="2026-08-04T20:48:36+00:00")
+    catalog = VersionCatalog("t" * 32, "c" * 40, "1" * 64, (item,), remote_check=report)
+    lines = _remote_check_summary_lines(catalog, item).splitlines()
+    assert len(lines) == 3
+    assert "2026-08-05 09:15 UTC" in lines[0]          # when the remote was checked
+    assert "2026-08-04 20:47 UTC" in lines[1]          # when the save itself was created
+    assert "2026-08-04 20:48 UTC" in lines[2]          # when remote head was committed
+    # The save-creation line must carry a real time, never a pointer elsewhere.
+    assert "detail pane" not in lines[1]
+
+
+def test_summary_save_creation_line_tracks_the_current_selection() -> None:
+    report = RemoteCheckReport(status="ok", checked_at="2026-08-05T09:15:00+00:00", error_code=None,
+                               head_committed_at=None)
+    item = SaveCandidate("a" * 32, "live", "Live", "2026-08-04T20:47:51+00:00", "m", "1" * 64, None,
+                         1, 2, 3, (), ManifestDiff(0, 0, 0))
+    catalog = VersionCatalog("t" * 32, "c" * 40, "1" * 64, (item,), remote_check=report)
+    assert "no candidate selected" in _remote_check_summary_lines(catalog, None)
+    assert "2026-08-04 20:47 UTC" in _remote_check_summary_lines(catalog, item)
+    source = inspect.getsource(present_tk_from_builder)
+    assert "summary.configure(text=_remote_check_summary_lines(catalog, item))" in source
+
+
+def test_unconfirmed_remote_dialog_does_not_grant_the_risky_candidate_confirmation() -> None:
+    """Plan section 10: acknowledging a stale remote must not, by itself,
+    authorize a history/bookmark restore.  The two confirmations are separate
+    questions and only the risky-candidate dialog may set ``confirmed``."""
+    source = inspect.getsource(present_tk_from_builder)
+    head, _, tail = source.partition("Remote check unconfirmed")
+    # Between the staleness dialog and the risky dialog, nothing may set the flag.
+    between, _, _ = tail.partition("Confirm save selection")
+    assert "confirmed = True" not in between
+
+
 def test_close_escape_cancel_and_reload_requests_are_domain_noops() -> None:
     writes: list[object] = []
     cancelled = CancelledSelection()

@@ -163,7 +163,8 @@ class VersionCatalogBuilder:
     """Build candidates without checkout, extraction, state, or ref mutation."""
 
     def __init__(self, vault: GitVault, live_root: Path, *, machine_id: str, retries: int = 1, window_seconds: float = 0,
-                 baseline_root_hash: str | None = None, clock: Callable[[], float] = time.time) -> None:
+                 baseline_root_hash: str | None = None, clock: Callable[[], float] = time.time,
+                 remote_check_failure: Literal["raise", "report"] = "raise") -> None:
         self.vault = vault
         self.live_root = Path(live_root)
         self.machine_id = machine_id
@@ -173,6 +174,12 @@ class VersionCatalogBuilder:
             raise SyncError("invalid_baseline_root", "Catalog baseline root is invalid.", EXIT_VALIDATION)
         self.baseline_root_hash = baseline_root_hash
         self.clock = clock
+        # ``offline_policy=deny`` is implemented *here*: an unreachable remote
+        # aborts catalog construction.  Reporting instead of raising is opt-in
+        # so that adding remote-check reporting can never silently relax it.
+        if remote_check_failure not in ("raise", "report"):
+            raise SyncError("invalid_remote_check_policy", "Remote check failure policy is invalid.", EXIT_VALIDATION)
+        self.remote_check_failure = remote_check_failure
 
     def _clock_now(self) -> float:
         try:
@@ -188,14 +195,15 @@ class VersionCatalogBuilder:
         # out nor changes live saves, sync state, locks, commits, or tags.
         live = stable_manifest(self.live_root, machine_id=self.machine_id, retries=self.retries, window_seconds=self.window_seconds)
         self.vault.preflight()
-        # The remote check itself (network fetch) is the one step allowed to
-        # fail without aborting catalog construction: a stale but locally
-        # verified view, clearly marked as unconfirmed, is safer than an
-        # opaque hard failure that leaves the user with no candidates at all.
-        # Every other step here stays fail-closed exactly as before.
+        # A failed remote check aborts by default, which is what implements
+        # ``offline_policy=deny``.  Only a caller that has explicitly opted
+        # into ``remote_check_failure="report"`` gets a stale-but-marked
+        # catalog instead.  Every other step here stays fail-closed.
         try:
             self.vault.fetch()
         except SyncError as error:
+            if self.remote_check_failure == "raise":
+                raise
             remote_status: Literal["ok", "failed", "skipped"] = "failed"
             remote_error_code: str | None = error.code
             checked_at: str | None = None

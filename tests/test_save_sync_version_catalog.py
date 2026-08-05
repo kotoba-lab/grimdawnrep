@@ -141,7 +141,8 @@ def test_fetch_failure_marks_remote_check_failed_without_aborting_catalog_build(
             raise SyncError("git_command_failed", "simulated network failure", 4)
 
     failing_vault = FetchFailsVault(one)
-    catalog = VersionCatalogBuilder(failing_vault, source, machine_id="a").build()
+    catalog = VersionCatalogBuilder(failing_vault, source, machine_id="a",
+                                    remote_check_failure="report").build()
     report = catalog.remote_check
     assert report.status == "failed"
     assert report.checked_at is None
@@ -151,6 +152,32 @@ def test_fetch_failure_marks_remote_check_failed_without_aborting_catalog_build(
     assert catalog.remote_head == commit
     all_entries = [entry for item in catalog.candidates for entry in (item, *item.aliases)]
     assert any(entry.commit == commit for entry in all_entries)
+
+
+def test_fetch_failure_aborts_by_default_so_offline_policy_deny_is_not_relaxed(tmp_path: Path) -> None:
+    """Plan section 10 / 4.2: adding remote-check reporting must not weaken the
+    existing fail-closed behavior.  ``offline_policy=deny`` is implemented by
+    the builder aborting, so reporting has to stay opt-in.
+    """
+    _, one, _ = clone_pair(tmp_path); source = save(tmp_path / "source", b"one"); vault = GitVault(one)
+    commit = vault.snapshot(source, machine_id="a", session_id="one", validator=valid); vault.push(commit)
+    vault.fetch()
+
+    class FetchFailsVault(GitVault):
+        def fetch(self) -> None:
+            raise SyncError("git_command_failed", "simulated network failure", 4)
+
+    failing_vault = FetchFailsVault(one)
+    with pytest.raises(SyncError) as error:
+        VersionCatalogBuilder(failing_vault, source, machine_id="a").build()
+    assert error.value.code == "git_command_failed"
+
+
+def test_invalid_remote_check_failure_policy_is_rejected(tmp_path: Path) -> None:
+    _, one, _ = clone_pair(tmp_path); source = save(tmp_path / "source", b"one")
+    with pytest.raises(SyncError) as error:
+        VersionCatalogBuilder(GitVault(one), source, machine_id="a", remote_check_failure="ignore")
+    assert error.value.code == "invalid_remote_check_policy"
 
 
 def test_same_root_hash_different_commits_keep_distinct_committed_at_provenance(tmp_path: Path) -> None:

@@ -84,7 +84,7 @@ def build_parser() -> argparse.ArgumentParser:
     launch_parser = subparsers.add_parser("launch", help="select a verified save and run the synchronized DPYes launch workflow")
     launch_parser.add_argument("--select", help="auto-safe or an opaque candidate ID")
     launch_parser.add_argument("--catalog-token", help="short-lived catalog capability for --select")
-    launch_parser.add_argument("--confirm", action="store_true", help="second confirmation for a history/bookmark selection or a failed remote check")
+    launch_parser.add_argument("--confirm", action="store_true", help="second confirmation for a history/bookmark selection")
     launch_parser.add_argument("--selector", choices=["always", "on-diff"], help="override the configured selection_policy for this run")
     subparsers.add_parser("versions", help="list verified save-version candidates")
     bookmark_parser = subparsers.add_parser("bookmark", help="create a named immutable bookmark")
@@ -364,6 +364,10 @@ def _capture_catalog(config_path: Path, expected_config: Any) -> tuple[GitVault,
         vault, current_config.save_root, machine_id=current_config.machine_id,
         retries=current_config.stable_scan_retries, window_seconds=current_config.stable_window_seconds,
         baseline_root_hash=state.last_applied_manifest_root_hash,
+        # deny is the only supported offline_policy today, so this keeps the
+        # pre-T-B behavior: an unreachable remote aborts before any candidate
+        # is shown.  The reporting path exists for a future permissive policy.
+        remote_check_failure=("raise" if getattr(current_config, "offline_policy", "deny") == "deny" else "report"),
     ).build()
     # Close the scan around config/state/lock/process too, so the catalog can
     # never be issued from a hybrid of values observed on opposite sides of I/O.
@@ -599,15 +603,16 @@ def _execute_selection_command(
             case = _selection_case(config_path, catalog, vault)
             _log_remote_check(config_path, config, catalog)
             # A headless caller (as_json or an explicit --select) never sees the
-            # interactive warning banner, so a failed remote check must stay
-            # fail-closed here exactly as an unreachable remote already did
-            # before this feature existed.  --confirm (already used for
-            # history/bookmark second confirmation) is reused as the one
-            # explicit override, so no new bypass surface is introduced.
-            if catalog.remote_check.status == "failed" and not confirmed:
+            # interactive warning banner, so a failed remote check stays
+            # fail-closed here.  There is deliberately no override flag:
+            # --confirm means "second confirmation for a risky candidate" and
+            # must not double as an unverified-remote bypass.  Under
+            # offline_policy=deny this is unreachable because the builder
+            # already aborted; it is defence in depth for a future policy.
+            if catalog.remote_check.status == "failed":
                 raise SyncError(
                     "remote_check_failed",
-                    "Remote check failed; pass --confirm to proceed with the last verified candidates.",
+                    "Remote check failed; no headless launch was started.",
                     3, details={"remote_check": _remote_check_payload(catalog)},
                 )
         directive = selection_policy(case, policy=effective_policy)

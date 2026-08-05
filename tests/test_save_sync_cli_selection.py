@@ -269,7 +269,7 @@ def test_versions_json_includes_remote_check_times_and_status_only(monkeypatch: 
     assert live not in rendered and remote not in rendered and "a" * 40 not in rendered
 
 
-def test_headless_launch_fails_closed_when_remote_check_failed_without_confirm(
+def test_headless_launch_fails_closed_when_remote_check_failed(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     """T-B 4.2/4.4: a failed remote check must never look like a normal,
@@ -287,17 +287,21 @@ def test_headless_launch_fails_closed_when_remote_check_failed_without_confirm(
     assert "COMPLETE" not in str(calls)
 
 
-def test_headless_launch_confirm_flag_proceeds_past_a_failed_remote_check(
+def test_confirm_flag_is_not_an_unverified_remote_bypass(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
+    """--confirm authorizes a risky *candidate*; it must never double as an
+    override for an unconfirmed remote (plan section 10)."""
     root = "1" * 64
     report = RemoteCheckReport(status="failed", checked_at=None, error_code="git_command_failed",
                                head_committed_at=None)
-    config_path, _, _ = _install_context(
+    config_path, _, calls = _install_context(
         monkeypatch, tmp_path, live=root, remote=root, baseline=root, remote_check=report,
     )
-    result = cli.launch(config_path, as_json=True, confirmed=True)
-    assert result["result"]["state"] == "COMPLETE"
+    with pytest.raises(SyncError) as error:
+        cli.launch(config_path, as_json=True, confirmed=True)
+    assert error.value.code == "remote_check_failed"
+    assert "COMPLETE" not in str(calls)
 
 
 def test_skipped_remote_check_does_not_block_headless_launch(
