@@ -17,8 +17,8 @@ from grim_dawn_sync.selection import (
 from grim_dawn_sync.version_catalog import ManifestDiff, SaveCandidate, VersionCatalog
 
 
-def candidate(kind: str, root: str, commit: str | None) -> SaveCandidate:
-    return SaveCandidate("candidate-" + kind, kind, kind, "2026-08-01T00:00:00+00:00", "machine", root, commit, 0, 0, 0, (), ManifestDiff(0, 0, 0))
+def candidate(kind: str, root: str, commit: str | None, *, source_archive_id: str | None = None) -> SaveCandidate:
+    return SaveCandidate("candidate-" + kind, kind, kind, "2026-08-01T00:00:00+00:00", "machine", root, commit, 0, 0, 0, (), ManifestDiff(0, 0, 0), source_archive_id=source_archive_id)
 
 
 def catalog(*items: SaveCandidate, token: str = "t" * 32, remote: str | None = "a" * 40, live: str = "1" * 64) -> VersionCatalog:
@@ -198,6 +198,42 @@ def test_injected_clock_invalid_values_fail_closed(value: object) -> None:
     with pytest.raises(SyncError) as caught:
         registry.register(value_catalog)
     assert caught.value.code == "catalog_clock_invalid"
+
+
+_VALID_ARCHIVE_ID = "save-session-start-" + "1" * 16 + "-" + "2" * 32
+
+
+def test_session_start_candidate_needs_no_commit_but_needs_valid_archive_id() -> None:
+    item = candidate("session_start", "2" * 64, None, source_archive_id=_VALID_ARCHIVE_ID)
+    value = catalog(item); registry = SelectionRegistry(); registry.register(value)
+    plan = registry.build_plan(catalog_token=value.token, candidate_id=item.candidate_id,
+                               mode="launch", case=ReconcileCase.LIVE_AHEAD)
+    assert plan.selected_commit is None
+    assert plan.candidate_kind == "session_start"
+    # A local, tool-owned archive is treated like history/bookmark: it needs
+    # a second confirmation before it can displace live/remote data.
+    assert plan.confirmation_required is True
+
+
+@pytest.mark.parametrize("bad_archive_id", [None, "", "../../etc/passwd", "save-before-restore-x", "save-session-start-x"])
+def test_session_start_candidate_rejects_missing_or_malformed_archive_id(bad_archive_id) -> None:
+    item = candidate("session_start", "2" * 64, None, source_archive_id=bad_archive_id)
+    value = catalog(item); registry = SelectionRegistry(); registry.register(value)
+    with pytest.raises(SyncError) as caught:
+        registry.build_plan(catalog_token=value.token, candidate_id=item.candidate_id,
+                            mode="launch", case=ReconcileCase.LIVE_AHEAD)
+    assert caught.value.code == "candidate_not_authorized"
+
+
+def test_session_start_candidate_does_not_require_verified_bookmark_target() -> None:
+    """Unlike legacy/bookmark, session_start has no commit to verify against a tag."""
+    item = candidate("session_start", "2" * 64, None, source_archive_id=_VALID_ARCHIVE_ID)
+    value = catalog(item)
+    registry = SelectionRegistry(verified_bookmark_target=lambda _item: False)  # would reject any legacy/bookmark
+    registry.register(value)
+    plan = registry.build_plan(catalog_token=value.token, candidate_id=item.candidate_id,
+                               mode="launch", case=ReconcileCase.LIVE_AHEAD)
+    assert plan.selected_root_hash == "2" * 64
 
 
 def test_nonce_tampering_and_expiry_before_or_after_confirmation_are_rejected() -> None:

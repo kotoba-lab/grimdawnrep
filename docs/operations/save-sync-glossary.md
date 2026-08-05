@@ -29,3 +29,9 @@
 - **Risky explicit launch**: selecting a history, bookmark, or legacy candidate
   from JSON/CLI requires both `--select <candidate-id> --catalog-token <token>`
   and the separate `--confirm` flag. Omitting confirmation is fail-closed.
+- **This launch's pre-session data (session-start snapshot)**: a verified local
+  archive of the exact live save as it existed right after the sync lock was
+  acquired for this launch, before any restore, launch, or promotion touched
+  it. Created automatically on every launch; never deleted automatically. See
+  [Session-start local snapshot](session-start-snapshot.md), including its
+  disk-usage and end-of-session-publish limitations.

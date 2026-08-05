@@ -15,6 +15,7 @@ import math
 import uuid
 
 from grim_dawn_sync.errors import EXIT_CONFLICT, EXIT_VALIDATION, SyncError
+from grim_dawn_sync.session_start import SESSION_START_ID_PATTERN
 from grim_dawn_sync.version_catalog import SaveCandidate, VersionCatalog
 
 
@@ -176,7 +177,7 @@ class SelectionRegistry:
             raise SyncError("selection_operation_forbidden", "This reconciliation state does not permit that operation.", EXIT_VALIDATION)
         catalog = self.catalog(catalog_token)
         candidate = catalog.candidate(candidate_id)
-        if candidate.kind not in {"live", "remote_head", "history", "bookmark", "legacy"}:
+        if candidate.kind not in {"live", "remote_head", "history", "bookmark", "legacy", "session_start"}:
             raise SyncError("candidate_not_authorized", "Selected version kind is not authorized.", EXIT_VALIDATION)
         if not isinstance(candidate.root_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", candidate.root_hash):
             raise SyncError("candidate_not_authorized", "Selected version has an invalid root hash.", EXIT_VALIDATION)
@@ -184,8 +185,15 @@ class SelectionRegistry:
             raise SyncError("invalid_catalog_token", "Catalog live root is invalid.", EXIT_VALIDATION)
         if catalog.remote_head is not None and (not isinstance(catalog.remote_head, str) or not re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", catalog.remote_head)):
             raise SyncError("invalid_catalog_token", "Catalog remote head is invalid.", EXIT_VALIDATION)
-        if candidate.kind != "live" and (candidate.commit is None or not re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", candidate.commit)):
+        # session_start candidates have no commit at all; they are a local,
+        # tool-owned archive instead.  Every other non-live kind still requires
+        # a verified commit target.
+        if candidate.kind not in {"live", "session_start"} and (candidate.commit is None or not re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", candidate.commit)):
             raise SyncError("candidate_not_authorized", "Selected version has no authorized commit target.", EXIT_VALIDATION)
+        if candidate.kind == "session_start" and (
+            not isinstance(candidate.source_archive_id, str) or not SESSION_START_ID_PATTERN.fullmatch(candidate.source_archive_id)
+        ):
+            raise SyncError("candidate_not_authorized", "Selected session-start archive is not authorized.", EXIT_VALIDATION)
         if candidate.kind in {"legacy", "bookmark"} and (
             self._verified_bookmark_target is None or not self._verified_bookmark_target(candidate)
         ):
@@ -196,7 +204,7 @@ class SelectionRegistry:
             displaced = True
         else:
             displaced = candidate.kind != "remote_head"
-        confirmation = candidate.kind in {"history", "bookmark", "legacy"}
+        confirmation = candidate.kind in {"history", "bookmark", "legacy", "session_start"}
         plan = SelectionPlan(
             plan_nonce=uuid.uuid4().hex,
             catalog_token=catalog_token,

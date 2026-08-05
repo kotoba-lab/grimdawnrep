@@ -18,7 +18,14 @@ from grim_dawn_sync.errors import EXIT_CONFLICT, EXIT_RECOVERY_REQUIRED, EXIT_VA
 from grim_dawn_sync.git_vault import GitVault
 from grim_dawn_sync.launcher import DPYesLauncher
 from grim_dawn_sync.manifest import _reject_unsafe, build_manifest, stable_manifest
-from grim_dawn_sync.session_lock import acquire_lock, release_lock
+from grim_dawn_sync.session_lock import acquire_lock, release_bookmark_lock, release_lock
+from grim_dawn_sync.session_start import (
+    SESSION_START_ID_PATTERN,
+    create_session_start_archive,
+    extract_session_start_archive,
+    read_session_start_metadata,
+    session_start_archive_manifest,
+)
 from grim_dawn_sync.snapshot import _copy_verified, _manifest, apply_restore, archive_before_restore, plan_restore
 from grim_dawn_sync.state import SyncState, load_state, save_state_if_unchanged
 from grim_dawn_sync.validation import destructive_change, validate_players
@@ -27,7 +34,7 @@ from grim_dawn_sync.selection import SelectionPlan, SelectionRegistry
 
 
 class WorkflowState(str, Enum):
-    PREFLIGHT="PREFLIGHT"; FETCH_REMOTE="FETCH_REMOTE"; RECONCILE="RECONCILE"; BUILD_CATALOG="BUILD_CATALOG"; WAIT_SELECTION="WAIT_SELECTION"; REVALIDATE_SELECTION="REVALIDATE_SELECTION"; ACQUIRE_LOCK="ACQUIRE_LOCK"; BOOKMARK_DISPLACED_REMOTE="BOOKMARK_DISPLACED_REMOTE"
+    PREFLIGHT="PREFLIGHT"; FETCH_REMOTE="FETCH_REMOTE"; RECONCILE="RECONCILE"; BUILD_CATALOG="BUILD_CATALOG"; WAIT_SELECTION="WAIT_SELECTION"; REVALIDATE_SELECTION="REVALIDATE_SELECTION"; ACQUIRE_LOCK="ACQUIRE_LOCK"; SESSION_START_SNAPSHOT="SESSION_START_SNAPSHOT"; BOOKMARK_DISPLACED_REMOTE="BOOKMARK_DISPLACED_REMOTE"
     ARCHIVE_BEFORE_RESTORE="ARCHIVE_BEFORE_RESTORE"; APPLY_REMOTE_SAVE="APPLY_REMOTE_SAVE"; START_DPYES="START_DPYES"
     WAIT_GAME_START="WAIT_GAME_START"; WAIT_GAME_EXIT="WAIT_GAME_EXIT"; WAIT_SAVE_STABLE="WAIT_SAVE_STABLE"
     VALIDATE_SAVE="VALIDATE_SAVE"; ARCHIVE_AFTER_GAME="ARCHIVE_AFTER_GAME"; UPDATE_VAULT="UPDATE_VAULT"
@@ -142,6 +149,48 @@ class DomainAdapters:
         self.vault.extract_save(base,source,machine_id=self.config.machine_id,retries=self.config.stable_scan_retries,window_seconds=self.config.stable_window_seconds)
         return plan_restore(source,self.config.save_root,self.local_root/"archives",self.local_root/"recovery",machine_id=self.config.machine_id,retries=self.config.stable_scan_retries,window_seconds=self.config.stable_window_seconds,session_id=session)
     def archive_before_restore(self, plan): return archive_before_restore(plan,machine_id=self.config.machine_id,retries=self.config.stable_scan_retries,window_seconds=self.config.stable_window_seconds)
+    def session_start_snapshot(self, expected_live_root_hash: str, *, session_id: str, launched_from_candidate_kind: str) -> str:
+        """Archive the exact pre-launch live save; runs once, right after lock acquisition."""
+        manifest = stable_manifest(
+            self.config.save_root, machine_id=self.config.machine_id,
+            retries=self.config.stable_scan_retries, window_seconds=self.config.stable_window_seconds,
+        )
+        if manifest.get("root_hash") != expected_live_root_hash:
+            raise SyncError("selection_stale", "Live save changed after lock acquisition; run recover.", EXIT_RECOVERY_REQUIRED)
+        return create_session_start_archive(
+            self.local_root / "archives", self.config.save_root, manifest=manifest, machine_id=self.config.machine_id,
+            session_id=session_id, launched_from_candidate_kind=launched_from_candidate_kind,
+            retries=self.config.stable_scan_retries, window_seconds=self.config.stable_window_seconds,
+        )
+    def release_unmutated_lock(self, lock: Any) -> None:
+        """Cleanly abandon a lock that was acquired but never used to mutate anything.
+
+        Only valid immediately after ``acquire``, before any commit or restore.
+        """
+        if self._selection_original_state is None:
+            raise SyncError("adapter_contract_invalid", "No recoverable original state for lock release.", EXIT_RECOVERY_REQUIRED)
+        release_bookmark_lock(self.vault, lock, self._selection_original_state, state_path=self.state_path)
+    def prepare_local_restore(self, archive_id: str, session: str):
+        """Stage a verified session-start archive's save tree (never its metadata sidecar)."""
+        archives_root = self.local_root / "archives"
+        archive = archives_root / archive_id
+        if not SESSION_START_ID_PATTERN.fullmatch(archive_id) or archive.parent != archives_root:
+            raise SyncError("candidate_not_authorized", "Selected session-start archive id is invalid.", EXIT_VALIDATION)
+        _reject_unsafe(archives_root)
+        _reject_unsafe(archive)
+        if not archive.is_dir():
+            raise SyncError("candidate_not_authorized", "Selected session-start archive is unavailable.", EXIT_VALIDATION)
+        metadata = read_session_start_metadata(archive)
+        manifest = session_start_archive_manifest(archive, machine_id=self.config.machine_id)
+        if manifest["root_hash"] != metadata["root_hash"]:
+            raise SyncError("candidate_not_authorized", "Selected session-start archive no longer matches its record.", EXIT_VALIDATION)
+        staged = self.local_root / "staging" / session
+        extract_session_start_archive(archive, staged, expected_manifest=manifest, machine_id=self.config.machine_id)
+        return plan_restore(
+            staged, self.config.save_root, self.local_root / "archives", self.local_root / "recovery",
+            machine_id=self.config.machine_id, retries=self.config.stable_scan_retries,
+            window_seconds=self.config.stable_window_seconds, session_id=session,
+        )
     def apply_remote_save(self, plan): return apply_restore(plan,self.local_root/"recovery",machine_id=self.config.machine_id,retries=self.config.stable_scan_retries,window_seconds=self.config.stable_window_seconds)
     def launch(self, hook: Callable[[str],None]): return DPYesLauncher(self.config,state_hook=hook).run()
     def wait_save_stable(self) -> dict: return stable_manifest(self.config.save_root,machine_id=self.config.machine_id,retries=self.config.stable_scan_retries,window_seconds=self.config.stable_window_seconds)
@@ -275,9 +324,12 @@ class LaunchWorkflow:
             message="Audit log failed after mutation; run recover." if self.mutated else "Audit log could not be written before mutation."
             raise SyncError("logging_failed",message,code) from None
         self.last_success=state
-    def _require_adapter_contract(self) -> None:
+    # Needed only by the selection path.  ``run`` never takes a session-start
+    # snapshot, so these stay out of _REQUIRED_METHODS.
+    _SELECTION_REQUIRED_METHODS = ("session_start_snapshot", "release_unmutated_lock")
+    def _require_adapter_contract(self, *, extra: tuple[str, ...] = ()) -> None:
         """Fail before preflight (and therefore before mutations) for incomplete fakes/adapters."""
-        missing=[name for name in self._REQUIRED_METHODS if not callable(getattr(self.adapters,name,None))]
+        missing=[name for name in (*self._REQUIRED_METHODS, *extra) if not callable(getattr(self.adapters,name,None))]
         if missing:
             raise SyncError("adapter_contract_invalid","Launch adapter is incomplete; no sync action was started.",2)
     def _call(self,name:str,*args:Any)->Any: return getattr(self.adapters,name)(*args)
@@ -339,7 +391,7 @@ class LaunchWorkflow:
                 )
             return observed
         try:
-            self._require_adapter_contract()
+            self._require_adapter_contract(extra=self._SELECTION_REQUIRED_METHODS)
             self._at(WorkflowState.PREFLIGHT); self._call("preflight")
             self._at(WorkflowState.REVALIDATE_SELECTION)
             canonical = registry.revalidate(
@@ -348,7 +400,15 @@ class LaunchWorkflow:
             # No state, lock, archive, live-save, or vault mutation happened
             # before the registry returned this canonical capability.
             current_live = require_live_root(canonical.expected_live_root_hash, post_lock=False)
-            if current_live.get("root_hash") != canonical.selected_root_hash and canonical.selected_commit is None:
+            # A "live" selection has no later restore step, so its selected
+            # root must already equal the current live root.  A session_start
+            # selection *does* have a later local-archive restore step (like a
+            # remote/history/bookmark commit does), so it is exempt here too.
+            if (
+                current_live.get("root_hash") != canonical.selected_root_hash
+                and canonical.selected_commit is None
+                and canonical.candidate_kind != "session_start"
+            ):
                 raise SyncError("selection_stale", "Save data changed while selection was open; reload versions.", EXIT_CONFLICT)
             self.baseline = current_live
             if canonical.expected_context_digest is not None:
@@ -388,6 +448,34 @@ class LaunchWorkflow:
                     "selection_stale", "Live save changed after lock acquisition; run recover.",
                     EXIT_RECOVERY_REQUIRED,
                 )
+            # Unconditionally preserve the exact pre-launch live save, before any
+            # restore, launch, or promotion touches it.  A failure here must
+            # leave live untouched and must not force recovery: the lock is
+            # cleanly abandoned instead, since nothing has mutated yet.
+            self._at(WorkflowState.SESSION_START_SNAPSHOT)
+            # Presence was already proven before preflight, so an incomplete
+            # adapter can never get this far and strand a lock.
+            session_start_fn = self.adapters.session_start_snapshot
+            try:
+                # The adapter re-scans live itself (it needs the full manifest
+                # to archive, not just a root hash) and verifies that scan
+                # against this already-established root before publishing.
+                session_start_fn(
+                    canonical.expected_live_root_hash, session_id=self.session,
+                    launched_from_candidate_kind=canonical.candidate_kind,
+                )
+            except SyncError as session_start_error:
+                # Nothing has mutated live/remote/state yet, so give the lock
+                # back cleanly.  Only a *successful* release may clear
+                # ``mutated``; if the release itself fails, the acquired lock
+                # is still outstanding and recovery is genuinely required.
+                try:
+                    self.adapters.release_unmutated_lock(lock)
+                except Exception:
+                    pass
+                else:
+                    self.mutated = False
+                raise session_start_error
             if canonical.bookmark_displaced_remote:
                 self._at(WorkflowState.BOOKMARK_DISPLACED_REMOTE)
                 bookmark = getattr(self.adapters, "bookmark_displaced_remote", None)
@@ -401,6 +489,28 @@ class LaunchWorkflow:
             if canonical.selected_commit is not None:
                 require_live_root(canonical.expected_live_root_hash, post_lock=True)
                 restore_plan = self._call("prepare_remote_restore", canonical.selected_commit, self.session)
+                self._at(WorkflowState.ARCHIVE_BEFORE_RESTORE)
+                restore_plan = self._call("archive_before_restore", restore_plan)
+                capture_destinations()
+                require_live_root(canonical.expected_live_root_hash, post_lock=True)
+                self._at(WorkflowState.APPLY_REMOTE_SAVE); self._call("apply_remote_save", restore_plan)
+                try: restored = self._call("wait_save_stable")
+                except SyncError:
+                    quarantine_root = self._call("rescue_raw", None); capture_destinations(); raise
+                if restored.get("root_hash") != canonical.selected_root_hash:
+                    raise SyncError("selected_restore_mismatch", "Selected save did not match its verified manifest.", EXIT_RECOVERY_REQUIRED)
+                self.baseline = restored
+            elif canonical.candidate_kind == "session_start":
+                require_live_root(canonical.expected_live_root_hash, post_lock=True)
+                local_restore_fn = getattr(self.adapters, "prepare_local_restore", None)
+                if not callable(local_restore_fn):
+                    raise SyncError("adapter_contract_invalid", "Selection adapter cannot restore local session-start data.", EXIT_RECOVERY_REQUIRED)
+                source_catalog = registry.catalog(canonical.catalog_token)
+                source_candidate = source_catalog.candidate(canonical.candidate_id)
+                archive_id = source_candidate.source_archive_id
+                if not isinstance(archive_id, str) or not SESSION_START_ID_PATTERN.fullmatch(archive_id):
+                    raise SyncError("candidate_not_authorized", "Selected session-start archive is not authorized.", EXIT_VALIDATION)
+                restore_plan = local_restore_fn(archive_id, self.session)
                 self._at(WorkflowState.ARCHIVE_BEFORE_RESTORE)
                 restore_plan = self._call("archive_before_restore", restore_plan)
                 capture_destinations()

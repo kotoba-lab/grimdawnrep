@@ -53,6 +53,10 @@ class FakeAdapters:
         assert expected_pre_state is None
         return self.lock
     def align_selection_base(self, base): self._call("align"); assert base == self.remote
+    def session_start_snapshot(self, expected_live_root_hash, *, session_id, launched_from_candidate_kind):
+        self._call("session_start"); assert session_id == "session-1"
+        return "save-session-start-" + "0" * 16 + "-" + "0" * 32
+    def release_unmutated_lock(self, lock): self._call("release_unmutated"); assert lock is self.lock
     def prepare_remote_restore(self, base, session): self._call("prepare"); assert (base, session) == (self.remote, "session-1"); return "plan"
     def archive_before_restore(self, plan): self._call("archive_before"); assert plan == "plan"; return "archived-plan"
     def apply_remote_save(self, plan): self._call("apply"); assert plan == "archived-plan"; return {"ok": True}
@@ -769,6 +773,129 @@ def test_every_selection_post_lock_sync_fault_is_recovery_required(tmp_path: Pat
     assert caught.value.exit_code == EXIT_RECOVERY_REQUIRED
     assert caught.value.details["next_command"] == "grim-dawn-sync recover"
     assert caught.value.details["archive"].startswith("save-")
+
+
+def test_session_start_snapshot_runs_immediately_after_lock_before_any_restore(tmp_path: Path) -> None:
+    adapters = FakeAdapters(); subject, _ = run(tmp_path, adapters)
+    live, commit = "1" * 64, "a" * 40
+    item = SaveCandidate("live", "live", "live", "x", "m", live, None, 0, 0, 0, (), ManifestDiff(0, 0, 0))
+    catalog = VersionCatalog("w" * 32, commit, live, (item,)); registry = SelectionRegistry(); registry.register(catalog)
+    plan = registry.build_plan(catalog_token=catalog.token, candidate_id=item.candidate_id, mode="launch", case=ReconcileCase.LIVE_AHEAD)
+    adapters.live_manifest = lambda: {"root_hash": live}
+    adapters.remote_oid = lambda: commit
+    adapters.bookmark_displaced_remote = lambda *_: adapters.calls.append("bookmark")
+    assert subject.execute_selection_plan(plan, registry)["state"] == "COMPLETE"
+    assert adapters.calls.index("acquire") < adapters.calls.index("session_start") < adapters.calls.index("launch")
+
+
+def test_session_start_state_is_logged_between_acquire_lock_and_start_dpyes(tmp_path: Path) -> None:
+    adapters = FakeAdapters(); subject, log = run(tmp_path, adapters)
+    live, commit = "1" * 64, "a" * 40
+    item = SaveCandidate("live", "live", "live", "x", "m", live, None, 0, 0, 0, (), ManifestDiff(0, 0, 0))
+    catalog = VersionCatalog("x" * 32, commit, live, (item,)); registry = SelectionRegistry(); registry.register(catalog)
+    plan = registry.build_plan(catalog_token=catalog.token, candidate_id=item.candidate_id, mode="launch", case=ReconcileCase.LIVE_AHEAD)
+    adapters.live_manifest = lambda: {"root_hash": live}
+    adapters.remote_oid = lambda: commit
+    adapters.bookmark_displaced_remote = lambda *_: adapters.calls.append("bookmark")
+    assert subject.execute_selection_plan(plan, registry)["state"] == "COMPLETE"
+    rows = [json.loads(line)["state"] for line in log.read_text(encoding="utf-8").splitlines()]
+    assert rows.index("ACQUIRE_LOCK") < rows.index("SESSION_START_SNAPSHOT") < rows.index("START_DPYES")
+
+
+def test_session_start_failure_releases_lock_cleanly_without_forcing_recovery(tmp_path: Path) -> None:
+    adapters = FakeAdapters(); subject, _ = run(tmp_path, adapters)
+    live, commit = "1" * 64, "a" * 40
+    item = SaveCandidate("live", "live", "live", "x", "m", live, None, 0, 0, 0, (), ManifestDiff(0, 0, 0))
+    catalog = VersionCatalog("y" * 32, commit, live, (item,)); registry = SelectionRegistry(); registry.register(catalog)
+    plan = registry.build_plan(catalog_token=catalog.token, candidate_id=item.candidate_id, mode="launch", case=ReconcileCase.LIVE_AHEAD)
+    adapters.live_manifest = lambda: {"root_hash": live}
+    adapters.remote_oid = lambda: commit
+    fault = SyncError("session_start_disk_full", "Session-start archive could not be published.", EXIT_VALIDATION)
+    adapters.session_start_snapshot = lambda *_a, **_k: (_ for _ in ()).throw(fault)
+    with pytest.raises(SyncError) as caught:
+        subject.execute_selection_plan(plan, registry)
+    # Fail-closed with the *original* code/exit, not forced to recovery_required:
+    # nothing mutated live, and the lock was cleanly released.
+    assert caught.value.code == "session_start_disk_full"
+    assert caught.value.exit_code == EXIT_VALIDATION
+    assert "release_unmutated" in adapters.calls
+    assert not subject.mutated
+    assert {"launch", "archive_after_game", "snapshot", "push", "release"}.isdisjoint(adapters.calls)
+
+
+def test_session_start_failure_with_unreleasable_lock_forces_recovery(tmp_path: Path) -> None:
+    adapters = FakeAdapters(); subject, _ = run(tmp_path, adapters)
+    live, commit = "1" * 64, "a" * 40
+    item = SaveCandidate("live", "live", "live", "x", "m", live, None, 0, 0, 0, (), ManifestDiff(0, 0, 0))
+    catalog = VersionCatalog("z" * 32, commit, live, (item,)); registry = SelectionRegistry(); registry.register(catalog)
+    plan = registry.build_plan(catalog_token=catalog.token, candidate_id=item.candidate_id, mode="launch", case=ReconcileCase.LIVE_AHEAD)
+    adapters.live_manifest = lambda: {"root_hash": live}
+    adapters.remote_oid = lambda: commit
+    fault = SyncError("session_start_disk_full", "Session-start archive could not be published.", EXIT_VALIDATION)
+    adapters.session_start_snapshot = lambda *_a, **_k: (_ for _ in ()).throw(fault)
+    adapters.release_unmutated_lock = lambda _lock: (_ for _ in ()).throw(RuntimeError("cleanup also failed"))
+    with pytest.raises(SyncError) as caught:
+        subject.execute_selection_plan(plan, registry)
+    assert caught.value.exit_code == EXIT_RECOVERY_REQUIRED
+    assert caught.value.details["next_command"] == "grim-dawn-sync recover"
+    assert subject.mutated
+
+
+def test_missing_session_start_adapter_method_is_a_contract_error(tmp_path: Path) -> None:
+    adapters = FakeAdapters(); subject, _ = run(tmp_path, adapters)
+    del adapters.__class__.session_start_snapshot  # simulate an incomplete adapter
+    live, commit = "1" * 64, "a" * 40
+    item = SaveCandidate("live", "live", "live", "x", "m", live, None, 0, 0, 0, (), ManifestDiff(0, 0, 0))
+    catalog = VersionCatalog("q" * 32, commit, live, (item,)); registry = SelectionRegistry(); registry.register(catalog)
+    plan = registry.build_plan(catalog_token=catalog.token, candidate_id=item.candidate_id, mode="launch", case=ReconcileCase.LIVE_AHEAD)
+    adapters.live_manifest = lambda: {"root_hash": live}
+    adapters.remote_oid = lambda: commit
+    try:
+        with pytest.raises(SyncError) as caught:
+            subject.execute_selection_plan(plan, registry)
+        assert caught.value.code == "adapter_contract_invalid"
+        # The session-start snapshot is unconditional, so an adapter missing it
+        # must be rejected up front like every other required method: before
+        # preflight, before the lock, and therefore without needing recovery.
+        assert caught.value.exit_code == 2
+        assert not subject.mutated
+        assert "acquire" not in adapters.calls and "preflight" not in adapters.calls
+    finally:
+        FakeAdapters.session_start_snapshot = lambda self, expected_live_root_hash, *, session_id, launched_from_candidate_kind: (
+            self._call("session_start") or ("save-session-start-" + "0" * 16 + "-" + "0" * 32)
+        )
+
+
+def test_session_start_candidate_restores_from_local_archive_not_vault(tmp_path: Path) -> None:
+    adapters = FakeAdapters(); subject, _ = run(tmp_path, adapters)
+    live, selected, commit = "1" * 64, "2" * 64, "a" * 40
+    archive_id = "save-session-start-" + "3" * 16 + "-" + "4" * 32
+    item = SaveCandidate("chosen", "session_start", "session_start", "x", "m", selected, None, 0, 0, 0, (),
+                         ManifestDiff(0, 0, 0), source_archive_id=archive_id)
+    catalog = VersionCatalog("r" * 32, commit, live, (item,)); registry = SelectionRegistry(); registry.register(catalog)
+    plan = registry.build_plan(catalog_token=catalog.token, candidate_id=item.candidate_id, mode="launch", case=ReconcileCase.LIVE_AHEAD)
+    plan = registry.confirm(plan)  # session_start requires the second confirmation
+    adapters.live_manifest = lambda: {"root_hash": live}
+    adapters.remote_oid = lambda: commit
+    adapters.bookmark_displaced_remote = lambda *_: adapters.calls.append("bookmark")
+    adapters.wait_save_stable = lambda: {"root_hash": selected, "character_count": 1, "file_count": 1, "total_bytes": 1}
+    def prepare_local(passed_archive_id, session):
+        adapters.calls.append("prepare_local")
+        assert passed_archive_id == archive_id and session == "session-1"
+        return "local-plan"
+    adapters.prepare_local_restore = prepare_local
+    def archive_before(plan_value):
+        adapters.calls.append("archive_before"); assert plan_value == "local-plan"; return "archived-local-plan"
+    adapters.archive_before_restore = archive_before
+    def apply_local(plan_value):
+        adapters.calls.append("apply"); assert plan_value == "archived-local-plan"; return {"ok": True}
+    adapters.apply_remote_save = apply_local
+    adapters.mark_committed = lambda *_: adapters.calls.append("mark_committed")
+    adapters.push = lambda oid: adapters.calls.append("push") or "c" * 40
+    adapters.release = lambda *_: adapters.calls.append("release")
+    assert subject.execute_selection_plan(plan, registry)["state"] == "COMPLETE"
+    assert "prepare" not in adapters.calls  # the vault-restore path must never run
+    assert adapters.calls.index("prepare_local") < adapters.calls.index("apply")
 
 
 def test_lock_push_unknown_during_acquire_requires_recovery(tmp_path: Path) -> None:

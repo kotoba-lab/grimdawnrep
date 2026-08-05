@@ -15,9 +15,10 @@ from grim_dawn_sync.bookmarks import parse_bookmark_annotation
 from grim_dawn_sync.errors import EXIT_VALIDATION, SyncError
 from grim_dawn_sync.git_vault import GitVault, SnapshotValidationCache
 from grim_dawn_sync.manifest import stable_manifest
+from grim_dawn_sync.session_start import scan_session_start_archives
 
 
-CandidateKind = Literal["live", "remote_head", "history", "bookmark", "legacy"]
+CandidateKind = Literal["live", "remote_head", "history", "bookmark", "legacy", "session_start"]
 
 
 @dataclass(frozen=True)
@@ -39,6 +40,7 @@ class CandidateAlias:
     commit: str | None
     note: str | None = None
     committed_at: str | None = None
+    source_archive_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -58,6 +60,9 @@ class SaveCandidate:
     note: str | None = None
     aliases: tuple[CandidateAlias, ...] = ()
     committed_at: str | None = None
+    # Only populated for kind == "session_start": the opaque, tool-owned local
+    # archive basename a restore must read from.  Never an arbitrary path.
+    source_archive_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -95,7 +100,8 @@ class VersionCatalog:
                 if alias.candidate_id == candidate_id:
                     return replace(item, candidate_id=alias.candidate_id, kind=alias.kind,
                                    display_name=alias.display_name, created_at=alias.created_at,
-                                   commit=alias.commit, note=alias.note, committed_at=alias.committed_at, aliases=())
+                                   commit=alias.commit, note=alias.note, committed_at=alias.committed_at,
+                                   source_archive_id=alias.source_archive_id, aliases=())
         raise SyncError("unknown_candidate", "Selected save candidate is not in this catalog.", EXIT_VALIDATION)
 
 
@@ -135,7 +141,7 @@ def _diff(left: dict, right: dict) -> ManifestDiff:
 
 
 _REPRESENTATIVE_PRIORITY: dict[CandidateKind, int] = {
-    "live": 0, "remote_head": 1, "bookmark": 2, "history": 3, "legacy": 4,
+    "live": 0, "remote_head": 1, "bookmark": 2, "history": 3, "legacy": 4, "session_start": 5,
 }
 
 
@@ -152,7 +158,7 @@ def _coalesce(candidates: list[SaveCandidate]) -> tuple[SaveCandidate, ...]:
         representative = min(values, key=lambda item: (_REPRESENTATIVE_PRIORITY[item.kind], values.index(item)))
         aliases = tuple(
             CandidateAlias(item.candidate_id, item.kind, item.display_name, item.created_at, item.commit,
-                           item.note, item.committed_at)
+                           item.note, item.committed_at, item.source_archive_id)
             for item in values if item is not representative
         )
         result.append(replace(representative, aliases=aliases))
@@ -164,12 +170,16 @@ class VersionCatalogBuilder:
 
     def __init__(self, vault: GitVault, live_root: Path, *, machine_id: str, retries: int = 1, window_seconds: float = 0,
                  baseline_root_hash: str | None = None, clock: Callable[[], float] = time.time,
-                 remote_check_failure: Literal["raise", "report"] = "raise") -> None:
+                 remote_check_failure: Literal["raise", "report"] = "raise",
+                 archives_root: Path | None = None) -> None:
         self.vault = vault
         self.live_root = Path(live_root)
         self.machine_id = machine_id
         self.retries = retries
         self.window_seconds = window_seconds
+        # Optional: when set, local session-start archives are scanned and
+        # offered as candidates alongside remote/history/bookmark ones.
+        self.archives_root = Path(archives_root) if archives_root is not None else None
         if baseline_root_hash is not None and not re.fullmatch(r"[0-9a-f]{64}", baseline_root_hash):
             raise SyncError("invalid_baseline_root", "Catalog baseline root is invalid.", EXIT_VALIDATION)
         self.baseline_root_hash = baseline_root_hash
@@ -240,12 +250,13 @@ class VersionCatalogBuilder:
             return committed_at_by_commit[commit]
 
         def candidate(kind: CandidateKind, display_name: str, commit: str | None, manifest: dict,
-                      *, note: str | None = None) -> SaveCandidate:
+                      *, note: str | None = None, source_archive_id: str | None = None) -> SaveCandidate:
             root_hash = str(manifest["root_hash"])
             if root_hash not in diff_by_root:
                 diff_by_root[root_hash] = _diff(live, manifest)
             return self._candidate(kind, display_name, commit, manifest, live, note=note,
-                                   diff=diff_by_root[root_hash], committed_at=committed_at(commit))
+                                   diff=diff_by_root[root_hash], committed_at=committed_at(commit),
+                                   source_archive_id=source_archive_id)
 
         candidates: list[SaveCandidate] = [candidate("live", "This device's current data", None, live)]
         for index, commit in enumerate(commits):
@@ -264,6 +275,12 @@ class VersionCatalogBuilder:
         for name, commit in self.vault.legacy_annotated_tags():
             manifest = snapshot(commit)
             candidates.append(candidate("legacy", name, commit, manifest))
+        if self.archives_root is not None:
+            # Local-only, opaque-id candidates: safety (link/reparse rejection,
+            # schema, and root-hash re-verification) is enforced inside the scan.
+            for archive_id, manifest, _meta in scan_session_start_archives(self.archives_root, machine_id=self.machine_id):
+                candidates.append(candidate("session_start", "This launch's pre-session data", None, manifest,
+                                            source_archive_id=archive_id))
         now = self._clock_now()
         scope = hashlib.sha256(
             (f"{int(now) // 300}\0{self.machine_id}\0{live['root_hash']}\0{remote_head or ''}\0"
@@ -287,7 +304,7 @@ class VersionCatalogBuilder:
     @staticmethod
     def _candidate(kind: CandidateKind, display_name: str, commit: str | None, manifest: dict, live: dict, *,
                    note: str | None = None, diff: ManifestDiff | None = None,
-                   committed_at: str | None = None) -> SaveCandidate:
-        seed = f"{kind}\0{commit or manifest['root_hash']}\0{manifest['root_hash']}".encode("ascii")
+                   committed_at: str | None = None, source_archive_id: str | None = None) -> SaveCandidate:
+        seed = f"{kind}\0{commit or source_archive_id or manifest['root_hash']}\0{manifest['root_hash']}".encode("ascii")
         candidate_id = hashlib.sha256(seed).hexdigest()[:32]
-        return SaveCandidate(candidate_id, kind, display_name, str(manifest["created_at"]), str(manifest["machine_id"]), str(manifest["root_hash"]), commit, int(manifest["character_count"]), int(manifest["file_count"]), int(manifest["total_bytes"]), _labels(manifest), diff or _diff(live, manifest), note, committed_at=committed_at)
+        return SaveCandidate(candidate_id, kind, display_name, str(manifest["created_at"]), str(manifest["machine_id"]), str(manifest["root_hash"]), commit, int(manifest["character_count"]), int(manifest["file_count"]), int(manifest["total_bytes"]), _labels(manifest), diff or _diff(live, manifest), note, committed_at=committed_at, source_archive_id=source_archive_id)

@@ -33,6 +33,7 @@ from grim_dawn_sync.session_lock import (
     release_lock,
 )
 from grim_dawn_sync.snapshot import _copy_verified, restore_from_directory
+from grim_dawn_sync.session_start import session_start_usage
 from grim_dawn_sync.state import SyncState, load_state, save_state_if_unchanged
 from grim_dawn_sync.process_monitor import ProcessMonitor, WindowsProcessMonitor
 from grim_dawn_sync.validation import validate_players
@@ -368,6 +369,7 @@ def _capture_catalog(config_path: Path, expected_config: Any) -> tuple[GitVault,
         # pre-T-B behavior: an unreachable remote aborts before any candidate
         # is shown.  The reporting path exists for a future permissive policy.
         remote_check_failure=("raise" if getattr(current_config, "offline_policy", "deny") == "deny" else "report"),
+        archives_root=Path(config_path).parent / "archives",
     ).build()
     # Close the scan around config/state/lock/process too, so the catalog can
     # never be issued from a hybrid of values observed on opposite sides of I/O.
@@ -828,6 +830,7 @@ def status(config_path: Path, *, monitor: ProcessMonitor | None = None) -> dict[
             "recovery_phase":state.phase,
             "processes": _process_status(config, monitor),
             "archive_usage": _tree_usage(Path(config_path).parent / "archives"),
+            "session_start_usage": session_start_usage(Path(config_path).parent / "archives"),
             "vault_usage": _tree_usage(Path(config.vault_repo) / "save")}
 
 

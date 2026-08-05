@@ -84,8 +84,8 @@ def _candidate_detail_text(item: SaveCandidate, catalog: VersionCatalog, directi
     baseline_relation = "unavailable" if catalog.baseline_root_hash is None else ("same" if item.root_hash == catalog.baseline_root_hash else "different")
     reason = ("Recommended: this matches the policy for the current synchronization state."
               if item.kind == directive.initial_selection else "Not the policy default: review the relations and warning before continuing.")
-    warning = ("Warning: selecting a history or bookmark version requires explicit confirmation."
-               if item.kind in {"history", "bookmark", "legacy"} else "Warning: verify that this is the intended game progress before launch.")
+    warning = ("Warning: selecting a history, bookmark, or session-start version requires explicit confirmation."
+               if item.kind in {"history", "bookmark", "legacy", "session_start"} else "Warning: verify that this is the intended game progress before launch.")
     char_diff = (f"Character directories: +{', '.join(diff.character_dirs_added) or 'none'}; "
                  f"-{', '.join(diff.character_dirs_removed) or 'none'}; changed {', '.join(diff.character_dirs_changed) or 'none'}.")
     provenance = _provenance_lines(item, catalog)
@@ -245,7 +245,7 @@ def present_tk_from_builder(build: Callable[[], VersionCatalog], directive: Sele
                 nonlocal result
                 item = selected()
                 if item is None: return
-                risky = item.kind in {"history", "bookmark", "legacy"} or mode == "promote-only"
+                risky = item.kind in {"history", "bookmark", "legacy", "session_start"} or mode == "promote-only"
                 confirmed = False
                 if not remote_ok:
                     unconfirmed_text = ("The remote version could not be freshly confirmed this session "

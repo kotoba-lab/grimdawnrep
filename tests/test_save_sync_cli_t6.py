@@ -554,6 +554,8 @@ def test_snapshot_with_enrolled_baseline_uses_real_lock_and_releases_cleanly(
 
 def test_status_reports_archive_and_vault_usage(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     (tmp_path / "archives").mkdir(); (tmp_path / "archives" / "a").write_bytes(b"abc")
+    session_start_dir = tmp_path / "archives" / ("save-session-start-" + "1" * 16 + "-" + "2" * 32)
+    session_start_dir.mkdir(); (session_start_dir / "player.gdc").write_bytes(b"12345")
     vault_root = tmp_path / "vault" / "save"; vault_root.mkdir(parents=True); (vault_root / "b").write_bytes(b"1234")
     config = SimpleNamespace(vault_repo=tmp_path / "vault", machine_id="t6")
     class Vault:
@@ -563,7 +565,11 @@ def test_status_reports_archive_and_vault_usage(monkeypatch: pytest.MonkeyPatch,
     monkeypatch.setattr(cli, "load_config", lambda _: config); monkeypatch.setattr(cli, "_vault", lambda _: Vault())
     monkeypatch.setattr(cli, "inspect_remote_lock_readonly", lambda _: None); monkeypatch.setattr(cli, "load_state", lambda _: cli.SyncState())
     result = cli.status(tmp_path / "config.local.json", monitor=_Monitor(ProcessScan(())))
-    assert result["readiness"] == "ready" and result["archive_usage"]["bytes"] == 3 and result["vault_usage"]["bytes"] == 4
+    assert result["readiness"] == "ready" and result["archive_usage"]["bytes"] == 8 and result["vault_usage"]["bytes"] == 4
+    # T-D 6.3: session-start archive count and total bytes are surfaced
+    # separately, without ever triggering automatic deletion.
+    assert result["session_start_usage"] == {"count": 1, "bytes": 5}
+    assert session_start_dir.is_dir()
 
 
 def test_doctor_is_read_only_and_does_not_emit_config_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

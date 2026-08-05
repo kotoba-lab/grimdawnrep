@@ -6,6 +6,8 @@ import pytest
 
 from grim_dawn_sync.git_vault import GitVault
 from grim_dawn_sync.errors import SyncError
+from grim_dawn_sync.manifest import build_manifest
+from grim_dawn_sync.session_start import create_session_start_archive
 from grim_dawn_sync.version_catalog import RemoteCheckReport, VersionCatalogBuilder, _diff
 from test_save_sync_git_vault import checkout_remote_main, clone_pair, git, save, valid
 
@@ -201,3 +203,47 @@ def test_same_root_hash_different_commits_keep_distinct_committed_at_provenance(
     assert set(by_commit) == {first, second}
     assert by_commit[first] is not None and by_commit[second] is not None
     assert by_commit[first] != by_commit[second]
+
+
+def test_catalog_lists_session_start_archive_with_no_commit_and_no_committed_at(tmp_path: Path) -> None:
+    """T-D 6.2: session_start candidates are commit-less, local-only archives."""
+    _, one, _ = clone_pair(tmp_path); source = save(tmp_path / "source", b"remote-content"); vault = GitVault(one)
+    remote = vault.snapshot(source, machine_id="a", session_id="one", validator=valid); vault.push(remote)
+    save(source, b"live-changed")  # live now differs from the archived pre-launch data
+    live_manifest_before_change = build_manifest(save(tmp_path / "pre-launch", b"pre-launch-data"), machine_id="a")
+    archives = tmp_path / "archives"
+    archive_id = create_session_start_archive(
+        archives, tmp_path / "pre-launch", manifest=live_manifest_before_change, machine_id="a",
+        session_id="11111111-1111-1111-1111-111111111111", launched_from_candidate_kind="remote_head",
+    )
+    catalog = VersionCatalogBuilder(vault, source, machine_id="a", archives_root=archives).build()
+    session_start_items = [item for item in catalog.candidates if item.kind == "session_start"]
+    assert len(session_start_items) == 1
+    item = session_start_items[0]
+    assert item.commit is None
+    assert item.committed_at is None
+    assert item.root_hash == live_manifest_before_change["root_hash"]
+    assert item.source_archive_id == archive_id
+
+
+def test_catalog_without_archives_root_never_scans_local_archives(tmp_path: Path) -> None:
+    _, one, _ = clone_pair(tmp_path); source = save(tmp_path / "source", b"one"); vault = GitVault(one)
+    vault.push(vault.snapshot(source, machine_id="a", session_id="one", validator=valid))
+    catalog = VersionCatalogBuilder(vault, source, machine_id="a").build()
+    assert not any(item.kind == "session_start" for item in catalog.candidates)
+
+
+def test_catalog_skips_tampered_session_start_archive_but_still_builds(tmp_path: Path) -> None:
+    _, one, _ = clone_pair(tmp_path); source = save(tmp_path / "source", b"one"); vault = GitVault(one)
+    vault.push(vault.snapshot(source, machine_id="a", session_id="one", validator=valid))
+    archives = tmp_path / "archives"
+    pre_launch = save(tmp_path / "pre-launch", b"pre-launch-data")
+    manifest = build_manifest(pre_launch, machine_id="a")
+    archive_id = create_session_start_archive(
+        archives, pre_launch, manifest=manifest, machine_id="a",
+        session_id="22222222-2222-2222-2222-222222222222", launched_from_candidate_kind="live",
+    )
+    (archives / archive_id / "main" / "a" / "player.gdc").write_bytes(b"tampered")
+    catalog = VersionCatalogBuilder(vault, source, machine_id="a", archives_root=archives).build()
+    assert not any(item.kind == "session_start" for item in catalog.candidates)
+    assert catalog.candidates  # the rest of the catalog still built fine
