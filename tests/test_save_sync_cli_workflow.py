@@ -24,6 +24,29 @@ def test_parser_requires_apply_and_explicit_restore_bootstrap_arguments() -> Non
     assert parser.parse_args(["archive-live", "--apply"]).command == "archive-live"
 
 
+def test_parser_selector_flag_defaults_to_none_and_accepts_only_known_values() -> None:
+    parser = cli.build_parser()
+    assert parser.parse_args(["launch"]).selector is None
+    assert parser.parse_args(["launch", "--selector", "always"]).selector == "always"
+    assert parser.parse_args(["launch", "--selector", "on-diff"]).selector == "on-diff"
+    with pytest.raises(SystemExit):
+        parser.parse_args(["launch", "--selector", "never"])
+
+
+def test_main_forwards_selector_override_to_launch(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
+    calls: list[dict[str, object]] = []
+
+    def fake_launch(_config_path, **kwargs):
+        calls.append(kwargs)
+        return {"schema_version": "1.0.0", "command": "launch", "result": {"state": "COMPLETE"}}
+
+    monkeypatch.setattr(cli, "launch", fake_launch)
+    config = tmp_path / "config.local.json"
+    assert cli.main(["--config", str(config), "--json", "launch", "--selector", "always"]) == 0
+    json.loads(capsys.readouterr().out)
+    assert calls[-1]["selector"] == "always"
+
+
 def test_main_routes_commands_to_their_semantic_handlers(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
     calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
 

@@ -41,6 +41,35 @@ def test_classification_is_pure_and_complete(live, remote, baseline, expected) -
         assert directive.allowed_operations == ("cancel",)
 
 
+@pytest.mark.parametrize("case", list(ReconcileCase))
+@pytest.mark.parametrize("policy", ["on_diff", "always"])
+def test_selection_policy_full_case_by_policy_matrix(case: ReconcileCase, policy: str) -> None:
+    """All 5 ReconcileCase values x both policy values (T-C 5.3 requirement)."""
+    on_diff = selection_policy(case, policy="on_diff")
+    directive = selection_policy(case, policy=policy)
+    # `always` may only ever widen show_selector to True; every other field,
+    # and BASELINE_MISSING's show_selector in particular, stays untouched.
+    assert directive.initial_selection == on_diff.initial_selection
+    assert directive.allowed_operations == on_diff.allowed_operations
+    assert directive.bookmark_displaced_remote == on_diff.bookmark_displaced_remote
+    if policy == "on_diff":
+        assert directive.show_selector == on_diff.show_selector
+    elif case is ReconcileCase.BASELINE_MISSING:
+        assert directive.show_selector is False
+    else:
+        assert directive.show_selector is True
+
+
+def test_selection_policy_defaults_to_on_diff_when_unspecified() -> None:
+    assert selection_policy(ReconcileCase.EQUAL) == selection_policy(ReconcileCase.EQUAL, policy="on_diff")
+
+
+def test_selection_policy_rejects_unknown_policy_name() -> None:
+    with pytest.raises(SyncError) as caught:
+        selection_policy(ReconcileCase.EQUAL, policy="never")
+    assert caught.value.code == "invalid_selection_policy"
+
+
 def test_equal_live_representative_never_bookmarks_displaced_remote() -> None:
     live = candidate("live", "1" * 64, None)
     value = catalog(live, live="1" * 64)

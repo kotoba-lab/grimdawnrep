@@ -59,12 +59,32 @@ def classify_reconciliation(*, live_root_hash: str | None, remote_root_hash: str
     return ReconcileCase.DIVERGED
 
 
-def selection_policy(case: ReconcileCase) -> SelectionDirective:
-    """Return the immutable policy for a reconciliation case."""
+SelectionPolicyName = Literal["on_diff", "always"]
+_SELECTION_POLICY_NAMES = frozenset({"on_diff", "always"})
+
+
+def selection_policy(case: ReconcileCase, *, policy: str = "on_diff") -> SelectionDirective:
+    """Return the immutable policy for a reconciliation case.
+
+    ``policy="always"`` may only widen ``show_selector`` to ``True``.  It never
+    changes ``initial_selection``, ``allowed_operations``, or
+    ``bookmark_displaced_remote``, and it never overrides the
+    ``BASELINE_MISSING`` fail-closed error (which keeps ``show_selector=False``
+    regardless of policy).
+    """
+    if policy not in _SELECTION_POLICY_NAMES:
+        raise SyncError("invalid_selection_policy", "Selection policy is invalid.", EXIT_VALIDATION)
     try:
-        return _POLICY[ReconcileCase(case)]
-    except (KeyError, ValueError) as error:
+        resolved_case = ReconcileCase(case)
+    except ValueError as error:
         raise SyncError("invalid_reconcile_case", "Selection state is invalid.", EXIT_VALIDATION) from error
+    try:
+        directive = _POLICY[resolved_case]
+    except KeyError as error:
+        raise SyncError("invalid_reconcile_case", "Selection state is invalid.", EXIT_VALIDATION) from error
+    if policy == "always" and resolved_case != ReconcileCase.BASELINE_MISSING and not directive.show_selector:
+        directive = replace(directive, show_selector=True)
+    return directive
 
 
 @dataclass(frozen=True)

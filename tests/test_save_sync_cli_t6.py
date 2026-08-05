@@ -375,7 +375,8 @@ def test_launch_and_shortcut_apply_are_explicit_and_dry_run_does_nothing(monkeyp
     })
     assert cli.main(["--config", str(config_path), "--json", "launch"]) == 0
     assert json.loads(capsys.readouterr().out)["result"] == {"phase": "complete"}
-    assert calls[-1] == (config_path, {"as_json": True, "selected": None, "catalog_token": None, "confirmed": False})
+    assert calls[-1] == (config_path, {"as_json": True, "selected": None, "catalog_token": None, "confirmed": False,
+                                       "selector": None})
 
 
 @pytest.mark.parametrize(("error", "expected"), [

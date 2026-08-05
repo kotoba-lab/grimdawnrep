@@ -11,8 +11,11 @@ from typing import Any
 from grim_dawn_sync.errors import SyncError
 
 
-CONFIG_SCHEMA_VERSION = "1.0.0"
+CONFIG_SCHEMA_VERSION = "1.1.0"
+SUPPORTED_CONFIG_SCHEMA_VERSIONS = frozenset({"1.0.0", "1.1.0"})
 DEFAULT_CONFIG_FILE_NAME = "config.local.json"
+SELECTION_POLICIES = frozenset({"on_diff", "always"})
+DEFAULT_SELECTION_POLICY = "on_diff"
 CONFIG_KEYS = frozenset(
     {
         "schema_version",
@@ -29,6 +32,7 @@ CONFIG_KEYS = frozenset(
         "stable_window_seconds",
         "stable_scan_retries",
         "offline_policy",
+        "selection_policy",
     }
 )
 
@@ -49,6 +53,7 @@ class SyncConfig:
     stable_window_seconds: int
     stable_scan_retries: int
     offline_policy: str
+    selection_policy: str
 
     def public_dict(self) -> dict[str, Any]:
         result = asdict(self)
@@ -86,8 +91,23 @@ def parse_config(payload: dict[str, Any]) -> SyncConfig:
     unknown_keys = sorted(set(payload) - CONFIG_KEYS)
     if unknown_keys:
         raise SyncError("invalid_config", "Configuration contains unsupported fields.")
-    if payload.get("schema_version") != CONFIG_SCHEMA_VERSION:
-        raise SyncError("unsupported_config_schema", f"schema_version must be {CONFIG_SCHEMA_VERSION}.")
+    schema_version = payload.get("schema_version")
+    if schema_version not in SUPPORTED_CONFIG_SCHEMA_VERSIONS:
+        raise SyncError(
+            "unsupported_config_schema",
+            f"schema_version must be one of {sorted(SUPPORTED_CONFIG_SCHEMA_VERSIONS)}.",
+        )
+    if "selection_policy" in payload:
+        selection_policy = payload.get("selection_policy")
+        if selection_policy not in SELECTION_POLICIES:
+            raise SyncError(
+                "invalid_config",
+                "Configuration field 'selection_policy' must be 'on_diff' or 'always'.",
+            )
+    else:
+        # Older (1.0.0) configs, and 1.1.0 configs that omit the field, keep
+        # the pre-existing behavior: the selector only appears on a diff.
+        selection_policy = DEFAULT_SELECTION_POLICY
     names = payload.get("game_process_names")
     if not isinstance(names, list) or not names or any(not isinstance(name, str) or not name.strip() for name in names):
         raise SyncError("invalid_config", "Configuration field 'game_process_names' must be a non-empty string array.")
@@ -112,6 +132,7 @@ def parse_config(payload: dict[str, Any]) -> SyncConfig:
         stable_window_seconds=_positive_integer(payload, "stable_window_seconds"),
         stable_scan_retries=_positive_integer(payload, "stable_scan_retries"),
         offline_policy=offline_policy,
+        selection_policy=selection_policy,
     )
 
 

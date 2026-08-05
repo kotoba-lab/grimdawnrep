@@ -20,11 +20,12 @@ def _candidate(candidate_id: str, kind: str, root: str, commit: str | None) -> S
 
 
 def _install_context(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, live: str, remote: str,
-                     baseline: str, token: str = "t" * 32) -> tuple[Path, VersionCatalog, list[object]]:
+                     baseline: str, token: str = "t" * 32,
+                     selection_policy: str = "on_diff") -> tuple[Path, VersionCatalog, list[object]]:
     config_path = tmp_path / "config.local.json"
     config = SimpleNamespace(save_root=tmp_path / "live", vault_repo=tmp_path / "vault", remote="origin",
                              branch="main", machine_id="machine", stable_scan_retries=1,
-                             stable_window_seconds=0)
+                             stable_window_seconds=0, selection_policy=selection_policy)
     config.public_dict = lambda: {"machine_id": "machine", "save_root": str(tmp_path / "live"),
                                   "vault_repo": str(tmp_path / "vault"), "remote": "origin", "branch": "main"}
     commit = "a" * 40
@@ -88,6 +89,86 @@ def test_equal_json_launch_uses_canonical_selection_path_not_legacy_run(monkeypa
     assert result["result"]["state"] == "COMPLETE"
     plan = calls[-1]
     assert getattr(plan, "candidate_kind") == "live" and getattr(plan, "mode") == "launch"
+
+
+def test_always_policy_json_launch_on_equal_requires_explicit_selection(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """T-C 5.2/5.3: `always` widens show_selector even for EQUAL, so headless
+    --json must not silently auto-select and rewrite live."""
+    root = "1" * 64
+    config_path, _, calls = _install_context(
+        monkeypatch, tmp_path, live=root, remote=root, baseline=root, selection_policy="always",
+    )
+    with pytest.raises(SyncError) as error:
+        cli.launch(config_path, as_json=True)
+    assert error.value.code == "selection_required"
+    assert calls == ["preflight"] * 3 and "COMPLETE" not in str(calls)
+
+
+def test_always_policy_still_lets_an_explicit_equal_selection_through(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    root = "1" * 64
+    config_path, _, calls = _install_context(
+        monkeypatch, tmp_path, live=root, remote=root, baseline=root, selection_policy="always",
+    )
+    issued = cli.versions(config_path)
+    result = cli.launch(config_path, as_json=True, selected="live-id", catalog_token=issued["catalog_token"])
+    assert result["result"]["state"] == "COMPLETE"
+
+
+def test_selector_cli_flag_overrides_config_policy_for_equal_json_launch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    root = "1" * 64
+    config_path, _, calls = _install_context(
+        monkeypatch, tmp_path, live=root, remote=root, baseline=root, selection_policy="on_diff",
+    )
+    # Config says on_diff (auto-select on EQUAL); the CLI override forces always.
+    with pytest.raises(SyncError) as error:
+        cli.launch(config_path, as_json=True, selector="always")
+    assert error.value.code == "selection_required"
+    # Without the override the same EQUAL state still auto-selects as before.
+    result = cli.launch(config_path, as_json=True)
+    assert result["result"]["state"] == "COMPLETE"
+
+
+def test_selector_cli_flag_can_relax_an_always_config_back_to_on_diff(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    root = "1" * 64
+    config_path, _, _ = _install_context(
+        monkeypatch, tmp_path, live=root, remote=root, baseline=root, selection_policy="always",
+    )
+    result = cli.launch(config_path, as_json=True, selector="on-diff")
+    assert result["result"]["state"] == "COMPLETE"
+
+
+def test_invalid_selector_override_is_rejected(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    root = "1" * 64
+    config_path, _, _ = _install_context(monkeypatch, tmp_path, live=root, remote=root, baseline=root)
+    with pytest.raises(SyncError) as error:
+        cli.launch(config_path, as_json=True, selector="never")
+    assert error.value.code == "invalid_selection_policy"
+
+
+def test_interactive_always_policy_shows_selector_on_equal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    root = "1" * 64
+    config_path, _, _ = _install_context(
+        monkeypatch, tmp_path, live=root, remote=root, baseline=root, selection_policy="always",
+    )
+
+    class Presenter:
+        def present_builder(self, build, directive):
+            catalog = build()
+            policy = directive(catalog)
+            assert policy.show_selector is True
+            return SelectionRequest("live-id", "launch")
+
+    assert cli.launch(config_path, presenter=Presenter())["result"]["state"] == "COMPLETE"
 
 
 def test_json_and_auto_safe_refuse_different_saves_without_mutation(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

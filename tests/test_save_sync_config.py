@@ -41,6 +41,44 @@ def test_parse_config_preserves_terminal_local_values() -> None:
     assert config.public_dict()["launcher_path"].endswith("DPYes.exe")
 
 
+def test_parse_config_defaults_selection_policy_to_on_diff() -> None:
+    payload = config_payload()
+    assert "selection_policy" not in payload
+    config = parse_config(payload)
+    assert config.selection_policy == "on_diff"
+    assert config.public_dict()["selection_policy"] == "on_diff"
+
+
+def test_parse_config_accepts_schema_1_0_0_without_selection_policy() -> None:
+    payload = config_payload()
+    payload["schema_version"] = "1.0.0"
+    config = parse_config(payload)
+    assert config.selection_policy == "on_diff"
+    # The tool always reports the current schema version once parsed.
+    assert config.schema_version == CONFIG_SCHEMA_VERSION
+
+
+def test_parse_config_accepts_selection_policy_always() -> None:
+    payload = config_payload()
+    payload["selection_policy"] = "always"
+    config = parse_config(payload)
+    assert config.selection_policy == "always"
+
+
+def test_parse_config_rejects_invalid_selection_policy() -> None:
+    payload = config_payload()
+    payload["selection_policy"] = "never"
+    with pytest.raises(SyncError, match="invalid_config"):
+        parse_config(payload)
+
+
+def test_parse_config_rejects_unsupported_schema_version() -> None:
+    payload = config_payload()
+    payload["schema_version"] = "9.9.9"
+    with pytest.raises(SyncError, match="unsupported_config_schema"):
+        parse_config(payload)
+
+
 def test_config_rejects_unsupported_offline_mode() -> None:
     payload = config_payload()
     payload["offline_policy"] = "allow"

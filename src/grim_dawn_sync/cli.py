@@ -85,6 +85,7 @@ def build_parser() -> argparse.ArgumentParser:
     launch_parser.add_argument("--select", help="auto-safe or an opaque candidate ID")
     launch_parser.add_argument("--catalog-token", help="short-lived catalog capability for --select")
     launch_parser.add_argument("--confirm", action="store_true", help="second confirmation for a history/bookmark selection")
+    launch_parser.add_argument("--selector", choices=["always", "on-diff"], help="override the configured selection_policy for this run")
     subparsers.add_parser("versions", help="list verified save-version candidates")
     bookmark_parser = subparsers.add_parser("bookmark", help="create a named immutable bookmark")
     bookmark_parser.add_argument("--candidate", required=True)
@@ -503,6 +504,21 @@ def _registry_for_catalog(catalog: Any) -> SelectionRegistry:
     )
 
 
+def _resolve_selection_policy(config: Any, selector_override: str | None) -> str:
+    """Resolve the effective selection_policy for one launch/promote call.
+
+    ``selector_override`` comes only from the ``--selector`` CLI flag (already
+    constrained by argparse choices to ``always``/``on-diff``); it never
+    reads or accepts arbitrary strings from any other input surface.
+    """
+    if selector_override is None:
+        return getattr(config, "selection_policy", "on_diff")
+    normalized = selector_override.replace("-", "_")
+    if normalized not in ("on_diff", "always"):
+        raise SyncError("invalid_selection_policy", "Selector override must be 'always' or 'on-diff'.", 3)
+    return normalized
+
+
 def _automatic_request(catalog: Any, mode: str) -> SelectionRequest:
     candidate = next((item for item in catalog.candidates if item.kind == "live"), None)
     if candidate is None:
@@ -519,9 +535,11 @@ def _execute_selection_command(
     catalog_token: str | None,
     presenter: SelectionPresenter | None = None,
     confirmed: bool = False,
+    selector_override: str | None = None,
 ) -> dict[str, Any]:
     config = load_config(config_path)
     _process_preflight(config)
+    effective_policy = _resolve_selection_policy(config, selector_override)
     if selected and selected != "auto-safe" and catalog_token is None:
         raise SyncError("catalog_token_required", "Explicit selection requires a current catalog capability.", 3)
     ui = presenter or TkSelectionPresenter()
@@ -537,7 +555,7 @@ def _execute_selection_command(
                                 projection=projection_value, case=case_value)
                 return catalog_value
             def directive_after_scan(_catalog: Any) -> SelectionDirective:
-                base = selection_policy(captured["case"])
+                base = selection_policy(captured["case"], policy=effective_policy)
                 if command == "promote":
                     return SelectionDirective(True, base.initial_selection, ("promote", "bookmark", "cancel", "reload"),
                                               base.bookmark_displaced_remote)
@@ -559,7 +577,7 @@ def _execute_selection_command(
                 config_path, config, supplied_token=(catalog_token if selected and selected != "auto-safe" else None),
             )
             case = _selection_case(config_path, catalog, vault)
-        directive = selection_policy(case)
+        directive = selection_policy(case, policy=effective_policy)
         registry = _registry_for_catalog(catalog); registry.register(catalog)
 
         if selected and selected != "auto-safe":
@@ -569,7 +587,11 @@ def _execute_selection_command(
             )
         elif command == "promote" and as_json:
             raise SyncError("selection_required", "Promotion requires an explicit current selection.", 3)
-        elif case == ReconcileCase.EQUAL:
+        elif not directive.show_selector:
+            # Policy may only widen this to True (never narrow it): on_diff's
+            # EQUAL auto-selection keeps working exactly as before, while
+            # selection_policy=always forces the explicit-selection path below
+            # even for what would otherwise be an automatic EQUAL launch.
             request = request or _automatic_request(catalog, "launch")
         elif selected == "auto-safe" or as_json:
             raise SyncError("selection_required", "Save versions differ; an explicit current selection is required.", 3)
@@ -674,17 +696,20 @@ def _execute_selection_command(
 
 def launch(config_path: Path, *, as_json: bool = False, selected: str | None = None,
            catalog_token: str | None = None, presenter: SelectionPresenter | None = None,
-           confirmed: bool = False) -> dict[str, Any]:
+           confirmed: bool = False, selector: str | None = None) -> dict[str, Any]:
     return _execute_selection_command(config_path, command="launch", as_json=as_json, selected=selected,
-                                      catalog_token=catalog_token, presenter=presenter, confirmed=confirmed)
+                                      catalog_token=catalog_token, presenter=presenter, confirmed=confirmed,
+                                      selector_override=selector)
 
 
 def promote(config_path: Path, *, apply: bool, as_json: bool = False, selected: str | None = None,
-            catalog_token: str | None = None, presenter: SelectionPresenter | None = None) -> dict[str, Any]:
+            catalog_token: str | None = None, presenter: SelectionPresenter | None = None,
+            selector: str | None = None) -> dict[str, Any]:
     if not apply:
         return {"schema_version": "1.0.0", "command": "promote", "dry_run": True}
     return _execute_selection_command(config_path, command="promote", as_json=as_json, selected=selected,
-                                      catalog_token=catalog_token, presenter=presenter)
+                                      catalog_token=catalog_token, presenter=presenter,
+                                      selector_override=selector)
 
 
 def _state_path(config_path: Path) -> Path:
@@ -1227,7 +1252,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command in {"enroll", "join"}: payload = enroll(args.config, apply=args.apply)
         elif args.command == "versions": payload = versions(args.config)
         elif args.command == "bookmark": payload = bookmark(args.config, args.candidate, args.name, args.note, apply=args.apply, catalog_token=args.catalog_token)
-        elif args.command == "launch": payload = launch(args.config, as_json=args.json, selected=args.select, catalog_token=args.catalog_token, confirmed=args.confirm)
+        elif args.command == "launch": payload = launch(args.config, as_json=args.json, selected=args.select, catalog_token=args.catalog_token, confirmed=args.confirm, selector=args.selector)
         elif args.command == "promote": payload = promote(args.config, apply=args.apply, as_json=args.json, selected=args.candidate, catalog_token=args.catalog_token)
         elif args.command == "install-shortcut":
             if not args.apply: payload = {"schema_version": "1.0.0", "command": "install-shortcut", "dry_run": True}
